@@ -1,0 +1,19 @@
+{
+  "id":"flux-dev", "version":1,"name":"FLUX Dev · Detail", "description":"Quality-first local FLUX.1 Dev. Natural-language prompts; no phrase weights.",
+  "family":"flux", "emphasis":false, "negative":false,
+  "model_source":["UNETLoader","unet_name"], "model_contains":["flux1-dev"],
+  "profiles":{"fast":{"steps":12,"cfg":3.5},"balanced":{"steps":20,"cfg":3.5},"quality":{"steps":28,"cfg":3.5},"maximum":{"steps":40,"cfg":3.5}},
+  "bindings":{"model":[["1","unet_name"]],"prompt":[["3","text"]],"width":[["5","width"]],"height":[["5","height"]],"seed":[["7","seed"]],"steps":[["7","steps"]],"cfg":[["4","guidance"]]},
+  "graph":{
+    "1":{"class_type":"UNETLoader","inputs":{"unet_name":"","weight_dtype":"default"}},
+    "2":{"class_type":"DualCLIPLoader","inputs":{"clip_name1":"t5xxl_fp16.safetensors","clip_name2":"clip_l.safetensors","type":"flux","device":"default"}},
+    "3":{"class_type":"CLIPTextEncode","inputs":{"text":"","clip":["2",0]}},
+    "4":{"class_type":"FluxGuidance","inputs":{"conditioning":["3",0],"guidance":3.5}},
+    "5":{"class_type":"EmptySD3LatentImage","inputs":{"width":1024,"height":1024,"batch_size":1}},
+    "6":{"class_type":"ConditioningZeroOut","inputs":{"conditioning":["3",0]}},
+    "7":{"class_type":"KSampler","inputs":{"seed":0,"steps":28,"cfg":1,"sampler_name":"euler","scheduler":"simple","denoise":1,"model":["1",0],"positive":["4",0],"negative":["6",0],"latent_image":["5",0]}},
+    "8":{"class_type":"VAELoader","inputs":{"vae_name":"ae.safetensors"}},
+    "9":{"class_type":"VAEDecode","inputs":{"samples":["7",0],"vae":["8",0]}},
+    "10":{"class_type":"SaveImage","inputs":{"images":["9",0],"filename_prefix":"PixAnvil"}}
+  }
+}

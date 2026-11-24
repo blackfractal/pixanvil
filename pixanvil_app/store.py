@@ -1,0 +1,121 @@
+import json
+import sqlite3
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+class Store:
+    def __init__(self, path):
+        self.path = str(path)
+        with self.connect() as db:
+            db.executescript('''
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id TEXT PRIMARY KEY, created TEXT NOT NULL, updated TEXT NOT NULL,
+                    state TEXT NOT NULL, prompt_id TEXT, recipe TEXT NOT NULL,
+                    graph TEXT NOT NULL, error TEXT, outputs TEXT NOT NULL DEFAULT '[]');
+                CREATE TABLE IF NOT EXISTS assets (
+                    id TEXT PRIMARY KEY, job_id TEXT, created TEXT NOT NULL,
+                    root TEXT NOT NULL, path TEXT NOT NULL, thumbnail TEXT NOT NULL,
+                    recipe TEXT NOT NULL, width INTEGER, height INTEGER,
+                    favorite INTEGER NOT NULL DEFAULT 0, rating INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(job_id,path));
+                CREATE TABLE IF NOT EXISTS presets (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, data TEXT NOT NULL);
+            ''')
+
+    @contextmanager
+    def connect(self):
+        db = sqlite3.connect(self.path, timeout=15)
+        db.row_factory = sqlite3.Row
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
+
+    @staticmethod
+    def decode(row):
+        if row is None:
+            return None
+        d = dict(row)
+        for key in ('recipe', 'graph', 'outputs', 'data'):
+            if key in d:
+                d[key] = json.loads(d[key])
+        return d
+
+    def create_job(self, recipe, graph):
+        job_id = uuid.uuid4().hex
+        with self.connect() as db:
+            db.execute('INSERT INTO jobs(id,created,updated,state,recipe,graph) VALUES(?,?,?,?,?,?)',
+                       (job_id, now(), now(), 'queued', json.dumps(recipe), json.dumps(graph)))
+        return self.job(job_id)
+
+    def job(self, job_id):
+        with self.connect() as db:
+            return self.decode(db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone())
+
+    def jobs(self, limit=100):
+        with self.connect() as db:
+            return [self.decode(r) for r in db.execute('SELECT * FROM jobs ORDER BY created DESC LIMIT ?', (limit,))]
+
+    def active(self):
+        with self.connect() as db:
+            return [self.decode(r) for r in db.execute("SELECT * FROM jobs WHERE state IN ('queued','submitting','running','collecting','unknown') ORDER BY created")]
+
+    def update_job(self, job_id, **values):
+        if not set(values).issubset({'state','prompt_id','error','outputs'}):
+            raise ValueError('Invalid job update')
+        if 'outputs' in values:
+            values['outputs'] = json.dumps(values['outputs'])
+        values['updated'] = now()
+        with self.connect() as db:
+            db.execute('UPDATE jobs SET ' + ','.join(k+'=?' for k in values) + ' WHERE id=?', (*values.values(), job_id))
+
+    def add_asset(self, asset):
+        with self.connect() as db:
+            db.execute('''INSERT OR IGNORE INTO assets
+                (id,job_id,created,root,path,thumbnail,recipe,width,height) VALUES(?,?,?,?,?,?,?,?,?)''',
+                (asset['id'],asset['job_id'],now(),asset['root'],asset['path'],asset['thumbnail'],
+                 json.dumps(asset['recipe']),asset['width'],asset['height']))
+
+    def assets(self, q='', model='', offset=0, limit=60, favorites=False):
+        clauses, args = [], []
+        if q:
+            clauses.append('recipe LIKE ?'); args.append('%'+q+'%')
+        if model:
+            clauses.append("json_extract(recipe,'$.model')=?"); args.append(model)
+        if favorites:
+            clauses.append('favorite=1')
+        where = (' WHERE '+' AND '.join(clauses)) if clauses else ''
+        with self.connect() as db:
+            total = db.execute('SELECT COUNT(*) FROM assets'+where,args).fetchone()[0]
+            rows = db.execute('SELECT * FROM assets'+where+' ORDER BY created DESC LIMIT ? OFFSET ?', (*args,limit,offset))
+            return {'items':[self.decode(r) for r in rows], 'total':total}
+
+    def asset(self, asset_id):
+        with self.connect() as db:
+            return self.decode(db.execute('SELECT * FROM assets WHERE id=?',(asset_id,)).fetchone())
+
+    def mark_asset(self, asset_id, favorite, rating):
+        with self.connect() as db:
+            db.execute('UPDATE assets SET favorite=?,rating=? WHERE id=?',(int(favorite),rating,asset_id))
+
+    def presets(self):
+        with self.connect() as db:
+            return [self.decode(r) for r in db.execute('SELECT * FROM presets ORDER BY name')]
+
+    def save_preset(self, name, data, preset_id=None):
+        preset_id = preset_id or uuid.uuid4().hex
+        with self.connect() as db:
+            db.execute('INSERT OR REPLACE INTO presets(id,name,data) VALUES(?,?,?)',(preset_id,name,json.dumps(data)))
+        return preset_id
+
+    def delete_preset(self, preset_id):
+        with self.connect() as db:
+            db.execute('DELETE FROM presets WHERE id=?',(preset_id,))

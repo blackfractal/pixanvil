@@ -1,0 +1,27 @@
+{
+  "id":"sulphur-video", "version":1, "name":"Sulphur · Video", "description":"Text-to-video with sound on the local LTX 2.3 Sulphur model. Eight-step distilled; a 4-second clip takes a few minutes.",
+  "family":"ltx2", "media":"video", "emphasis":false, "negative":true,
+  "sampler":"one_stage", "scheduler":"distilled", "seed_max":2147483647,
+  "defaults":{"width":768,"height":512,"frames":97,"fps":24,"negative":"blurry, out of focus, subtitles, overexposed, underexposed, low contrast, washed out colors, excessive noise, flickering, distorted proportions, deformed facial features, extra limbs, disfigured hands, camera shake, silent or muted audio, distorted voice, jittery movement"},
+  "frames":{"step":8,"offset":1,"min":25,"max":241},
+  "durations":[{"seconds":2,"frames":49},{"seconds":4,"frames":97},{"seconds":6,"frames":145},{"seconds":8,"frames":193},{"seconds":10,"frames":241}],
+  "canvases":[{"width":768,"height":512,"label":"Landscape · 768 × 512"},{"width":512,"height":768,"label":"Portrait · 512 × 768"},{"width":640,"height":640,"label":"Square · 640 × 640"}],
+  "model_source":["LTX2_SM_Model","gguf"], "model_contains":["sulphur"],
+  "profiles":{"fast":{"steps":8,"cfg":1},"balanced":{"steps":8,"cfg":1},"quality":{"steps":8,"cfg":1},"maximum":{"steps":8,"cfg":1}},
+  "bindings":{"model":[["model","gguf"]],"prompt":[["encode","prompt"]],"negative":[["encode","negative_prompt"]],"width":[["latents","width"]],"height":[["latents","height"]],"frames":[["latents","num_frames"]],"fps":[["latents","frame_rate"],["video","fps"]],"seed":[["sampler","seed"]],"steps":[["sampler","steps"]],"cfg":[["sampler","video_cfg_guidance_scale"]]},
+  "graph":{
+    "model":{"class_type":"LTX2_SM_Model","inputs":{"dit":"none","gguf":"","distilled_lora":"none","lora":"none","sampling_mode":"one_stage","offload":true}},
+    "video-vae":{"class_type":"LTX2_SM_VAE","inputs":{"vae":"ltx-2.3-22b-distilled_video_vae.safetensors"}},
+    "audio-vae":{"class_type":"LTX2_SM_AUDIO_VAE","inputs":{"audio_vae":"ltx-2.3-22b-distilled_audio_vae.safetensors"}},
+    "text-encoder":{"class_type":"LTX2_SM_Clip","inputs":{"clip":"gemma-3-12b-it-qat-Q4_0.gguf","connector":"connector.safetensors","infer_device":"cuda"}},
+    "encode":{"class_type":"LTX2_SM_ENCODER","inputs":{"clip":["text-encoder",0],"enhance_prompt":false,"save_emb":true,"streaming_prefetch_count":12,"prompt":"","negative_prompt":""}},
+    "latents":{"class_type":"LTX2_LATENTS","inputs":{"width":768,"height":512,"num_frames":97,"frame_rate":24,"strength":0.8,"audio_start_time":0,"audio_max_duration":0}},
+    "sampler":{"class_type":"LTX2_SM_KSampler","inputs":{"model":["model",0],"latents":["latents",0],"positive":["encode",0],"negative":["encode",1],"steps":8,"seed":0,"video_cfg_guidance_scale":1,"video_stg_guidance_scale":0,"video_rescale_scale":0,"a2v_guidance_scale":1,"video_skip_step":0,"video_stg_blocks":-1,"audio_cfg_guidance_scale":1,"audio_stg_guidance_scale":0,"audio_rescale_scale":0,"v2a_guidance_scale":1,"audio_skip_step":0,"audio_stg_blocks":-1,"block_group_size":2,"spatial_upsampler":"none"}},
+    "decode-video":{"class_type":"LTX2_DECO_VIDEO","inputs":{"decoder":["video-vae",0],"latent":["sampler",0],"tile":true}},
+    "decode-audio":{"class_type":"LTX2_DECO_AUDIO","inputs":{"a_decoder":["audio-vae",0],"audio_latents":["sampler",1]}},
+    "video":{"class_type":"CreateVideo","inputs":{"images":["decode-video",0],"audio":["decode-audio",0],"fps":24}},
+    "save":{"class_type":"SaveVideo","inputs":{"video":["video",0],"filename_prefix":"video/PixAnvil","format":"auto","codec":"auto"}},
+    "poster-frame":{"class_type":"ImageFromBatch","inputs":{"image":["decode-video",0],"batch_index":0,"length":1}},
+    "poster":{"class_type":"SaveImage","inputs":{"images":["poster-frame",0],"filename_prefix":"PixAnvil_poster"}}
+  }
+}
