@@ -102,6 +102,24 @@ class Store:
         with self.connect() as db:
             return self.decode(db.execute('SELECT * FROM assets WHERE id=?',(asset_id,)).fetchone())
 
+    def delete_job(self, job_id):
+        """Remove a job and the gallery entries it produced. Returns the removed asset rows."""
+        with self.connect() as db:
+            removed = [self.decode(r) for r in db.execute('SELECT * FROM assets WHERE job_id=?', (job_id,))]
+            db.execute('DELETE FROM assets WHERE job_id=?', (job_id,))
+            db.execute('DELETE FROM jobs WHERE id=?', (job_id,))
+        return removed
+
+    def delete_asset(self, asset_id):
+        with self.connect() as db:
+            db.execute('DELETE FROM assets WHERE id=?', (asset_id,))
+
+    def input_in_use(self, name):
+        """True when any remaining job still needs this saved source snapshot."""
+        with self.connect() as db:
+            return db.execute("SELECT 1 FROM jobs WHERE json_extract(recipe,'$.input_name')=? OR json_extract(recipe,'$.end_input_name')=? LIMIT 1",
+                              (name, name)).fetchone() is not None
+
     def mark_asset(self, asset_id, favorite, rating):
         with self.connect() as db:
             db.execute('UPDATE assets SET favorite=?,rating=? WHERE id=?',(int(favorite),rating,asset_id))

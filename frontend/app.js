@@ -125,7 +125,9 @@ $('#quality').oninput=()=>{updateLabels();$('#steps').value='';$('#cfg').value='
 $('#generation-form').addEventListener('input',()=>{if(workflows.length)saveDraft();});
 $('#example-prompt').onclick=()=>{$('#prompt').value='Create a high quality image of a young, handsome teenage water knight casting a powerful water spell. Sleeveless armor, cinematic lighting';saveDraft();};
 $('#generation-form').onsubmit=run(async e=>{e.preventDefault();busy=true;$('#generate-button').disabled=true;try{const response=await api('/jobs','POST',data());notice(`Queued ${response.jobs.length} ${response.jobs[0].recipe.media==='video'?'video':'image'}(s). You can keep browsing; results save automatically.`);await refreshJobs();}finally{busy=false;setModelOptions($('#workflow').value,$('#model').value);}});
-async function refreshGallery(append=false){if(!append)offset=0;const response=await api(`/assets?limit=48&offset=${offset}&favorites=${favorites}&q=${encodeURIComponent($('#search').value)}`);total=response.total;assets=append?[...assets,...response.items]:response.items;offset=assets.length;$('#image-count').textContent=`${total} image${total===1?'':'s'}`;$('#empty-gallery').hidden=total>0;$('#load-more').hidden=offset>=total;const grid=$('#gallery-grid');grid.replaceChildren();for(const a of assets){const card=el('button','card');card.setAttribute('aria-label',a.recipe.prompt);const imgWrap=el('div','card-image');const img=el('img');img.src=`/api/assets/${a.id}/thumbnail`;img.alt=a.recipe.prompt;img.loading='lazy';imgWrap.append(img);if(a.favorite)imgWrap.append(el('span','heart','♥'));if(isVideo(a))imgWrap.append(el('span','play',`▶ ${clipSeconds(a.recipe)}s`));const text=el('div','card-text');text.append(el('strong','',a.recipe.prompt),el('span','',`${a.width} × ${a.height}`));card.append(imgWrap,text,el('small','',`${a.recipe.workflow} / ${new Date(a.created).toLocaleDateString()}`));card.onclick=()=>openAsset(a);grid.append(card);}renderPending();if(assets.length&&!favorites&&!$('#search').value)showLatest(assets[0]);}
+async function refreshGallery(append=false){if(!append)offset=0;const response=await api(`/assets?limit=48&offset=${offset}&favorites=${favorites}&q=${encodeURIComponent($('#search').value)}`);total=response.total;assets=append?[...assets,...response.items]:response.items;offset=assets.length;$('#image-count').textContent=`${total} image${total===1?'':'s'}`;$('#empty-gallery').hidden=total>0;$('#load-more').hidden=offset>=total;const grid=$('#gallery-grid');grid.replaceChildren();for(const a of assets){const card=el('button','card');card.setAttribute('aria-label',a.recipe.prompt);const imgWrap=el('div','card-image');const img=el('img');img.src=`/api/assets/${a.id}/thumbnail`;img.alt=a.recipe.prompt;img.loading='lazy';imgWrap.append(img);if(a.favorite)imgWrap.append(el('span','heart','♥'));if(isVideo(a))imgWrap.append(el('span','play',`▶ ${clipSeconds(a.recipe)}s`));const text=el('div','card-text');text.append(el('strong','',a.recipe.prompt),el('span','',`${a.width} × ${a.height}`));card.append(imgWrap,text,el('small','',`${a.recipe.workflow} / ${new Date(a.created).toLocaleDateString()}`));card.onclick=()=>openAsset(a);grid.append(card);}renderPending();if(!favorites&&!$('#search').value){if(assets.length)showLatest(assets[0]);else if(latestId===''){$('#latest-preview').replaceChildren(...latestPlaceholder.map(n=>n.cloneNode(true)));$('#latest-caption').textContent='';}}}
+// The Live tab's empty state, restored when its last result is deleted.
+const latestPlaceholder=[...$('#latest-preview').childNodes].map(n=>n.cloneNode(true));
 // The Live activity tab shows the newest result: a clip plays in place, an image opens in the viewer.
 function showLatest(a){
   if(a.id===latestId)return;latestId=a.id;let node;
@@ -168,6 +170,22 @@ $('#vary-image').onclick=run(()=>startImageTool('variation'));$('#refine-image')
 // A clip's first frame becomes an ordinary image, ready for Edit and then Animate.
 $('#frame-image').onclick=run(async()=>{const frame=await api(`/assets/${selected.id}/first-frame`,'POST');await refreshGallery();openAsset(frame);});
 $('#parent-image').onclick=run(async()=>openAsset(await api('/assets/'+selected.recipe.parent_asset_id)));
+// Deleting a generated output and deleting its job are the same action: both remove the record and the files.
+async function deleteRecord(path,question){
+  if(!confirm(question))return false;
+  const result=await api(path,'DELETE');
+  for(const id of result.deleted_assets){if(sourceAsset?.id===id)sourceAsset=null;if(endAsset?.id===id)endAsset=null;if(latestId===id)latestId='';}
+  if(workflows.length){updateOperation();saveDraft();}
+  notice(result.leftover_files.length?`Deleted, but these files could not be removed: ${result.leftover_files.join(', ')}`:'');
+  await Promise.all([refreshGallery(),refreshJobs()]);
+  return true;
+}
+$('#delete-image').onclick=run(async()=>{
+  const a=selected,kind=isVideo(a)?'video':'image';
+  const others=a.job_id?((await api('/jobs/'+a.job_id).catch(()=>null))?.outputs.length||1)-1:0;
+  const question=a.job_id?`Delete this ${kind} and its history entry${others?`, along with ${others} other output${others===1?'':'s'} from the same job`:''}? The files are removed from your library.`:`Delete this imported ${kind}? The file is removed from your library.`;
+  if(await deleteRecord('/assets/'+a.id,question))$('#viewer').close();
+});
 async function refreshPresets(){presets=(await api('/presets')).items;const selectedId=$('#preset-select').value;$('#preset-select').replaceChildren(el('option','','Load a preset…'));$('#preset-select').firstChild.value='';for(const p of presets){const option=el('option','',p.name);option.value=p.id;$('#preset-select').append(option);}$('#preset-select').value=selectedId;}
 $('#save-preset').onclick=run(async()=>{const name=prompt('Name this prompt preset');if(!name)return;const id=$('#preset-select').value;await api('/presets','POST',{name,data:data(),id:presets.find(p=>p.id===id)?.name===name?id:null});await refreshPresets();notice('Preset saved.');});$('#preset-select').onchange=()=>{const p=presets.find(p=>p.id===$('#preset-select').value);if(p)loadRecipe({...data(),prompt:p.data.prompt,negative:p.data.negative,emphasis:p.data.emphasis});};$('#delete-preset').onclick=run(async()=>{const id=$('#preset-select').value;if(!id)return;await api('/presets/'+id,'DELETE');await refreshPresets();});
 function progressView(j){
@@ -199,6 +217,12 @@ async function refreshJobs(){
     if(j.state==='queued'||j.state==='unknown'){
       const b=el('button','quiet',j.state==='queued'?'Cancel queued':'Abandon local job');
       b.onclick=run(async()=>{await api(`/jobs/${j.id}/${j.state==='queued'?'cancel':'abandon'}`,'POST');await refreshJobs();});actions.append(b);
+    }
+    // Work that may still be running on ComfyUI cannot be deleted until it finishes or is abandoned.
+    if(!['submitting','running','collecting','unknown'].includes(j.state)){
+      const remove=el('button','quiet danger','Delete'),n=j.outputs.length;
+      remove.onclick=run(()=>deleteRecord('/jobs/'+j.id,n?`Delete this job and its ${n} output${n===1?'':'s'}? The files are removed from your library.`:'Delete this job from your history?'));
+      actions.append(remove);
     }
     row.append(status,body,actions);container.append(row);
   }

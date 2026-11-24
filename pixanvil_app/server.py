@@ -335,6 +335,49 @@ def make_app(state=None, worker=True, client_factory=Comfy):
             store.update_job(job_id,state='abandoned',error='Locally abandoned. Any remote execution is unaffected.')
         return store.job(job_id)
 
+    def remove_asset_files(asset):
+        """Delete an asset's files from the library. Returns the ones that could not be removed."""
+        path=safe_path(asset['root'],asset['path'])
+        # A generated output keeps its recipe in a JSON sidecar; a clip also keeps its full-size first frame.
+        files=[path,safe_path(asset['root'],asset['thumbnail']),path.with_suffix('.json')]
+        if path.suffix.lower()=='.mp4': files.append(path.with_suffix('.png'))
+        leftover=[]
+        for file in files:
+            try: file.unlink(missing_ok=True)
+            except OSError: leftover.append(str(file))
+        return leftover
+
+    def remove_job(job):
+        """Delete a job, every output it produced, and source snapshots no other job needs."""
+        if job['state'] in ('submitting','running','collecting','unknown'):
+            raise HTTPException(409,'This job may still be running on ComfyUI. Wait for it to finish, or abandon it first.')
+        removed=store.delete_job(job['id'])
+        leftover=[f for asset in removed for f in remove_asset_files(asset)]
+        for key in ('input_name','end_input_name'):
+            name=job['recipe'].get(key)
+            if name and not store.input_in_use(name):
+                try: safe_path(config.state/'inputs',name).unlink(missing_ok=True)
+                except OSError as exc: leftover.append(str(exc.filename))
+        return {'deleted_job':job['id'],'deleted_assets':[a['id'] for a in removed],'leftover_files':leftover}
+
+    @app.delete('/api/jobs/{job_id}')
+    def delete_job(job_id:str):
+        with engine.lock:
+            found=store.job(job_id)
+            if not found: raise HTTPException(404,'Job not found')
+            return remove_job(found)
+
+    @app.delete('/api/assets/{asset_id}')
+    def delete_asset(asset_id:str):
+        with engine.lock:
+            asset=store.asset(asset_id)
+            if not asset: raise HTTPException(404,'Image not found')
+            # A generated output and its job are one record: deleting either removes both.
+            job=store.job(asset['job_id']) if asset['job_id'] else None
+            if job: return remove_job(job)
+            store.delete_asset(asset_id)
+            return {'deleted_job':None,'deleted_assets':[asset_id],'leftover_files':remove_asset_files(asset)}
+
     @app.get('/api/assets')
     def assets(q:str='',model:str='',offset:int=0,limit:int=60,favorites:bool=False):
         return store.assets(q,model,max(0,offset),max(1,min(limit,100)),favorites)

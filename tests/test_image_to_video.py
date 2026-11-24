@@ -178,6 +178,18 @@ def test_first_frame_of_a_clip_becomes_an_image_linked_to_it(setup):
     assert animate(client,frame).status_code==201
 
 
+def test_deleting_a_clip_removes_its_first_frame_but_keeps_its_source(setup):
+    app,client,source=setup
+    job=animate(client,source).json()['jobs'][0]
+    app.state.engine.tick(); app.state.engine.tick()
+    video=client.get(f'/api/assets/{job["id"]}-0').json()
+    clip=Path(video['root'])/video['path']
+    assert clip.with_suffix('.png').is_file()
+    assert client.delete(f'/api/assets/{video["id"]}',headers=HEADERS).json()['deleted_job']==job['id']
+    assert not clip.exists() and not clip.with_suffix('.png').exists() and not clip.with_suffix('.json').exists()
+    assert client.get(f'/api/assets/{source["id"]}').status_code==200
+
+
 def test_clip_can_take_an_end_image_alone_or_with_a_start_image(setup):
     app,client,start=setup
     end=client.post('/api/assets/import',headers=HEADERS,files={'file':('end.png',picture((640,800),'PNG'))}).json()

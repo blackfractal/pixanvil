@@ -19,3 +19,4 @@
 @media(max-width:1050px){.live-layout{grid-template-columns:1fr}}
 
 .card.pending{animation:none}
+button.quiet.danger{color:#e6a08a}button.quiet.danger:hover{background:#3a2520;border-color:#6b3a2e}
