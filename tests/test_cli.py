@@ -37,3 +37,37 @@ def test_terminal_prompt_appears_in_gallery(tmp_path):
             assert client.get(f'http://127.0.0.1:{port}/api/assets/{assets[0]["id"]}/image').headers['content-type']=='image/png'
     finally:
         server.should_exit=True; thread.join(timeout=10); sock.close()
+
+
+def test_stop_ends_a_background_server(tmp_path):
+    sock=socket.socket(); sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]; sock.close()
+    env={**__import__('os').environ,'PIXANVIL_STATE':str(tmp_path)}
+    server=subprocess.Popen([sys.executable,str(ROOT/'pixanvil.py'),'serve','--port',str(port)],
+                            env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    try:
+        deadline=time.monotonic()+15
+        while time.monotonic()<deadline:
+            try:
+                if httpx.get(f'http://127.0.0.1:{port}/api/health',trust_env=False).status_code==200: break
+            except httpx.ConnectError: time.sleep(.2)
+        stop=[sys.executable,str(ROOT/'pixanvil.py'),'stop','--port',str(port)]
+        result=subprocess.run(stop,env=env,capture_output=True,text=True,timeout=30)
+        assert result.returncode==0,result.stdout+result.stderr
+        assert 'PixAnvil stopped.' in result.stdout
+        assert server.wait(timeout=10)==0
+        again=subprocess.run(stop,env=env,capture_output=True,text=True,timeout=30)
+        assert again.returncode==0 and 'not running' in again.stdout
+    finally:
+        if server.poll() is None: server.kill()
+
+
+def test_shutdown_needs_a_server_that_can_stop_itself(tmp_path):
+    from fastapi.testclient import TestClient
+    from test_app import HEADERS
+    app=make_app(tmp_path,worker=False,client_factory=Fake)
+    with TestClient(app) as client:
+        assert client.post('/api/shutdown',headers=HEADERS).status_code==409
+        stopped=[]; app.state.shutdown=lambda:stopped.append(True)
+        assert client.post('/api/shutdown').status_code==403
+        assert client.post('/api/shutdown',headers=HEADERS).json()=={'stopping':True,'active':0}
+        assert stopped==[True]

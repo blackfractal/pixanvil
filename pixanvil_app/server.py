@@ -161,6 +161,14 @@ def make_app(state=None, worker=True, client_factory=Comfy):
     @app.get('/api/health')
     def health(): return {'app':'pixanvil','version':'0.1.0','library':config.data['library']}
 
+    @app.post('/api/shutdown')
+    def shutdown():
+        """Ask the server to exit. Queued and unfinished jobs are durable and resume on the next start."""
+        stop=getattr(app.state,'shutdown',None)
+        if not stop: raise HTTPException(409,'This server was not started by pixanvil.py serve, so it cannot stop itself')
+        stop()
+        return {'stopping':True,'active':len(store.active())}
+
     @app.get('/api/settings')
     def get_settings(): return config.public()
 
@@ -234,80 +242,116 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         try: return capabilities(info())
         except Exception as exc: raise HTTPException(503,'ComfyUI unavailable: '+str(exc))
 
-    @app.post('/api/jobs',status_code=201)
-    def submit(value:Generation):
+    def prepare(value:Generation):
+        """Compile a request into one (recipe, graph) per output, plus the source snapshots the jobs read.
+
+        Raises HTTPException: 422 for a request that cannot run, 503 when ComfyUI cannot be reached."""
         try:
-            with engine.lock:
-                data=value.model_dump()
-                count=data.pop('count')
-                data.update(library=config.data['library'],comfy_url=config.data['comfy_url'])
-                definitions=info()
-                source=None
-                end=None
-                snapshots={}
-                def stage(asset,name_key,hash_key):
-                    if asset['recipe'].get('media')=='video': raise ValueError('The source must be a still image, not a video')
-                    path=safe_path(asset['root'],asset['path'])
-                    if path.stat().st_size>80*1024*1024: raise ValueError('Source exceeds 80 MB')
-                    payload=path.read_bytes()
-                    from PIL import Image
-                    with Image.open(io.BytesIO(payload)) as image:
-                        if image.format!='PNG' or image.size!=(asset['width'],asset['height']):
-                            raise ValueError('Source file no longer matches the saved image')
-                        image.verify()
-                    digest=hashlib.sha256(payload).hexdigest()
-                    data.update({name_key:digest+'.png',hash_key:digest})
-                    snapshots[digest+'.png']=payload
-                if data['end_asset_id']:
-                    if data['operation']!='img2vid': raise ValueError('An end image needs a video workflow')
-                    end=store.asset(data['end_asset_id'])
-                    if not end: raise ValueError('Choose an end image from the gallery')
-                if data['operation']!='txt2img':
-                    source=store.asset(data['source_asset_id']) if data['source_asset_id'] else None
-                    if not source and not end: raise ValueError('Choose a source image from the gallery')
-                    data['parent_asset_id']=(source or end)['id']
-                    if data['operation'] in ('img2vid','edit'):
-                        data['source_size']=[(source or end)['width'],(source or end)['height']]
-                    if data['operation']=='variation':
-                        original=source['recipe']
-                        if original.get('operation','txt2img') not in ('txt2img','variation'):
-                            raise ValueError('Seed variations need a generated image or a seed variation; use Refine for edited/upscaled images')
-                        data.update(seed=original['seed'],workflow=original['workflow'],model=original['model'],
-                                    width=source['width'],height=source['height'])
-                        data['variation_seed']=resolve_seed(data['variation_seed'])
-                    else:
-                        if source: stage(source,'input_name','source_sha256')
-                        if end: stage(end,'end_input_name','end_sha256')
-                elif data['source_asset_id']:
-                    raise ValueError('Source image requires an image operation')
-                if data['operation']=='upscale':
-                    if data['refinement']: raise ValueError('Upscale first, then refine the saved result')
-                    if count!=1: raise ValueError('Upscaling produces one image at a time')
-                    recipe,graph=compile_upscale(data,source,definitions)
+            data=value.model_dump()
+            count=data.pop('count')
+            data.update(library=config.data['library'],comfy_url=config.data['comfy_url'])
+            definitions=info()
+            source=None
+            end=None
+            snapshots={}
+            def stage(asset,name_key,hash_key):
+                if asset['recipe'].get('media')=='video': raise ValueError('The source must be a still image, not a video')
+                path=safe_path(asset['root'],asset['path'])
+                if path.stat().st_size>80*1024*1024: raise ValueError('Source exceeds 80 MB')
+                payload=path.read_bytes()
+                from PIL import Image
+                with Image.open(io.BytesIO(payload)) as image:
+                    if image.format!='PNG' or image.size!=(asset['width'],asset['height']):
+                        raise ValueError('Source file no longer matches the saved image')
+                    image.verify()
+                digest=hashlib.sha256(payload).hexdigest()
+                data.update({name_key:digest+'.png',hash_key:digest})
+                snapshots[digest+'.png']=payload
+            if data['end_asset_id']:
+                if data['operation']!='img2vid': raise ValueError('An end image needs a video workflow')
+                end=store.asset(data['end_asset_id'])
+                if not end: raise ValueError('Choose an end image from the gallery')
+            if data['operation']!='txt2img':
+                source=store.asset(data['source_asset_id']) if data['source_asset_id'] else None
+                if not source and not end: raise ValueError('Choose a source image from the gallery')
+                data['parent_asset_id']=(source or end)['id']
+                if data['operation'] in ('img2vid','edit'):
+                    data['source_size']=[(source or end)['width'],(source or end)['height']]
+                if data['operation']=='variation':
+                    original=source['recipe']
+                    if original.get('operation','txt2img') not in ('txt2img','variation'):
+                        raise ValueError('Seed variations need a generated image or a seed variation; use Refine for edited/upscaled images')
+                    data.update(seed=original['seed'],workflow=original['workflow'],model=original['model'],
+                                width=source['width'],height=source['height'])
+                    data['variation_seed']=resolve_seed(data['variation_seed'])
                 else:
-                    recipe,graph=compile_recipe(data,definitions)
-                try:
-                    stats=client_factory(config.data['comfy_url']).health()
-                    data['environment']={'system':stats.get('system',{}),'devices':stats.get('devices',[])}
-                except Exception:
-                    data['environment']={'note':'Runtime version information unavailable at submission'}
-                prepared=[]
-                base=int(recipe['seed'])
-                for i in range(count):
-                    item={**data,'seed':str((base+i)%(2**64))}
-                    if data['operation']=='variation':
-                        item.update(seed=str(base),variation_seed=str((int(data['variation_seed'])+i)%(2**64)))
-                    rec,g=compile_upscale(item,source,definitions) if data['operation']=='upscale' else compile_recipe(item,definitions)
-                    prepared.append((rec,g))
-                for name,payload in snapshots.items():
-                    inputs=config.state/'inputs'; inputs.mkdir(exist_ok=True)
-                    target=inputs/name
-                    temporary=target.with_suffix('.part')
-                    temporary.write_bytes(payload); temporary.replace(target)
-                created=[store.create_job(rec,g) for rec,g in prepared]
-                return {'jobs':created}
+                    if source: stage(source,'input_name','source_sha256')
+                    if end: stage(end,'end_input_name','end_sha256')
+            elif data['source_asset_id']:
+                raise ValueError('Source image requires an image operation')
+            if data['operation']=='upscale':
+                if data['refinement']: raise ValueError('Upscale first, then refine the saved result')
+                if count!=1: raise ValueError('Upscaling produces one image at a time')
+                recipe,graph=compile_upscale(data,source,definitions)
+            else:
+                recipe,graph=compile_recipe(data,definitions)
+            try:
+                stats=client_factory(config.data['comfy_url']).health()
+                data['environment']={'system':stats.get('system',{}),'devices':stats.get('devices',[])}
+            except Exception:
+                data['environment']={'note':'Runtime version information unavailable at submission'}
+            prepared=[]
+            base=int(recipe['seed'])
+            for i in range(count):
+                item={**data,'seed':str((base+i)%(2**64))}
+                if data['operation']=='variation':
+                    item.update(seed=str(base),variation_seed=str((int(data['variation_seed'])+i)%(2**64)))
+                rec,g=compile_upscale(item,source,definitions) if data['operation']=='upscale' else compile_recipe(item,definitions)
+                prepared.append((rec,g))
+            return prepared,snapshots
         except ValueError as exc: raise HTTPException(422,str(exc))
         except Exception as exc: raise HTTPException(503,str(exc))
+
+    def save_snapshots(snapshots):
+        for name,payload in snapshots.items():
+            inputs=config.state/'inputs'; inputs.mkdir(exist_ok=True)
+            target=inputs/name
+            temporary=target.with_suffix('.part')
+            temporary.write_bytes(payload); temporary.replace(target)
+
+    def release_inputs(recipe):
+        """Delete the source snapshots a recipe used once no remaining job needs them. Returns the ones that could not be removed."""
+        leftover=[]
+        for key in ('input_name','end_input_name'):
+            name=recipe.get(key)
+            if name and not store.input_in_use(name):
+                try: safe_path(config.state/'inputs',name).unlink(missing_ok=True)
+                except OSError as exc: leftover.append(str(exc.filename))
+        return leftover
+
+    @app.post('/api/jobs',status_code=201)
+    def submit(value:Generation):
+        with engine.lock:
+            prepared,snapshots=prepare(value)
+            save_snapshots(snapshots)
+            return {'jobs':[store.create_job(rec,g) for rec,g in prepared]}
+
+    @app.put('/api/jobs/{job_id}')
+    def edit_job(job_id:str,value:Generation):
+        """Replace a queued job's settings. The job keeps its place in the queue.
+
+        The coordinator takes the same lock before it sends a job to ComfyUI, so an edit either
+        lands before submission or is refused because the job has already started."""
+        if value.count!=1: raise HTTPException(422,'A queued job makes one output. Submit a new job for more.')
+        with engine.lock:
+            found=store.job(job_id)
+            if not found: raise HTTPException(404,'Job not found')
+            if found['state']!='queued': raise HTTPException(409,'This job has already started, so its settings can no longer change.')
+            [(recipe,graph)],snapshots=prepare(value)
+            save_snapshots(snapshots)
+            store.update_job(job_id,recipe=recipe,graph=graph)
+            release_inputs(found['recipe'])
+            return store.job(job_id)
 
     @app.get('/api/jobs')
     def jobs(): return {'items':[engine.with_progress(j) for j in store.jobs()]}
@@ -335,29 +379,36 @@ def make_app(state=None, worker=True, client_factory=Comfy):
             store.update_job(job_id,state='abandoned',error='Locally abandoned. Any remote execution is unaffected.')
         return store.job(job_id)
 
-    def remove_asset_files(asset):
-        """Delete an asset's files from the library. Returns the ones that could not be removed."""
+    # Jobs in these states may still be executing on ComfyUI, so their records and files must stay.
+    busy_states=('submitting','running','collecting','unknown')
+
+    def asset_files(asset):
+        """Every file an asset owns in the library."""
         path=safe_path(asset['root'],asset['path'])
         # A generated output keeps its recipe in a JSON sidecar; a clip also keeps its full-size first frame.
         files=[path,safe_path(asset['root'],asset['thumbnail']),path.with_suffix('.json')]
         if path.suffix.lower()=='.mp4': files.append(path.with_suffix('.png'))
+        return files
+
+    def remove_asset_files(asset):
+        """Delete an asset's files from the library. Returns the ones that could not be removed."""
         leftover=[]
-        for file in files:
+        for file in asset_files(asset):
             try: file.unlink(missing_ok=True)
             except OSError: leftover.append(str(file))
         return leftover
 
+    def saved_inputs():
+        """Source-image snapshots kept for jobs that read an image."""
+        folder=config.state/'inputs'
+        return [f for f in folder.iterdir() if f.is_file()] if folder.is_dir() else []
+
     def remove_job(job):
         """Delete a job, every output it produced, and source snapshots no other job needs."""
-        if job['state'] in ('submitting','running','collecting','unknown'):
+        if job['state'] in busy_states:
             raise HTTPException(409,'This job may still be running on ComfyUI. Wait for it to finish, or abandon it first.')
         removed=store.delete_job(job['id'])
-        leftover=[f for asset in removed for f in remove_asset_files(asset)]
-        for key in ('input_name','end_input_name'):
-            name=job['recipe'].get(key)
-            if name and not store.input_in_use(name):
-                try: safe_path(config.state/'inputs',name).unlink(missing_ok=True)
-                except OSError as exc: leftover.append(str(exc.filename))
+        leftover=[f for asset in removed for f in remove_asset_files(asset)]+release_inputs(job['recipe'])
         return {'deleted_job':job['id'],'deleted_assets':[a['id'] for a in removed],'leftover_files':leftover}
 
     @app.delete('/api/jobs/{job_id}')
@@ -377,6 +428,34 @@ def make_app(state=None, worker=True, client_factory=Comfy):
             if job: return remove_job(job)
             store.delete_asset(asset_id)
             return {'deleted_job':None,'deleted_assets':[asset_id],'leftover_files':remove_asset_files(asset)}
+
+    @app.get('/api/library/summary')
+    def library_summary():
+        """What deleting the whole library would remove, so the user can review it first."""
+        assets=store.all_assets()
+        inputs=saved_inputs()
+        files=[f for a in assets for f in asset_files(a)]+inputs
+        return {'jobs':store.job_count(),
+                'generated':sum(1 for a in assets if a['job_id']),
+                'imported':sum(1 for a in assets if not a['job_id']),
+                'inputs':len(inputs),
+                'bytes':sum(f.stat().st_size for f in files if f.is_file()),
+                'busy':sum(1 for j in store.active() if j['state'] in busy_states)}
+
+    @app.delete('/api/library')
+    def clear_library():
+        """Delete every job, gallery entry, library file and source snapshot. Presets and settings stay."""
+        with engine.lock:
+            if any(j['state'] in busy_states for j in store.active()):
+                raise HTTPException(409,'Some jobs may still be running on ComfyUI. Wait for them to finish, or abandon them first.')
+            jobs=store.job_count()
+            removed=store.clear_history()
+            leftover=[f for asset in removed for f in remove_asset_files(asset)]
+            inputs=saved_inputs()
+            for file in inputs:
+                try: file.unlink()
+                except OSError: leftover.append(str(file))
+        return {'deleted_jobs':jobs,'deleted_assets':len(removed),'deleted_inputs':len(inputs),'leftover_files':leftover}
 
     @app.get('/api/assets')
     def assets(q:str='',model:str='',offset:int=0,limit:int=60,favorites:bool=False):

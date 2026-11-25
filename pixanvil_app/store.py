@@ -69,10 +69,11 @@ class Store:
             return [self.decode(r) for r in db.execute("SELECT * FROM jobs WHERE state IN ('queued','submitting','running','collecting','unknown') ORDER BY created")]
 
     def update_job(self, job_id, **values):
-        if not set(values).issubset({'state','prompt_id','error','outputs'}):
+        if not set(values).issubset({'state','prompt_id','error','outputs','recipe','graph'}):
             raise ValueError('Invalid job update')
-        if 'outputs' in values:
-            values['outputs'] = json.dumps(values['outputs'])
+        for key in ('outputs','recipe','graph'):
+            if key in values:
+                values[key] = json.dumps(values[key])
         values['updated'] = now()
         with self.connect() as db:
             db.execute('UPDATE jobs SET ' + ','.join(k+'=?' for k in values) + ' WHERE id=?', (*values.values(), job_id))
@@ -108,6 +109,22 @@ class Store:
             removed = [self.decode(r) for r in db.execute('SELECT * FROM assets WHERE job_id=?', (job_id,))]
             db.execute('DELETE FROM assets WHERE job_id=?', (job_id,))
             db.execute('DELETE FROM jobs WHERE id=?', (job_id,))
+        return removed
+
+    def all_assets(self):
+        with self.connect() as db:
+            return [self.decode(r) for r in db.execute('SELECT * FROM assets')]
+
+    def job_count(self):
+        with self.connect() as db:
+            return db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0]
+
+    def clear_history(self):
+        """Remove every job and gallery entry, keeping presets. Returns the removed asset rows."""
+        with self.connect() as db:
+            removed = [self.decode(r) for r in db.execute('SELECT * FROM assets')]
+            db.execute('DELETE FROM assets')
+            db.execute('DELETE FROM jobs')
         return removed
 
     def delete_asset(self, asset_id):

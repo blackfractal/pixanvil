@@ -3,6 +3,8 @@ const el=(tag,cls,text)=>{const n=document.createElement(tag);if(cls)n.className
 let workflows=[],presets=[],assets=[],selected=null,metadata=null,favorites=false,offset=0,total=0,lastSignature='',busy=false;
 let sourceAsset=null,endAsset=null,toolCapabilities={};
 let activeJobs=[],latestId='';
+// The queued job the Generate form is editing, if any; the user's own draft waits in stashedDraft meanwhile.
+let editingJob=null,editLocked=false,stashedDraft=null;
 const profiles=['fast','balanced','quality','maximum'];
 const titles={gallery:'Your image collection',live:'Watch it take shape',generate:'Give an idea its shape',history:'Every step, remembered',settings:'Make yourself at home'};
 async function api(path,method='GET',body){const options={method,headers:{'X-PixAnvil':'local'}};if(body instanceof FormData)options.body=body;else if(body!==undefined){options.headers['Content-Type']='application/json';options.body=JSON.stringify(body);}const r=await fetch('/api'+path,options);const data=await r.json();if(!r.ok)throw new Error(typeof data.detail==='string'?data.detail:JSON.stringify(data.detail));return data;}
@@ -48,7 +50,7 @@ function data(){
     variation_seed:$('#variation-seed').value,variation_strength:Number($('#variation-strength').value),denoise:Number($('#denoise').value),scale:Number($('#upscale-factor').value),upscale_model:$('#upscale-model').value,
     refinement:!upscale&&!video&&$('#refinement-enabled').checked?{workflow:$('#refinement-workflow').value,model:$('#refinement-model').value,steps:Number($('#refinement-steps').value),denoise:Number($('#refinement-denoise').value)}:null};
 }
-function saveDraft(){localStorage.setItem('pixanvil-draft',JSON.stringify(data()));}
+function saveDraft(){if(!editingJob)localStorage.setItem('pixanvil-draft',JSON.stringify(data()));}
 function setModelOptions(workflow,model){const w=workflows.find(w=>w.id===workflow);$('#model').replaceChildren(...(w?.models||[]).map(m=>{const o=el('option','',m);o.value=m;return o;}));if(model&&w?.models.includes(model))$('#model').value=model;$('#workflow-description').textContent=w?(w.available?w.description:w.issues.join('; ')):'Connect to SPARK to discover workflows.';$('#negative-label').hidden=!w?.negative;$('#emphasis-section').hidden=!w?.emphasis;$('#negative').disabled=!w?.negative;$('#emphasis-text').disabled=!w?.emphasis;if(!w?.negative)$('#negative').value='';if(!w?.emphasis)$('#emphasis-text').value='';setWorkflowOptions(w);updateOperation();}
 function loadRecipe(r){let wf=r.workflow&&workflows.some(w=>w.id===r.workflow)?r.workflow:null;if(!wf&&r.model&&r.operation!=='upscale'){const match=workflows.find(w=>w.models.includes(r.model));if(match)wf=match.id;else notice('The imported model is unavailable. Select a compatible installed model before generating.');}const source=sourceAsset,end=endAsset;setMode(modeOf({...r,workflow:wf}),wf);sourceAsset=r.operation&&r.operation!=='txt2img'?source:null;endAsset=r.operation==='img2vid'?end:null;setModelOptions($('#workflow').value,r.model);$('#prompt').value=r.prompt||'';const w=workflows.find(w=>w.id===$('#workflow').value);$('#negative').value=w?.negative?(r.negative||''):'';$('#seed').value=r.seed??'-1';if(r.width&&r.height&&r.operation!=='edit')setDimensions(r.width,r.height);if(r.frames){if(![...$('#duration').options].some(o=>o.value===String(r.frames))){const o=el('option','',`${r.frames} frames`);o.value=r.frames;$('#duration').append(o);}$('#duration').value=r.frames;}$('#quality').value=Math.max(0,profiles.indexOf(r.quality||'quality'));$('#steps').value=r.operation==='upscale'?'':r.steps??'';$('#cfg').value=r.operation==='upscale'?'':r.cfg??'';$('#count').value=r.count||1;$('#emphasis-text').value=w?.emphasis?(r.emphasis?.[0]?.text||''):'';$('#emphasis-weight').value=r.emphasis?.[0]?.weight??1;
   $('#variation-seed').value=r.variation_seed??'-1';$('#variation-strength').value=r.variation_strength??.15;$('#denoise').value=r.denoise??.25;$('#upscale-factor').value=r.scale||2;if(r.upscale_model)$('#upscale-model').value=r.upscale_model;
@@ -73,17 +75,18 @@ function updateOperation(){
   const auto=$('#dimensions').querySelector('[value=auto]');
   if(op==='img2vid'&&!auto){const o=el('option','','Match the source image');o.value='auto';$('#dimensions').prepend(o);$('#dimensions').value='auto';}else if(op!=='img2vid'&&auto)auto.remove();
   $('#prompt').placeholder=op==='img2vid'?'Describe the motion and the sound: what happens after this frame…':op==='edit'?'Describe the change: what to alter, and what must stay the same…':video?'Describe the clip you want to make, including sounds and speech…':'Describe the image you want to make…';
-  showSlot('source',sourceAsset,video?!!w?.start_image:m!=='image',video?'START IMAGE · OPTIONAL':op==='edit'?'IMAGE TO CHANGE':'SOURCE IMAGE',video?'The clip opens on this image. Choose a file, or open an image in Gallery and choose Animate.':'Choose a file, or open an image in Gallery and use its buttons.');
-  showSlot('end',endAsset,video&&!!w?.end_image,'END IMAGE · OPTIONAL','The clip finishes on this image. Use it alone or together with a start image.');
+  showSlot('source',sourceAsset,video?!!w?.start_image:m!=='image',video?'START IMAGE · OPTIONAL':op==='edit'?'IMAGE TO CHANGE':'SOURCE IMAGE',video?'The clip opens on this image. Choose or drop a file here, or open an image in Gallery and choose Animate.':'Choose or drop a file here, or open an image in Gallery and use its buttons.');
+  showSlot('end',endAsset,video&&!!w?.end_image,'END IMAGE · OPTIONAL','The clip finishes on this image. Choose or drop a file here; use it alone or with a start image.');
   $('#variation-controls').hidden=!variation;$('#denoise-controls').hidden=op!=='refine';$('#upscale-controls').hidden=!upscale;
   $('#direction-controls').hidden=upscale;$('#sampler-controls').hidden=upscale;$('#prompt').disabled=upscale;
-  for(const id of ['seed','workflow','model','dimensions'])$('#'+id).disabled=variation;
+  for(const id of ['seed','random-seed','workflow','model','dimensions'])$('#'+id).disabled=variation;
+  $('#count').disabled=!!editingJob;
   $('#dimensions').disabled=variation||op==='edit';
   $('#refinement-controls').hidden=!$('#refinement-enabled').checked;
   const labels={txt2img:'Generate image ↗',variation:'Generate variation ↗',refine:'Refine image ↗',upscale:'Upscale image ↗',img2vid:'Animate image ↗',edit:'Edit image ↗'};
-  $('#generate-button').textContent=video?'Generate video ↗':labels[op];$('#operation-caption').textContent=op==='txt2img'?'Create something new':video?'Source images preserved · clip saved separately':'Original preserved · result saved separately';
+  $('#generate-button').textContent=editingJob?'Save changes to queued job ↗':video?'Generate video ↗':labels[op];$('#operation-caption').textContent=op==='txt2img'?'Create something new':video?'Source images preserved · clip saved separately':'Original preserved · result saved separately';
   const feature=toolCapabilities[op],ref=workflows.find(w=>w.id===$('#refinement-workflow').value);
-  $('#generate-button').disabled=busy||(op!=='txt2img'&&(!(sourceAsset||endAsset)||!feature?.available))||(!upscale&&!w?.available)||(op==='refine'&&(w?.id==='flux-schnell'||w?.media==='video'))||(op==='img2vid'&&!w?.start_image)||(op==='edit'&&!w?.source_image)||(['txt2img','refine'].includes(op)&&!!w?.source_image)||(!upscale&&!video&&$('#refinement-enabled').checked&&!ref?.available);
+  $('#generate-button').disabled=busy||editLocked||(op!=='txt2img'&&(!(sourceAsset||endAsset)||!feature?.available))||(!upscale&&!w?.available)||(op==='refine'&&(w?.id==='flux-schnell'||w?.media==='video'))||(op==='img2vid'&&!w?.start_image)||(op==='edit'&&!w?.source_image)||(['txt2img','refine'].includes(op)&&!!w?.source_image)||(!upscale&&!video&&$('#refinement-enabled').checked&&!ref?.available);
   $('#upscale-description').textContent=sourceAsset?`Output: ${sourceAsset.width*Number($('#upscale-factor').value)} × ${sourceAsset.height*Number($('#upscale-factor').value)}. RealESRGAN renders at 4×, then resizes for a 2× result.`:'';
   for(const [id,label] of [['variation-strength','variation-label'],['denoise','denoise-label'],['refinement-denoise','refinement-label']])$('#'+label).textContent=Number($('#'+id).value).toFixed(2);
 }
@@ -91,7 +94,7 @@ function updateOperation(){
 const findAsset=id=>id?api('/assets/'+id).catch(()=>null):null;
 async function restoreRecipe(r){sourceAsset=await findAsset(r.source_asset_id);endAsset=await findAsset(r.end_asset_id);loadRecipe(r);}
 async function startImageTool(op,asset=selected){
-  sourceAsset=asset;endAsset=null;const r={...asset.recipe,operation:op,source_asset_id:asset.id,end_asset_id:null,variation_seed:'-1',count:1};
+  endEditing(false);sourceAsset=asset;endAsset=null;const r={...asset.recipe,operation:op,source_asset_id:asset.id,end_asset_id:null,variation_seed:'-1',count:1};
   if(op==='refine'){r.refinement=null;if(['flux-schnell','upscale','import'].includes(r.workflow)||r.operation==='frame'||workflows.find(w=>w.id===r.workflow)?.media==='video'||workflows.find(w=>w.id===r.workflow)?.source_image){r.workflow='sdxl';r.model='';r.steps=null;r.cfg=null;}const scale=Math.min(1,1536/Math.max(asset.width,asset.height));r.width=Math.max(256,Math.round(asset.width*scale/64)*64);r.height=Math.max(256,Math.round(asset.height*scale/64)*64);}
   if(op==='edit'){const w=workflows.find(w=>w.source_image&&w.available)||workflows.find(w=>w.source_image);Object.assign(r,{workflow:w?.id||r.workflow,model:'',steps:null,cfg:null,refinement:null,negative:'',emphasis:[],seed:'-1',prompt:''});}
   if(op==='img2vid'){const w=workflows.find(w=>w.start_image&&w.available)||workflows.find(w=>w.start_image);Object.assign(r,{workflow:w?.id||r.workflow,model:'',steps:null,cfg:null,width:null,height:null,frames:null,refinement:null,negative:'',emphasis:[],seed:'-1'});if(asset.recipe.operation==='import')r.prompt='';}
@@ -108,14 +111,30 @@ $('#operation').onchange=run(async()=>{
   setModelOptions($('#workflow').value);
   if(m==='refine'&&sourceAsset)fitRefineCanvas(sourceAsset);
   saveDraft();});
-async function attachFile(e,slot){
-  const file=e.target.files[0];if(!file)return;e.target.value='';
+async function attachFile(file,slot){
   const form=new FormData();form.append('file',file);const asset=await api('/assets/import','POST',form);
   if(slot==='end')endAsset=asset;
   else{sourceAsset=asset;if(mode()==='refine')fitRefineCanvas(asset);}
   updateOperation();saveDraft();await refreshGallery();
 }
-$('#source-file').onchange=run(e=>attachFile(e,'source'));$('#end-file').onchange=run(e=>attachFile(e,'end'));
+// The file in a picker's change event; the picker is cleared so choosing the same file again still fires.
+function pickedFile(e){const file=e.target.files[0];e.target.value='';return file;}
+// Any box that takes an image also takes a file dragged onto it from Explorer.
+function dropZone(node,onFile){
+  const hasFiles=e=>e.dataTransfer.types.includes('Files');
+  node.addEventListener('dragover',e=>{if(!hasFiles(e))return;e.preventDefault();e.dataTransfer.dropEffect='copy';node.classList.add('drop-target');});
+  node.addEventListener('dragleave',e=>{if(!node.contains(e.relatedTarget))node.classList.remove('drop-target');});
+  node.addEventListener('drop',run(async e=>{
+    if(!hasFiles(e))return;e.preventDefault();node.classList.remove('drop-target');
+    const file=e.dataTransfer.files[0];
+    if(!file.type.startsWith('image/'))throw new Error(`${file.name} is not an image file`);
+    await onFile(file);
+  }));
+}
+// A file dropped beside a box would otherwise make the browser leave PixAnvil to display it.
+for(const type of ['dragover','drop'])window.addEventListener(type,e=>{if(e.dataTransfer.types.includes('Files'))e.preventDefault();});
+$('#source-file').onchange=run(e=>{const file=pickedFile(e);if(file)return attachFile(file,'source');});$('#end-file').onchange=run(e=>{const file=pickedFile(e);if(file)return attachFile(file,'end');});
+dropZone($('#source-card'),file=>attachFile(file,'source'));dropZone($('#end-card'),file=>attachFile(file,'end'));
 $('#clear-end').onclick=()=>{endAsset=null;updateOperation();saveDraft();};
 $('#clear-source').onclick=()=>{sourceAsset=null;if(mode()==='variation'){setMode('image');setModelOptions($('#workflow').value);}updateOperation();saveDraft();};
 for(const id of ['variation-strength','denoise','refinement-denoise','upscale-factor','refinement-enabled'])$('#'+id).oninput=()=>{updateOperation();saveDraft();};
@@ -123,8 +142,43 @@ $('#refinement-workflow').onchange=()=>{refinementModels();updateOperation();sav
 function updateLabels(){$('#quality-label').textContent=profiles[+$('#quality').value].replace(/^./,c=>c.toUpperCase());$('#weight-label').textContent=Number($('#emphasis-weight').value).toFixed(2)+'×';}
 $('#quality').oninput=()=>{updateLabels();$('#steps').value='';$('#cfg').value='';saveDraft();};$('#emphasis-weight').oninput=()=>{updateLabels();saveDraft();};$('#workflow').onchange=()=>{if(videoMode())$('#refinement-enabled').checked=false;setModelOptions($('#workflow').value);$('#steps').value='';$('#cfg').value='';saveDraft();};
 $('#generation-form').addEventListener('input',()=>{if(workflows.length)saveDraft();});
+$('#random-seed').onclick=()=>{$('#seed').value='-1';saveDraft();};
+// Editing a queued job reuses the Generate form. The server refuses the save once the job has started,
+// and the form locks as soon as the job is seen leaving the queue.
+async function editJob(j){
+  if(!editingJob)stashedDraft=localStorage.getItem('pixanvil-draft');
+  editingJob=j.id;editLocked=false;
+  await restoreRecipe(j.recipe);$('#count').value=1;
+  $('#job-dialog').close();tab('generate');showEditing();
+}
+function showEditing(){
+  $('#edit-banner').hidden=!editingJob;$('#edit-banner').classList.toggle('locked',editLocked);
+  $('#edit-status').textContent=editLocked?'This job has started, so its settings are locked. Stop editing to return to your draft.':'Editing a queued job. Changes apply only when you save them.';
+  $('#generation-fields').disabled=editLocked;
+  if(workflows.length)updateOperation();
+}
+// Leave edit mode. With restore, the draft the user had before editing comes back.
+async function endEditing(restore=true){
+  if(!editingJob)return;
+  editingJob=null;editLocked=false;showEditing();
+  const draft=stashedDraft;stashedDraft=null;
+  if(restore&&draft)await restoreRecipe(JSON.parse(draft));
+}
+async function saveJobEdit(){
+  busy=true;updateOperation();
+  try{await api('/jobs/'+editingJob,'PUT',data());}
+  catch(e){await refreshJobs();throw e;}
+  finally{busy=false;updateOperation();}
+  await endEditing();notice('Saved changes to the queued job.');tab('live');await refreshJobs();
+}
+// The form locks once the job being edited is no longer waiting in the queue.
+function checkEditing(jobs){
+  if(!editingJob||editLocked)return;
+  if(jobs.find(j=>j.id===editingJob)?.state!=='queued'){editLocked=true;showEditing();}
+}
+$('#stop-editing').onclick=run(()=>endEditing());
 $('#example-prompt').onclick=()=>{$('#prompt').value='Create a high quality image of a young, handsome teenage water knight casting a powerful water spell. Sleeveless armor, cinematic lighting';saveDraft();};
-$('#generation-form').onsubmit=run(async e=>{e.preventDefault();busy=true;$('#generate-button').disabled=true;try{const response=await api('/jobs','POST',data());notice(`Queued ${response.jobs.length} ${response.jobs[0].recipe.media==='video'?'video':'image'}(s). You can keep browsing; results save automatically.`);await refreshJobs();}finally{busy=false;setModelOptions($('#workflow').value,$('#model').value);}});
+$('#generation-form').onsubmit=run(async e=>{e.preventDefault();if(editingJob)return saveJobEdit();busy=true;$('#generate-button').disabled=true;try{const response=await api('/jobs','POST',data());notice(`Queued ${response.jobs.length} ${response.jobs[0].recipe.media==='video'?'video':'image'}(s). You can keep browsing; results save automatically.`);await refreshJobs();}finally{busy=false;setModelOptions($('#workflow').value,$('#model').value);}});
 async function refreshGallery(append=false){if(!append)offset=0;const response=await api(`/assets?limit=48&offset=${offset}&favorites=${favorites}&q=${encodeURIComponent($('#search').value)}`);total=response.total;assets=append?[...assets,...response.items]:response.items;offset=assets.length;$('#image-count').textContent=`${total} image${total===1?'':'s'}`;$('#empty-gallery').hidden=total>0;$('#load-more').hidden=offset>=total;const grid=$('#gallery-grid');grid.replaceChildren();for(const a of assets){const card=el('button','card');card.setAttribute('aria-label',a.recipe.prompt);const imgWrap=el('div','card-image');const img=el('img');img.src=`/api/assets/${a.id}/thumbnail`;img.alt=a.recipe.prompt;img.loading='lazy';imgWrap.append(img);if(a.favorite)imgWrap.append(el('span','heart','♥'));if(isVideo(a))imgWrap.append(el('span','play',`▶ ${clipSeconds(a.recipe)}s`));const text=el('div','card-text');text.append(el('strong','',a.recipe.prompt),el('span','',`${a.width} × ${a.height}`));card.append(imgWrap,text,el('small','',`${a.recipe.workflow} / ${new Date(a.created).toLocaleDateString()}`));card.onclick=()=>openAsset(a);grid.append(card);}renderPending();if(!favorites&&!$('#search').value){if(assets.length)showLatest(assets[0]);else if(latestId===''){$('#latest-preview').replaceChildren(...latestPlaceholder.map(n=>n.cloneNode(true)));$('#latest-caption').textContent='';}}}
 // The Live tab's empty state, restored when its last result is deleted.
 const latestPlaceholder=[...$('#latest-preview').childNodes].map(n=>n.cloneNode(true));
@@ -142,7 +196,7 @@ function inputThumbs(r){
     if(!id)continue;
     const figure=el('figure'),img=el('img');img.src=`/api/assets/${id}/thumbnail`;img.alt=label.toLowerCase()+' image';img.loading='lazy';
     // An image that has since left the library simply drops out.
-    img.onerror=()=>figure.remove();figure.onclick=run(async e=>{e.stopPropagation();openAsset(await api('/assets/'+id));});
+    img.onerror=()=>figure.remove();
     figure.append(img,el('figcaption','',label));box.append(figure);
   }
   return box;
@@ -152,12 +206,13 @@ function renderPending(){
   const grid=$('#gallery-grid');grid.querySelectorAll('.card.pending').forEach(n=>n.remove());
   if(favorites||$('#search').value)return;
   const cards=activeJobs.map(j=>{
-    const card=el('button','card pending'),frame=el('div','card-image'),source=j.recipe.source_asset_id||j.recipe.end_asset_id;
-    card.setAttribute('aria-label','In progress: '+j.recipe.prompt);
+    const card=el('div','card pending'),frame=el('div','card-image'),source=j.recipe.source_asset_id||j.recipe.end_asset_id;
+    card.tabIndex=0;card.setAttribute('role','button');card.setAttribute('aria-label','Show job details: '+j.recipe.prompt);
+    card.onclick=()=>openJob(j);card.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();openJob(j);}};
     if(source){const img=el('img');img.src=`/api/assets/${source}/thumbnail`;img.alt='';img.onerror=()=>img.remove();frame.append(img);}
     frame.append(el('span','state',j.state==='queued'?'Queued':j.state==='unknown'?'Needs attention':'Rendering'),progressView(j));
     const text=el('div','card-text');text.append(el('strong','',j.recipe.prompt),el('span','',j.recipe.media==='video'?'video':'image'));
-    card.append(frame,text,el('small','',`${j.recipe.workflow} / on its way`));card.onclick=()=>tab('live');return card;
+    card.append(frame,text,el('small','',`${j.recipe.workflow} / on its way`));return card;
   });
   grid.prepend(...cards);$('#empty-gallery').hidden=total>0||cards.length>0;
 }
@@ -165,7 +220,16 @@ let searchTimer;$('#search').oninput=()=>{clearTimeout(searchTimer);searchTimer=
 function openAsset(a){selected=a;const video=isVideo(a),file=`/api/assets/${a.id}/file`;$('#full-image').hidden=video;$('#full-video').hidden=!video;
   if(video){if(!$('#full-video').src.endsWith(file)){$('#full-video').poster=`/api/assets/${a.id}/thumbnail`;$('#full-video').src=file;}}else{$('#full-video').removeAttribute('src');$('#full-image').src=file;$('#full-image').alt=a.recipe.prompt;}
   $('#image-prompt').textContent=a.recipe.prompt;$('#image-details').replaceChildren();const details={Operation:a.recipe.operation||'txt2img',Model:a.recipe.model,Seed:a.recipe.seed,Size:`${a.width} × ${a.height}`,Steps:a.recipe.steps,Guidance:a.recipe.cfg,Workflow:a.recipe.workflow,File:a.path};if(video)details.Length=`${clipSeconds(a.recipe)} s · ${a.recipe.frames} frames at ${a.recipe.fps} fps`;if(a.recipe.operation==='variation'){details['Variation seed']=a.recipe.variation_seed;details.Strength=a.recipe.variation_strength;}if(a.recipe.operation==='refine')details.Denoise=a.recipe.denoise;if(a.recipe.refinement)details['Second model']=a.recipe.refinement.model;for(const [k,v]of Object.entries(details)){ $('#image-details').append(el('dt','',k),el('dd','',String(v)));}$('#image-recipe').textContent=JSON.stringify(a.recipe,null,2);$('#download-image').href=file;$('#download-image').download=a.id+(video?'.mp4':'.png');$('#download-image').textContent=video?'Download MP4':'Download PNG';$('#refine-image').disabled=$('#upscale-image').disabled=$('#animate-image').disabled=$('#edit-image').disabled=video;$('#frame-image').hidden=!video;$('#favorite-image').textContent=a.favorite?'♥ Favorited':'♡ Favorite';$('#parent-image').hidden=!a.recipe.parent_asset_id;$('#vary-image').disabled=video||!['txt2img','variation'].includes(a.recipe.operation||'txt2img');if(!$('#viewer').open)$('#viewer').showModal();}
-$('#close-viewer').onclick=()=>$('#viewer').close();$('#viewer').addEventListener('close',()=>$('#full-video').pause());$('#reuse-image').onclick=run(async()=>{await restoreRecipe(selected.recipe);$('#viewer').close();tab('generate');});$('#favorite-image').onclick=run(async()=>{selected=await api('/assets/'+selected.id,'PUT',{favorite:!selected.favorite,rating:selected.rating});openAsset(selected);await refreshGallery();});
+// Left and right arrows step through the gallery in its displayed order, loading more as needed.
+$('#viewer').addEventListener('keydown',run(async e=>{
+  if(!['ArrowLeft','ArrowRight'].includes(e.key)||e.target.closest('input,textarea,select'))return;
+  e.preventDefault();
+  const i=assets.findIndex(a=>a.id===selected?.id);if(i<0)return;
+  const next=i+(e.key==='ArrowRight'?1:-1);
+  if(next>=assets.length&&offset<total)await refreshGallery(true);
+  if(next>=0&&next<assets.length)openAsset(assets[next]);
+}));
+$('#close-viewer').onclick=()=>$('#viewer').close();$('#viewer').addEventListener('close',()=>$('#full-video').pause());$('#reuse-image').onclick=run(async()=>{endEditing(false);await restoreRecipe(selected.recipe);$('#viewer').close();tab('generate');});$('#favorite-image').onclick=run(async()=>{selected=await api('/assets/'+selected.id,'PUT',{favorite:!selected.favorite,rating:selected.rating});openAsset(selected);await refreshGallery();});
 $('#vary-image').onclick=run(()=>startImageTool('variation'));$('#refine-image').onclick=run(()=>startImageTool('refine'));$('#upscale-image').onclick=run(()=>startImageTool('upscale'));$('#animate-image').onclick=run(()=>startImageTool('img2vid'));$('#edit-image').onclick=run(()=>startImageTool('edit'));
 // A clip's first frame becomes an ordinary image, ready for Edit and then Animate.
 $('#frame-image').onclick=run(async()=>{const frame=await api(`/assets/${selected.id}/first-frame`,'POST');await refreshGallery();openAsset(frame);});
@@ -180,6 +244,41 @@ async function deleteRecord(path,question){
   await Promise.all([refreshGallery(),refreshJobs()]);
   return true;
 }
+// Return the Generate form, the gallery search and the saved draft to a fresh visit's defaults.
+function resetForm(){
+  editingJob=null;editLocked=false;stashedDraft=null;showEditing();
+  localStorage.removeItem('pixanvil-draft');
+  sourceAsset=null;endAsset=null;optionsWorkflow='';
+  $('#generation-form').reset();$('#search').value='';
+  if(workflows.length){setMode('image','flux-dev');setModelOptions($('#workflow').value);refinementModels();}
+  updateLabels();
+}
+// Start over: list everything the library holds, then delete it all once the user confirms.
+function count(n,one,many){return `${n} ${n===1?one:many}`;}
+function fileSize(bytes){const units=['bytes','KB','MB','GB','TB'];let i=0;while(bytes>=1024&&i<units.length-1){bytes/=1024;i++;}return i?`${bytes.toFixed(1)} ${units[i]}`:`${bytes} bytes`;}
+$('#open-wipe').onclick=run(async()=>{
+  const s=await api('/library/summary');
+  $('#wipe-summary').replaceChildren(...[
+    count(s.jobs,'history entry','history entries')+', including their prompts and recipes',
+    count(s.generated,'generated image or video','generated images and videos'),
+    count(s.imported,'imported image','imported images'),
+    count(s.inputs,'saved source image','saved source images')+' used by image and video tools',
+    `${fileSize(s.bytes)} of files in total`,
+  ].map(t=>el('li','',t)));
+  const empty=!s.jobs&&!s.generated&&!s.imported&&!s.inputs;
+  $('#wipe-blocked').hidden=!s.busy&&!empty;
+  $('#wipe-blocked').textContent=s.busy?`${count(s.busy,'job','jobs')} may still be running on ComfyUI. Wait for ${s.busy===1?'it':'them'} to finish, or abandon ${s.busy===1?'it':'them'} in History, then try again.`:'There is nothing to delete.';
+  $('#confirm-wipe').disabled=Boolean(s.busy)||empty;
+  $('#wipe-dialog').showModal();
+});
+$('#close-wipe').onclick=$('#cancel-wipe').onclick=()=>$('#wipe-dialog').close();
+$('#confirm-wipe').onclick=run(async()=>{
+  const r=await api('/library','DELETE');
+  latestId='';resetForm();
+  $('#wipe-dialog').close();
+  notice(r.leftover_files.length?`Deleted, but these files could not be removed: ${r.leftover_files.join(', ')}`:`Deleted ${count(r.deleted_jobs,'history entry','history entries')}, ${count(r.deleted_assets,'output','outputs')} and ${count(r.deleted_inputs,'saved source image','saved source images')}.`);
+  await Promise.all([refreshGallery(),refreshJobs()]);
+});
 $('#delete-image').onclick=run(async()=>{
   const a=selected,kind=isVideo(a)?'video':'image';
   const others=a.job_id?((await api('/jobs/'+a.job_id).catch(()=>null))?.outputs.length||1)-1:0;
@@ -197,9 +296,43 @@ function progressView(j){
   if(measured){const bar=el('progress');bar.max=p.max;bar.value=p.value;bar.setAttribute('aria-label',p.stage+' progress');box.append(bar);}
   return box;
 }
+// Job details for the Live tab: what was asked for, when, where it stands in the queue, and how far it has got.
+let openJobId=null;
+function openJob(j){openJobId=j.id;showJob(j,activeJobs);$('#job-dialog').showModal();}
+const jobStatus={queued:'Waiting in the queue',submitting:'Sending to ComfyUI',running:'Rendering now',collecting:'Saving results',unknown:'Needs attention: ComfyUI may still be working on it',complete:'Finished',failed:'Failed',cancelled:'Cancelled',abandoned:'Abandoned'};
+function showJob(j,active){
+  const r=j.recipe,ahead=active.filter(a=>a.created<j.created).length;
+  const details={
+    Status:jobStatus[j.state]||j.state,
+    Queue:j.state==='queued'?(ahead?`${count(ahead,'job','jobs')} ahead of it`:'Next up'):null,
+    Submitted:new Date(j.created).toLocaleString(),
+    Operation:r.operation||'txt2img',Workflow:r.workflow,Model:r.model,Seed:r.seed,
+    Size:r.width&&r.height?`${r.width} × ${r.height}`:null,
+    Length:r.media==='video'&&r.frames?`${clipSeconds(r)} s · ${r.frames} frames at ${r.fps} fps`:null,
+    Steps:r.steps,Guidance:r.cfg,
+    Denoise:['refine','edit'].includes(r.operation)?r.denoise:null,
+    Strength:r.operation==='variation'?r.variation_strength:null,
+    Scale:r.operation==='upscale'?`${r.scale}×`:null,
+    Negative:r.negative,
+  };
+  const list=el('dl');
+  for(const [k,v] of Object.entries(details))if(v!==null&&v!==undefined&&v!=='')list.append(el('dt','',k),el('dd','',String(v)));
+  $('#job-title').textContent=r.prompt||'Untitled job';
+  $('#job-body').replaceChildren(progressView(j),...(j.error?[el('p','error',j.error)]:[]),inputThumbs(r),list);
+  const actions=[];
+  if(j.state==='queued'){const edit=el('button','quiet','Edit settings');edit.onclick=run(()=>editJob(j));actions.push(edit);}
+  if(j.state==='queued'||j.state==='unknown'){
+    const b=el('button','quiet',j.state==='queued'?'Cancel queued':'Abandon local job');
+    b.onclick=run(async()=>{await api(`/jobs/${j.id}/${j.state==='queued'?'cancel':'abandon'}`,'POST');await refreshJobs();});actions.push(b);
+  }
+  const close=el('button','quiet','Close');close.onclick=()=>$('#job-dialog').close();actions.push(close);
+  $('#job-actions').replaceChildren(...actions);
+}
+$('#close-job').onclick=()=>$('#job-dialog').close();
 let galleryJobSignature='';
 async function refreshJobs(){
   const jobs=(await api('/jobs')).items;
+  checkEditing(jobs);
   const sig=JSON.stringify(jobs.map(j=>[j.id,j.state,j.outputs,j.error,j.progress]));
   if(sig===lastSignature)return;
   lastSignature=sig;
@@ -213,7 +346,8 @@ async function refreshJobs(){
     body.append(el('p','',j.recipe.prompt),el('small','',`${j.recipe.workflow} · seed ${j.recipe.seed} · ${new Date(j.created).toLocaleString()}`),inputThumbs(j.recipe),progressView(j));
     if(j.error)body.append(el('p','error',j.error));
     const actions=el('div'),reuse=el('button','quiet','Reuse settings');
-    reuse.onclick=run(async()=>{await restoreRecipe(j.recipe);tab('generate');});actions.append(reuse);
+    reuse.onclick=run(async()=>{endEditing(false);await restoreRecipe(j.recipe);tab('generate');});actions.append(reuse);
+    if(j.state==='queued'){const edit=el('button','quiet','Edit settings');edit.onclick=run(()=>editJob(j));actions.append(edit);}
     if(j.state==='queued'||j.state==='unknown'){
       const b=el('button','quiet',j.state==='queued'?'Cancel queued':'Abandon local job');
       b.onclick=run(async()=>{await api(`/jobs/${j.id}/${j.state==='queued'?'cancel':'abandon'}`,'POST');await refreshJobs();});actions.append(b);
@@ -230,19 +364,26 @@ async function refreshJobs(){
   $('#activity').replaceChildren();
   if(!active.length)$('#activity').textContent='Ready for your next idea.';
   for(const j of active){
-    const item=el('div','activity-job');
+    const item=el('div','activity-job');item.tabIndex=0;item.setAttribute('role','button');item.setAttribute('aria-label','Show job details: '+j.recipe.prompt);
+    item.onclick=()=>openJob(j);
+    item.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();item.click();}};
     item.append(el('p','',`${j.state.toUpperCase()} · ${j.recipe.prompt.slice(0,85)}${j.error?' — '+j.error:''}`),inputThumbs(j.recipe),progressView(j));
     $('#activity').append(item);
   }
   $('#footer-status').textContent=active.length?`${active.length} active job(s) · progress updates every 2 seconds`:'Your library stays on this machine.';
   // Newest first, matching the gallery's order.
   activeJobs=active;renderPending();
+  // An open job details dialog follows the job until it finishes.
+  const shown=$('#job-dialog').open&&jobs.find(j=>j.id===openJobId);
+  if(shown)showJob(shown,active);
   if(changed)await refreshGallery();
 }
 async function connection(){const c=await api('/connection');$('#connection-dot').classList.toggle('ready',c.state==='ready');$('#connection-label').textContent=c.state==='ready'?'Connected · ready':c.state==='starting'?'Starting ComfyUI…':'Unavailable';$('#start-comfy').hidden=c.state==='ready';$('#start-comfy').disabled=c.state==='starting';$('#connection-detail').textContent=c.state==='ready'?`Connected to ${c.url}`:(c.startup?.message||c.error||'');if(c.state==='ready'&&!workflows.length)await loadWorkflows();}
-async function loadWorkflows(){try{workflows=(await api('/workflows')).items;toolCapabilities=await api('/image-tools');$('#upscale-model').replaceChildren(...(toolCapabilities.upscale?.models||[]).filter(m=>m==='RealESRGAN_x4plus.pth').map(m=>{const o=el('option','',m);o.value=m;return o;}));setMode(mode(),$('#workflow').value||'flux-dev');setModelOptions($('#workflow').value);refinementModels();const draft=localStorage.getItem('pixanvil-draft');if(draft)await restoreRecipe(JSON.parse(draft));}catch(e){$('#workflow-description').textContent=e.message;$('#generate-button').disabled=true;}}
+async function loadWorkflows(){try{workflows=(await api('/workflows')).items;toolCapabilities=await api('/image-tools');$('#upscale-model').replaceChildren(...(toolCapabilities.upscale?.models||[]).filter(m=>m==='RealESRGAN_x4plus.pth').map(m=>{const o=el('option','',m);o.value=m;return o;}));setMode(mode(),$('#workflow').value||'flux-dev');setModelOptions($('#workflow').value);refinementModels();const draft=localStorage.getItem('pixanvil-draft');// A fresh visit always starts with a random seed; a fixed seed lasts only until the page is reloaded.
+  if(draft)await restoreRecipe({...JSON.parse(draft),seed:'-1'});}catch(e){$('#workflow-description').textContent=e.message;$('#generate-button').disabled=true;}}
 $('#start-comfy').onclick=run(async()=>{await api('/connection/start','POST');notice('Starting ComfyUI on SPARK. Status will update here.');await connection();});
 $('#settings-form').onsubmit=run(async e=>{e.preventDefault();await api('/settings','PUT',{library:$('#library').value,comfy_url:$('#comfy-url').value,ssh_host:$('#ssh-host').value});workflows=[];notice('Settings saved. Existing images remain linked to their original files.');await connection();});$('#discover').onclick=run(async()=>{const d=await api('/discover');$('#discovery-result').textContent=d.addresses.length?`${d.hostname} → ${d.addresses.join(', ')}`:d.error;if(d.addresses.length){$('#comfy-url').value=`http://${d.hostname}:8188`;$('#ssh-host').value=`exordium@${d.hostname}`;}});
-$('#metadata-file').onchange=run(async e=>{const file=e.target.files[0];if(!file)return;const form=new FormData();form.append('file',file);metadata=await api('/inspect','POST',form);$('#metadata-content').textContent=JSON.stringify(metadata.recipe||metadata.raw,null,2);$('#metadata-notice').textContent=metadata.notice||`Recovered ${metadata.format} settings. Review before generating.`;$('#load-metadata').hidden=!metadata.recipe;$('#metadata-dialog').showModal();e.target.value='';});$('#close-metadata').onclick=()=>$('#metadata-dialog').close();$('#load-metadata').onclick=run(async()=>{await restoreRecipe(metadata.recipe);$('#metadata-dialog').close();});
+async function readMetadata(file){const form=new FormData();form.append('file',file);metadata=await api('/inspect','POST',form);$('#metadata-content').textContent=JSON.stringify(metadata.recipe||metadata.raw,null,2);$('#metadata-notice').textContent=metadata.notice||`Recovered ${metadata.format} settings. Review before generating.`;$('#load-metadata').hidden=!metadata.recipe;$('#metadata-dialog').showModal();}
+$('#metadata-file').onchange=run(e=>{const file=pickedFile(e);if(file)return readMetadata(file);});dropZone($('#metadata-drop'),readMetadata);$('#close-metadata').onclick=()=>$('#metadata-dialog').close();$('#load-metadata').onclick=run(async()=>{endEditing(false);await restoreRecipe(metadata.recipe);$('#metadata-dialog').close();});
 async function init(){tab(location.hash.slice(1)||'gallery');const settings=await api('/settings');$('#library').value=settings.library;$('#comfy-url').value=settings.comfy_url;$('#ssh-host').value=settings.ssh_host;await Promise.all([refreshGallery(),refreshPresets(),refreshJobs(),connection()]);setInterval(()=>refreshJobs().catch(()=>{}),2000);setInterval(()=>connection().catch(()=>{}),10000);}
 run(init)();

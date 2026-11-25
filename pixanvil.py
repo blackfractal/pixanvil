@@ -40,6 +40,21 @@ def ensure_server(base,port):
     raise RuntimeError('Server did not start. See '+str(state/'server.log'))
 
 
+def stop_server(base):
+    try:
+        if request(base,'/api/health').get('app')!='pixanvil': raise RuntimeError('Port belongs to another application')
+    except httpx.ConnectError:
+        print('PixAnvil is not running.'); return 0
+    active=request(base,'/api/shutdown','POST')['active']
+    if active: print(f'{active} job(s) are still active. They are saved and resume when PixAnvil starts again.')
+    for _ in range(40):
+        time.sleep(.5)
+        try: request(base,'/api/health')
+        except httpx.ConnectError:
+            print('PixAnvil stopped.'); return 0
+    raise RuntimeError('The server was asked to stop but is still answering. See '+str(state_directory()/'server.log'))
+
+
 def import_file(base,path):
     path=Path(path)
     with path.open('rb') as handle:
@@ -74,8 +89,8 @@ def main():
     imp.add_argument('file')
     imp.add_argument('--port',type=int,default=8790)
     imp.add_argument('--json',action='store_true',help='Print the whole asset record instead of its id')
-    for name in ('open','status','start-comfy'):
-        cmd=sub.add_parser(name)
+    for name,description in (('open',None),('status',None),('start-comfy',None),('stop','Stop the running PixAnvil server')):
+        cmd=sub.add_parser(name,help=description)
         cmd.add_argument('--port',type=int,default=8790)
     args=parser.parse_args()
     if not args.command: parser.print_help(); return 0
@@ -86,8 +101,13 @@ def main():
         if args.open:
             import threading
             threading.Timer(1.5,lambda:webbrowser.open(base)).start()
-        uvicorn.run(make_app(),host='127.0.0.1',port=args.port,ws='none')
+        app=make_app()
+        server=uvicorn.Server(uvicorn.Config(app,host='127.0.0.1',port=args.port,ws='none'))
+        # Lets `pixanvil.py stop` end a server that runs in the background with no window.
+        app.state.shutdown=lambda:setattr(server,'should_exit',True)
+        server.run()
         return 0
+    if args.command=='stop': return stop_server(base)
     ensure_server(base,args.port)
     if args.command=='open': webbrowser.open(base); print(base); return 0
     if args.command=='status': print(json.dumps(request(base,'/api/connection'),indent=2)); return 0

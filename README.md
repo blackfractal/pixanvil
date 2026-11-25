@@ -49,6 +49,10 @@ python pixanvil.py import C:\path	o\image.png
 # Run the app in the foreground; Ctrl+C stops the server
 python pixanvil.py serve --open
 
+# Stop the server, including one started in the background by generate or open.
+# Unfinished jobs are saved and resume on the next start.
+python pixanvil.py stop
+
 # Connection diagnostics
 python pixanvil.py status
 ```

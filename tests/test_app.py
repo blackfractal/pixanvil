@@ -303,3 +303,32 @@ def test_live_progress_reaches_job_api_and_clears_after_collection(app,monkeypat
         assert client.get('/api/jobs/'+item['id']).json()['progress'] is None
     assert len(watchers)==1
     assert Fake.submitted==[item['id']]
+
+
+def test_queued_job_settings_can_change_before_submission(app):
+    job=submit(app,seed='7')[0]
+    with TestClient(app) as client:
+        response=client.put('/api/jobs/'+job['id'],json={'prompt':'a fire knight','workflow':'sdxl','seed':'42'},headers=HEADERS)
+        assert response.status_code==200,response.text
+        edited=response.json()
+    assert edited['id']==job['id'] and edited['created']==job['created'] and edited['state']=='queued'
+    assert edited['recipe']['prompt']=='a fire knight' and edited['recipe']['seed']=='42'
+    assert edited['graph']!=job['graph']
+    app.state.engine.tick()
+    assert Fake.submitted==[job['id']]
+    assert app.state.store.job(job['id'])['recipe']['prompt']=='a fire knight'
+
+
+def test_started_job_settings_cannot_change(app):
+    job=submit(app)[0]; app.state.engine.tick()
+    with TestClient(app) as client:
+        response=client.put('/api/jobs/'+job['id'],json={'prompt':'too late','workflow':'sdxl'},headers=HEADERS)
+        assert response.status_code==409
+        assert client.put('/api/jobs/missing',json={'prompt':'x','workflow':'sdxl'},headers=HEADERS).status_code==404
+    assert app.state.store.job(job['id'])['recipe']['prompt']=='a water knight'
+
+
+def test_queued_job_edit_makes_one_output(app):
+    job=submit(app)[0]
+    with TestClient(app) as client:
+        assert client.put('/api/jobs/'+job['id'],json={'prompt':'x','workflow':'sdxl','count':2},headers=HEADERS).status_code==422
