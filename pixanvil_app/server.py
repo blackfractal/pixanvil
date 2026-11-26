@@ -145,6 +145,14 @@ class BranchExport(BaseModel):
     items: list[str] = Field(min_length=1, max_length=2000)
 
 
+class PairChoice(BaseModel):
+    # The pair is the one this finished clip belongs to.
+    clip_id: str = Field(max_length=200)
+    preferred: bool = False
+    label_mode: Literal['stats','custom'] | None = None
+    label: str | None = Field(default=None, max_length=60)
+
+
 class Chain(BaseModel):
     clips: list[str] = Field(min_length=1, max_length=200)
 
@@ -554,6 +562,7 @@ def make_app(state=None, worker=True, client_factory=Comfy):
     def branch_graph():
         def has_last_frame(clip): return clip_frame_files(clip,'last')[0].is_file()
         nodes,clips=branches.build(store.all_assets(),store.active(),store.branch_added(),has_last_frame)
+        branches.mark_takes(nodes,clips,store.branch_pairs())
         return nodes,branches.trees(nodes,clips)
 
     @app.get('/api/branches')
@@ -613,6 +622,17 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         nodes,_=branch_graph()
         if not any(branches.label_key(n)==image_id for n in nodes.values()): raise HTTPException(404,'Not in Branches')
         store.set_branch_label(image_id,value.label.strip())
+        return {'ok':True}
+
+    @app.put('/api/branches/pairs')
+    def choose_for_pair(value:PairChoice):
+        """Make a take the preferred one between its two images, or set how their connection is labelled."""
+        nodes,trees=branch_graph()
+        clip=next((c for t in trees for c in t['clips'] if c['id']==value.clip_id),None)
+        if not clip or clip['pending']: raise HTTPException(404,'Not a finished clip in Branches')
+        keys=branches.pair_keys(nodes,clip)
+        store.set_branch_pair(*keys,preferred_clip=clip['id'] if value.preferred else None,
+                              label_mode=value.label_mode,label=None if value.label is None else value.label.strip())
         return {'ok':True}
 
     def node_picture(node):

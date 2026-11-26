@@ -467,6 +467,8 @@ const NODE_W=128,NODE_H=84,COLUMN=250,ROW=124;
 let cy=null,branchTree=null,branchOpenId=null,branchSignature='',positionQueue={},positionTimer=null;
 // The clip a playing chain is on, kept so a redraw can highlight it again; redrawingTree hides the redraw's own reselection.
 let chainPlaying=null,redrawingTree=false,chainTimer=null,branchFocus=[];
+// Takes: the clips between the same two nodes form one pair, drawn as one connection whose id is its preferred take's.
+let branchPairs=new Map(),pairByEdge=new Map(),pairByClip=new Map();
 // Loading and drawing run one at a time, so a poll arriving mid-draw cannot build the graph twice.
 let branchWork=Promise.resolve();
 function branchTask(fn){branchWork=branchWork.catch(()=>{}).then(fn);return branchWork;}
@@ -493,14 +495,16 @@ async function loadTree(id){
   branchOpenId=tree.id;branchTree=tree;
   $('#tree-picker').hidden=true;$('#tree-view').hidden=false;
   if(document.activeElement!==$('#tree-name'))$('#tree-name').value=tree.name;
-  $('#tree-summary').textContent=`${count(tree.clips.filter(c=>!c.pending).length,'clip','clips')} · ${tree.seconds} s of footage`+(tree.pending?` · ${tree.pending} rendering`:'');
+  setPairs(tree);
+  const finished=tree.clips.filter(c=>!c.pending).length;
+  $('#tree-summary').textContent=`${count(tree.connections,'connection','connections')} · ${count(finished,'clip','clips')} · ${tree.seconds} s of footage`+(tree.pending?` · ${tree.pending} on the way`:'');
   const signature=JSON.stringify([tree.nodes,tree.clips]);
   if(fresh||signature!==branchSignature){branchSignature=signature;await drawTree(tree,fresh);}
   else cy?.resize();
   // Opened to show particular items, such as the clips a joined chain was made from.
   if(branchFocus.length&&cy){
     const focus=branchFocus;branchFocus=[];
-    cy.elements().unselect();for(const item of focus)cy.getElementById(item).select();
+    cy.elements().unselect();for(const item of focus)cy.getElementById(pairByClip.get(item)?.id||item).select();
   }
 }
 // Saved positions win. A tree seen for the first time is laid out left to right by dagre; after that a new node
@@ -552,6 +556,7 @@ function freeSpot(x,y,taken){
     if(!spots.some(p=>Math.abs(p.x-x)<NODE_W&&Math.abs(p.y-candidate.y)<NODE_H+16))return candidate;
   }
 }
+const SELECTED='#8ec5f0',GENERATING='#b8d68e';
 function branchStyle(){
   const accent=getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
   return [
@@ -561,34 +566,99 @@ function branchStyle(){
     {selector:'node.virtual',style:{opacity:.55,'border-style':'dashed'}},
     {selector:'node.pending',style:{'border-style':'dashed','text-valign':'center','text-margin-y':0}},
     {selector:'node.missing',style:{'border-style':'dashed','border-color':'#a5523f','text-valign':'center','text-margin-y':0}},
-    {selector:'node:selected',style:{'border-color':accent,'border-width':3,opacity:1}},
+    // Orange and green mean queued and generating here, as on the History tab, so selection is blue.
+    {selector:'node:selected',style:{'border-color':SELECTED,'border-width':3,opacity:1}},
     {selector:'edge',style:{'curve-style':'bezier','control-point-step-size':40,width:3,'line-color':'#5b6450','target-arrow-shape':'triangle','target-arrow-color':'#5b6450',
       label:'data(label)',color:'#cbd0c3','font-size':10,'text-background-color':'#101210','text-background-opacity':1,'text-background-padding':3}},
+    // Dotted: no finished take yet. Orange: takes queued. Blinking: a take generating now, green when nothing is
+    // queued after it. Together the orange lines show the whole queue and the blinking one shows what runs now.
     {selector:'edge.pending',style:{'line-style':'dashed'}},
-    {selector:'edge:selected',style:{'line-color':accent,'target-arrow-color':accent,width:4}},
+    // Both ways between two images: straight, with endpoints set by placeTwoWay so the pair runs side by side.
+    {selector:'edge.two-way',style:{'curve-style':'straight'}},
+    {selector:'edge.rendering',style:{'line-color':GENERATING,'target-arrow-color':GENERATING}},
+    {selector:'edge.queued',style:{'line-color':accent,'target-arrow-color':accent}},
+    {selector:'edge.rendering.blink',style:{'line-opacity':.3}},
+    {selector:'edge:selected',style:{'line-color':SELECTED,'target-arrow-color':SELECTED,width:4}},
     {selector:'edge.playing',style:{'line-color':'#f4f1e8','target-arrow-color':'#f4f1e8',width:6}},
   ];
 }
+// The blink of rendering connections. A system asking for reduced motion gets a steady line; the label still says rendering.
+const calmMotion=matchMedia('(prefers-reduced-motion: reduce)');
+setInterval(()=>{if(cy&&!calmMotion.matches&&!$('#branches').hidden)cy.edges('.rendering').toggleClass('blink');},700);
 // The text under a node: its label, and its state when it has no picture.
 function nodeCaption(n){
   const state={pending:'Rendering…',missing:'Deleted image'}[n.kind]||(n.available?'':'No saved frame');
   return [n.label,state].filter(Boolean).join(' · ');
+}
+// ---- Takes: every clip between the same two nodes is one pair, drawn as one connection however many there are. ----
+function setPairs(tree){
+  branchPairs=new Map();
+  for(const c of tree.clips){
+    const key=c.source+'>'+c.target;
+    if(!branchPairs.has(key))branchPairs.set(key,{key,source:c.source,target:c.target,takes:[],pending:[],labelMode:'stats',label:''});
+    const pair=branchPairs.get(key);
+    (c.pending?pair.pending:pair.takes).push(c);
+    pair.labelMode=c.pair_label_mode||'stats';pair.label=c.pair_label||'';
+  }
+  pairByEdge=new Map();pairByClip=new Map();
+  for(const pair of branchPairs.values()){
+    pair.takes.sort((a,b)=>a.take-b.take);
+    pair.preferred=pair.takes.find(c=>c.preferred)||pair.takes[0]||null;
+    pair.id=pair.preferred?.id||pair.pending[0].id;
+    pair.rendering=pair.pending.filter(c=>c.state!=='queued').length;
+    pair.queued=pair.pending.length-pair.rendering;
+    pairByEdge.set(pair.id,pair);
+    for(const c of [...pair.takes,...pair.pending])pairByClip.set(c.id,pair);
+  }
+}
+// The stats label: the preferred take's length and its number among the takes, then what is still on the way.
+// A custom label replaces all of it.
+function pairCaption(p){
+  if(p.labelMode==='custom'&&p.label)return p.label;
+  const parts=[];
+  if(p.preferred)parts.push(`${p.preferred.seconds} s`+(p.takes.length>1?` · take ${p.preferred.take}/${p.takes.length}`:''));
+  if(p.rendering)parts.push('rendering');
+  if(p.queued)parts.push(p.preferred||p.rendering?`+${p.queued} queued`:p.queued>1?`${p.queued} queued`:'queued');
+  return parts.join(' · ');
+}
+function pairName(p){
+  const name=id=>branchTree?.nodes.find(n=>n.id===id)?.label;
+  return name(p.source)&&name(p.target)?`${name(p.source)} → ${name(p.target)}`:'';
+}
+// Connections both ways between two images are two straight parallel lines, each shifted to the right of its own
+// direction of travel, so the pair sits side by side. Cytoscape draws them through explicit endpoints on the node
+// borders, worked out here and again whenever a node moves.
+const TWO_WAY_GAP=12;
+function placeTwoWay(edge){
+  const s=edge.source().position(),t=edge.target().position();
+  const length=Math.hypot(t.x-s.x,t.y-s.y);
+  if(length<1)return;
+  const ux=(t.x-s.x)/length,uy=(t.y-s.y)/length,ox=-uy*TWO_WAY_GAP,oy=ux*TWO_WAY_GAP;
+  // From the shifted point inside a node, travelling along (dx, dy): where the line leaves the node's rectangle.
+  const exit=(dx,dy)=>{
+    const across=dx?((dx>0?NODE_W:-NODE_W)/2-ox)/dx:Infinity,down=dy?((dy>0?NODE_H:-NODE_H)/2-oy)/dy:Infinity;
+    const k=Math.min(across,down);return `${ox+dx*k}px ${oy+dy*k}px`;
+  };
+  edge.style({'source-endpoint':exit(ux,uy),'target-endpoint':exit(-ux,-uy)});
 }
 async function drawTree(tree,fit){
   const positions=await placeNodes(tree);
   const elements=[
     ...tree.nodes.map(n=>({group:'nodes',classes:n.kind,position:{...positions[n.id]},
       data:{id:n.id,label:nodeCaption(n),...(n.thumbnail?{thumb:n.thumbnail}:{})}})),
-    ...tree.clips.map(c=>({group:'edges',classes:c.pending?'pending':'',data:{id:c.id,source:c.source,target:c.target,label:c.pending?c.state:`${c.seconds} s`}})),
+    ...[...branchPairs.values()].map(p=>({group:'edges',
+      classes:[p.preferred?'':'pending',p.rendering?'rendering':'',p.queued?'queued':'',branchPairs.has(p.target+'>'+p.source)?'two-way':''].join(' ').trim(),
+      data:{id:p.id,source:p.source,target:p.target,label:pairCaption(p)}})),
   ];
   if(!cy){
     cy=cytoscape({container:$('#branch-graph'),elements,layout:{name:'preset'},style:branchStyle(),boxSelectionEnabled:true,maxZoom:3,minZoom:.1});
     cy.on('tap','node',e=>showBranchNode(branchTree.nodes.find(n=>n.id===e.target.id())));
-    cy.on('tap','edge',e=>showBranchClip(branchTree.clips.find(c=>c.id===e.target.id())));
+    cy.on('tap','edge',e=>showBranchPair(pairByEdge.get(e.target.id())));
     cy.on('tap',e=>{if(e.target===cy)clearBranchPanel();});
     // Selecting several items offers them as a chain. Runs after the tap handlers, so it wins over a single item's panel.
     cy.on('select unselect',()=>{if(redrawingTree)return;clearTimeout(chainTimer);chainTimer=setTimeout(showChainSelection,0);});
     // Dropped nodes keep their place; a dragged selection saves in one request.
+    cy.on('position','node',e=>e.target.connectedEdges('.two-way').forEach(placeTwoWay));
     cy.on('dragfree','node',e=>{
       const id=e.target.id();if(id.startsWith('job:'))return;
       positionQueue[id]={...e.target.position()};branchTree.positions[id]=positionQueue[id];
@@ -604,37 +674,71 @@ async function drawTree(tree,fit){
     if(chainPlaying)cy.getElementById(chainPlaying).addClass('playing');
     if(!fit)cy.viewport(viewport);
   }
+  cy.edges('.two-way').forEach(placeTwoWay);
   if(fit){clearBranchPanel();cy.fit(undefined,40);}
 }
-const BRANCH_HINT='Click an image or a clip. Shift-click clips, or two images, to play a chain. Drag to move, scroll to zoom, F to fit.';
+const BRANCH_HINT='Click an image or a connection. Shift-click connections, or two images, to play a chain. Drag to move, scroll to zoom, F to fit.';
 function clearBranchPanel(){
   stopBranchVideo();
   $('#branch-preview').replaceChildren(el('p','muted',BRANCH_HINT));
   $('#branch-info').replaceChildren();$('#branch-actions').replaceChildren();
 }
+function stopVideos(container){container.querySelectorAll('video').forEach(v=>{v.onended=null;v.pause();});}
 function stopBranchVideo(){
-  document.querySelectorAll('#branch-preview video').forEach(v=>{v.onended=null;v.pause();});
+  stopVideos($('#branch-preview'));
   cy?.edges().removeClass('playing');chainPlaying=null;
 }
+function playOne(container,clip){
+  stopVideos(container);
+  const video=el('video');video.controls=true;video.loop=true;video.playsInline=true;video.poster=clip.thumbnail;video.src=clip.file;
+  container.replaceChildren(video);video.play().catch(()=>{});
+}
+// Plays clips back to back and loops. Two players take turns: while one plays, the other loads the next clip,
+// so each join waits as little as possible. caption(i, pass) gets the pass number, so a loop can say it has looped.
+function playClips(container,clips,{captionEl,caption,onShow}){
+  stopVideos(container);
+  const players=[0,1].map(()=>{const v=el('video');v.controls=true;v.playsInline=true;v.preload='auto';v.hidden=true;return v;});
+  container.replaceChildren(...players);
+  let active=0,index=0,pass=1;
+  const load=(player,i)=>{player.poster=clips[i].thumbnail;player.src=clips[i].file;};
+  const show=()=>{
+    const current=players[active],other=players[1-active];
+    other.pause();other.hidden=true;current.hidden=false;
+    current.play().catch(()=>{});
+    load(other,(index+1)%clips.length);
+    captionEl.textContent=caption(index,pass);
+    onShow?.(clips[index]);
+  };
+  for(const player of players)player.onended=()=>{
+    if(player!==players[active])return;
+    active=1-active;index=(index+1)%clips.length;if(index===0)pass++;show();
+  };
+  load(players[0],0);show();
+}
+function highlightPlaying(clip){
+  const edge=pairByClip.get(clip.id)?.id||clip.id;
+  cy.edges().removeClass('playing');cy.getElementById(edge).addClass('playing');chainPlaying=edge;
+}
 // ---- Chains: clips that each start where the previous one ended, played back to back. ----
-// From the selection: the selected clips in order, or else the one route between two selected images.
+// From the selection: the preferred takes of the selected connections in order, or else the one route between
+// two selected images.
 function chainFromSelection(tree,ids){
-  const clips=tree.clips.filter(c=>ids.includes(c.id)),nodes=tree.nodes.filter(n=>ids.includes(n.id));
-  if(clips.length){
-    if(clips.some(c=>c.pending))return {error:'A selected clip is still rendering.'};
-    return orderClips(clips);
+  const pairs=ids.map(id=>pairByEdge.get(id)).filter(Boolean),nodes=tree.nodes.filter(n=>ids.includes(n.id));
+  if(pairs.length){
+    if(pairs.some(p=>!p.preferred))return {error:'A selected connection has no finished take yet.'};
+    return orderClips(pairs.map(p=>p.preferred));
   }
   if(nodes.length===2){
     const [left,right]=[...nodes].sort((a,b)=>cy.getElementById(a.id).position('x')-cy.getElementById(b.id).position('x'));
-    return routeBetween(tree,left.id,right.id)||routeBetween(tree,right.id,left.id)||{error:'No finished clips lead from one of these images to the other.'};
+    return routeBetween(left.id,right.id)||routeBetween(right.id,left.id)||{error:'No finished clips lead from one of these images to the other.'};
   }
-  return {error:'To play a chain, select clips that follow on from each other, or two images with a route between them.'};
+  return {error:'To play a chain, select connections that follow on from each other, or two images with a route between them.'};
 }
 function orderClips(clips){
-  const broken={error:'The selected clips do not connect end to start. Select clips where each one starts on the image the previous one ends on.'};
+  const broken={error:'The selected connections do not join end to start. Select ones where each starts on the image the previous one ends on.'};
   const from=new Map();
   for(const c of clips){
-    if(from.has(c.source))return {error:'The selected clips split into more than one path from one image. Select a single route.'};
+    if(from.has(c.source))return {error:'The selected connections split into more than one path from one image. Select a single route.'};
     from.set(c.source,c);
   }
   const targets=new Set(clips.map(c=>c.target)),starts=clips.filter(c=>!targets.has(c.source));
@@ -645,20 +749,21 @@ function orderClips(clips){
   while(clip&&!order.includes(clip)){order.push(clip);clip=from.get(clip.target);}
   return order.length===clips.length?{clips:order}:broken;
 }
-// The shortest route of finished clips from one node to another, or null. Two equally short routes are ambiguous.
-function routeBetween(tree,start,end){
+// The shortest route from one node to another, one step per connection, or null. Two equally short routes are
+// ambiguous; several takes of one connection are not, since a route uses each connection's preferred take.
+function routeBetween(start,end){
   if(start===end)return null;
-  const finished=tree.clips.filter(c=>!c.pending);
+  const steps=[...branchPairs.values()].filter(p=>p.preferred).map(p=>p.preferred);
   const depth=new Map([[start,0]]),routes=new Map([[start,1]]),via=new Map(),queue=[start];
   while(queue.length){
     const node=queue.shift();
-    for(const c of finished.filter(c=>c.source===node)){
+    for(const c of steps.filter(c=>c.source===node)){
       if(!depth.has(c.target)){depth.set(c.target,depth.get(node)+1);routes.set(c.target,0);via.set(c.target,c);queue.push(c.target);}
       if(depth.get(c.target)===depth.get(node)+1)routes.set(c.target,routes.get(c.target)+routes.get(node));
     }
   }
   if(!depth.has(end))return null;
-  if(routes.get(end)>1)return {error:'More than one route joins these images. Shift-click the clips you want instead.'};
+  if(routes.get(end)>1)return {error:'More than one route joins these images. Shift-click the connections you want instead.'};
   const order=[];
   for(let node=end;node!==start;node=via.get(node).source)order.unshift(via.get(node));
   return {clips:order};
@@ -675,11 +780,29 @@ function showChainSelection(){
     $('#branch-info').replaceChildren(el('span','eyebrow',`${ids.length} SELECTED`));
     return;
   }
-  const poster=el('img');poster.src=chain.clips[0].thumbnail;poster.alt=chain.clips[0].prompt;
+  // The steps start on each connection's preferred take; a step with several takes can be swapped for this chain only.
+  const chosen=[...chain.clips];
+  const poster=el('img');poster.src=chosen[0].thumbnail;poster.alt=chosen[0].prompt;
   $('#branch-preview').replaceChildren(poster);
-  $('#branch-info').replaceChildren(chainHeading(chain.clips),el('p','muted','Plays the clips back to back. Each join may hitch slightly in the browser.'));
+  const heading=chainHeading(chosen);
+  $('#branch-info').replaceChildren(heading,el('p','muted','Plays the clips back to back. Each join may hitch slightly in the browser.'));
+  if(chosen.some(c=>pairByClip.get(c.id).takes.length>1)){
+    const steps=el('ol','chain-steps');
+    chosen.forEach((clip,i)=>{
+      const pair=pairByClip.get(clip.id),item=el('li','',(pairName(pair)||`Step ${i+1}`)+' ');
+      if(pair.takes.length>1){
+        const pick=el('select');
+        for(const take of pair.takes){const o=el('option','',`Take ${take.take} · ${take.seconds} s`+(take===pair.preferred?' ★':''));o.value=take.id;pick.append(o);}
+        pick.value=clip.id;
+        pick.onchange=()=>{chosen[i]=pair.takes.find(t=>t.id===pick.value);heading.replaceWith(chainHeading(chosen));};
+        item.append(pick);
+      }else item.append(el('span','muted',`Take ${clip.take}`));
+      steps.append(item);
+    });
+    $('#branch-info').append(steps);
+  }
   const grid=el('div','branch-grid');
-  grid.append(actionButton('▶ Play chain',()=>playChain(chain.clips)),exportChainButton(chain.clips));
+  grid.append(actionButton('▶ Play chain',()=>playChain(chosen)),exportChainButton(chosen));
   $('#branch-actions').replaceChildren(grid);
 }
 // Joins the chain into one video on this computer and saves it to the gallery.
@@ -697,8 +820,9 @@ function exportChainButton(clips){
   return button;
 }
 $('#export-selected').onclick=run(async()=>{
-  const items=cy?cy.$(':selected').map(e=>e.id()):[];
-  if(!items.length){notice('Select images and clips to export first: shift-click them, or shift-drag a box around them.');return;}
+  // A selected connection stands for every take between its two images.
+  const items=cy?cy.$(':selected').map(e=>e.id()).flatMap(id=>{const p=pairByEdge.get(id);return p?[...p.takes,...p.pending].map(c=>c.id):[id];}):[];
+  if(!items.length){notice('Select images and connections to export first: shift-click them, or shift-drag a box around them.');return;}
   const button=$('#export-selected');button.disabled=true;button.textContent='Exporting…';
   try{
     const r=await fetch('/api/branches/export',{method:'POST',headers:{'X-PixAnvil':'local','Content-Type':'application/json'},body:JSON.stringify({items})});
@@ -715,28 +839,169 @@ function chainHeading(clips){
   const seconds=Math.round(clips.reduce((sum,c)=>sum+(c.seconds||0),0)*10)/10;
   return el('span','eyebrow',`CHAIN · ${clips.length} CLIPS · ${seconds} S`);
 }
-// Two players take turns: while one plays, the other loads the next clip, so each join waits as little as possible.
 function playChain(clips){
   stopBranchVideo();
-  const players=[0,1].map(()=>{const v=el('video');v.controls=true;v.playsInline=true;v.preload='auto';v.hidden=true;return v;});
   const caption=el('p','');
-  $('#branch-preview').replaceChildren(...players);
   $('#branch-info').replaceChildren(chainHeading(clips),caption);
   $('#branch-actions').replaceChildren(actionButton('↺ Restart chain',()=>playChain(clips)));
-  let active=0,index=0;
-  const load=(player,i)=>{player.poster=clips[i].thumbnail;player.src=clips[i].file;};
-  const show=()=>{
-    const current=players[active],other=players[1-active];
-    other.pause();other.hidden=true;current.hidden=false;
-    current.play().catch(()=>{});
-    load(other,(index+1)%clips.length);
-    caption.textContent=`Clip ${index+1} of ${clips.length} · ${clips[index].prompt}`;
-    cy.edges().removeClass('playing');cy.getElementById(clips[index].id).addClass('playing');chainPlaying=clips[index].id;
-  };
-  // The chain loops, like a single clip does.
-  for(const player of players)player.onended=()=>{if(player!==players[active])return;active=1-active;index=(index+1)%clips.length;show();};
-  load(players[0],0);show();
+  playClips($('#branch-preview'),clips,{captionEl:caption,caption:i=>`Clip ${i+1} of ${clips.length} · ${clips[i].prompt}`,onShow:highlightPlaying});
 }
+// ---- A connection's panel: its takes, the preferred one playing, and its label. ----
+function showBranchPair(p,playing=p?.preferred){
+  if(!p)return;
+  stopBranchVideo();
+  if(playing){playOne($('#branch-preview'),playing);highlightPlaying(playing);}
+  else $('#branch-preview').replaceChildren(el('p','muted',p.rendering?'The first take is rendering.':'The first take is queued.'));
+  const onTheWay=[p.rendering?`${p.rendering} rendering`:'',p.queued?`${p.queued} queued`:''].filter(Boolean).join(' · ');
+  $('#branch-info').replaceChildren(el('span','eyebrow',[count(p.takes.length,'take','takes'),pairName(p),onTheWay].filter(Boolean).join(' · ').toUpperCase()));
+  if(playing)$('#branch-info').append(el('p','',playing.prompt));
+  const actions=[];
+  if(p.takes.length){
+    $('#branch-info').append(pairLabelField(p),takeList(p,playing));
+    const grid=el('div','branch-grid');
+    grid.append(actionButton('▶ Play all takes',()=>playAllTakes(p)),actionButton('Open take gallery',()=>openTakeGallery(p)),
+      actionButton('New take ↗',()=>newTake(p,playing||p.preferred)));
+    if(playing)grid.append(actionButton('View in gallery',async()=>openAsset(await api('/assets/'+playing.id))));
+    actions.push(grid);
+  }
+  $('#branch-actions').replaceChildren(...actions);
+}
+// Stats label (automatic) or custom label (exactly what was typed). Switching back to stats keeps the typed text.
+function pairLabelField(p){
+  const mode=el('select');
+  for(const [value,text] of [['stats','Stats label'],['custom','Custom label']]){const o=el('option','',text);o.value=value;mode.append(o);}
+  mode.value=p.labelMode;
+  const input=el('input');input.maxLength=60;input.placeholder='e.g. Leap';input.value=p.label;input.hidden=p.labelMode!=='custom';
+  const save=run(async()=>{
+    await api('/branches/pairs','PUT',{clip_id:p.takes[0].id,label_mode:mode.value,label:input.value});
+    p.labelMode=mode.value;p.label=input.value.trim();cy?.getElementById(p.id).data('label',pairCaption(p));
+  });
+  mode.onchange=()=>{input.hidden=mode.value!=='custom';if(mode.value==='custom')input.focus();save();};
+  input.onchange=save;
+  const field=el('div','pair-label');field.append(el('span','','Label'),mode,input);return field;
+}
+function takeList(p,playing){
+  const list=el('div','take-list');
+  for(const take of p.takes){
+    const row=el('div','take-row'+(take===playing?' playing':''));
+    const play=el('button','take-play',`Take ${take.take} · ${take.seconds} s · ${take.prompt}`);play.type='button';play.title=take.prompt;
+    play.onclick=()=>showBranchPair(p,take);
+    const star=el('button','take-icon',take.preferred?'★':'☆');star.type='button';star.disabled=take.preferred;
+    star.title=take.preferred?'The preferred take':'Make this the preferred take';star.setAttribute('aria-label',star.title);
+    star.onclick=run(async()=>{await api('/branches/pairs','PUT',{clip_id:take.id,preferred:true});await reloadPair(p.key,take.id);});
+    const remove=el('button','take-icon','🗑');remove.type='button';remove.title='Delete this take';remove.setAttribute('aria-label',`Delete take ${take.take}`);
+    remove.onclick=run(async()=>{if(await deleteTakes([take]))await reloadPair(p.key,playing?.id);});
+    row.append(play,star,remove);list.append(row);
+  }
+  return list;
+}
+function playAllTakes(p){
+  stopBranchVideo();
+  showBranchPair(p,null);
+  const caption=el('p','take-caption');$('#branch-info').querySelector('.eyebrow').after(caption);
+  const rows=[...$('#branch-info').querySelectorAll('.take-row')];
+  playClips($('#branch-preview'),p.takes,{captionEl:caption,caption:(i,pass)=>`Take ${p.takes[i].take}/${p.takes.length}`+(pass>1?' · looped':''),
+    onShow:take=>{highlightPlaying(take);rows.forEach((row,i)=>row.classList.toggle('playing',p.takes[i]===take));}});
+}
+// Opens Generate with a take's settings, both of the pair's images and a new random seed, so what it makes lands
+// on the same connection as another take. A frame not yet saved is saved first, as Extend does.
+async function newTake(p,take){
+  const node=id=>branchTree.nodes.find(n=>n.id===id),ends=[node(p.source),node(p.target)];
+  if(!ends.every(n=>n&&n.available&&['image','virtual'].includes(n.kind)))
+    throw new Error('A new take needs both images, and one of them was deleted or has no saved frame.');
+  const start=await realNode(ends[0]),end=await realNode(ends[1]);
+  const clip=await api('/assets/'+take.id);
+  const both=w=>w.start_image&&w.end_image;
+  const w=workflows.find(w=>w.id===clip.recipe.workflow&&both(w))||workflows.find(w=>both(w)&&w.available)||workflows.find(both);
+  endEditing(false);
+  await restoreRecipe({...clip.recipe,operation:'img2vid',workflow:w?.id||clip.recipe.workflow,source_asset_id:start.id,end_asset_id:end.id,
+    seed:'-1',count:1,variation_seed:'-1'});
+  $('#viewer').close();tab('generate');
+  notice(toolCapabilities.img2vid?.available?'':toolCapabilities.img2vid?.issues?.join('; ')||'Connect to SPARK to animate images.');
+}
+async function deleteTakes(takes){
+  const what=takes.length===1?`take ${takes[0].take}`:`${takes.length} takes`;
+  if(!confirm(`Delete ${what}? This removes ${takes.length===1?'the clip and its job':'the clips and their jobs'} permanently.`))return false;
+  for(const take of takes)await api('/assets/'+take.id,'DELETE');
+  refreshGallery();return true;
+}
+// After a change to a pair: reload the tree, then show the pair again if it still has any clips.
+async function reloadPair(key,playingId){
+  branchSignature='';await branchTask(()=>loadTree(branchOpenId).catch(()=>loadTrees()));
+  const pair=branchTree&&branchPairs.get(key);
+  if(pair)showBranchPair(pair,pair.takes.find(t=>t.id===playingId)||pair.preferred);else clearBranchPanel();
+}
+// ---- Set viewer: every take of a pair in one dialog. Built to show a gallery batch the same way later. ----
+let setView=null;
+function openTakeGallery(p){
+  const view=pair=>({title:['TAKES',pairName(pair)].filter(Boolean).join(' · '),items:pair.takes,preferredId:pair.preferred?.id,
+    prefer:item=>api('/branches/pairs','PUT',{clip_id:item.id,preferred:true}),
+    newTake:item=>newTake(pair,item),
+    reload:async()=>{
+      branchSignature='';await branchTask(()=>loadTree(branchOpenId).catch(()=>loadTrees()));
+      const next=branchTree&&branchPairs.get(pair.key);return next?.takes.length?view(next):null;
+    },
+    closed:()=>{const next=branchTree&&branchPairs.get(pair.key);if(next)showBranchPair(next);else clearBranchPanel();}});
+  stopBranchVideo();openSetViewer(view(p));
+}
+function openSetViewer(view,playingId){
+  setView={...view,selected:new Set(),playing:view.items.find(i=>i.id===playingId)||view.items.find(i=>i.id===view.preferredId)||view.items[0]};
+  renderSetViewer();playSetItem(setView.playing);
+  if(!$('#set-viewer').open)$('#set-viewer').showModal();
+}
+function setNumber(item){return `Take ${item.take}/${setView.items.length}`;}
+function renderSetViewer(){
+  const v=setView;
+  $('#set-title').textContent=`${v.title} · ${count(v.items.length,'take','takes').toUpperCase()}`;
+  $('#set-grid').replaceChildren(...v.items.map(item=>{
+    const card=el('button','set-card');card.type='button';card.dataset.id=item.id;card.title=item.prompt;
+    const img=el('img');img.src=item.thumbnail;img.alt='';img.loading='lazy';
+    card.append(img,el('span','',`${setNumber(item)} · ${item.seconds} s`+(item.id===v.preferredId?' ★':'')));
+    card.onclick=e=>{
+      if(e.shiftKey||e.ctrlKey||e.metaKey){v.selected.has(item.id)?v.selected.delete(item.id):v.selected.add(item.id);renderSetActions();markSetCards();}
+      else playSetItem(item);
+    };
+    return card;
+  }));
+  markSetCards();renderSetActions();
+}
+function markSetCards(){
+  for(const card of $('#set-grid').children){
+    card.classList.toggle('playing',card.dataset.id===setView.playing?.id);
+    card.classList.toggle('selected',setView.selected.has(card.dataset.id));
+  }
+}
+function renderSetActions(){
+  const v=setView,item=v.playing,actions=[actionButton('▶ Play all takes',playAllInSet)];
+  if(v.prefer&&item&&item.id!==v.preferredId)actions.push(actionButton('★ Make preferred',async()=>{await v.prefer(item);await reloadSet(item.id);}));
+  if(v.newTake&&item)actions.push(actionButton('New take ↗',async()=>{closeSetViewer();await v.newTake(item);}));
+  if(item)actions.push(actionButton('Delete',async()=>{if(await deleteTakes([item]))await reloadSet();}),
+    actionButton('View in gallery',async()=>{closeSetViewer();openAsset(await api('/assets/'+item.id));}));
+  if(v.selected.size){
+    const chosen=v.items.filter(i=>v.selected.has(i.id));
+    const remove=actionButton(`Delete selected (${chosen.length})`,async()=>{if(await deleteTakes(chosen))await reloadSet(item?.id);});
+    remove.classList.add('danger');actions.push(remove);
+  }
+  $('#set-actions').replaceChildren(...actions);
+}
+function playSetItem(item){
+  setView.playing=item;playOne($('#set-player'),item);
+  $('#set-caption').textContent=`${setNumber(item)} · ${item.prompt}`;
+  markSetCards();renderSetActions();
+}
+function playAllInSet(){
+  const v=setView;
+  playClips($('#set-player'),v.items,{captionEl:$('#set-caption'),caption:(i,pass)=>setNumber(v.items[i])+(pass>1?' · looped':''),
+    onShow:item=>{v.playing=item;markSetCards();renderSetActions();}});
+}
+async function reloadSet(playingId){
+  const next=await setView.reload();
+  if(!next){closeSetViewer();return;}
+  openSetViewer(next,playingId);
+}
+function closeSetViewer(){if($('#set-viewer').open)$('#set-viewer').close();}
+$('#close-set-viewer').onclick=closeSetViewer;
+$('#set-viewer').addEventListener('close',()=>{stopVideos($('#set-player'));const v=setView;setView=null;v?.closed?.();});
 function actionButton(label,handler){const b=el('button','quiet',label);b.type='button';b.onclick=run(handler);return b;}
 // A virtual node is saved as a gallery image the first time something is built from it.
 function realNode(n){return n.kind==='image'?api('/assets/'+n.asset_id):api(`/branches/nodes/${encodeURIComponent(n.id)}/real`,'POST');}
@@ -771,17 +1036,6 @@ function labelField(n){
     n.label=input.value.trim();cy?.getElementById(n.id).data('label',nodeCaption(n));
   });
   const field=el('label','branch-label','Label');field.append(input);return field;
-}
-function showBranchClip(c){
-  if(!c)return;
-  stopBranchVideo();
-  if(c.pending){$('#branch-preview').replaceChildren(el('p','muted','This clip is '+c.state+'.'));}
-  else{
-    const video=el('video');video.controls=true;video.loop=true;video.playsInline=true;video.poster=c.thumbnail;video.src=c.file;
-    $('#branch-preview').replaceChildren(video);video.play().catch(()=>{});
-  }
-  $('#branch-info').replaceChildren(el('span','eyebrow',`CLIP · ${c.seconds} S · ${c.workflow}`),el('p','',c.prompt));
-  $('#branch-actions').replaceChildren(...(c.pending?[]:[actionButton('View in gallery',async()=>openAsset(await api('/assets/'+c.id)))]));
 }
 // Building backwards: the node becomes the clip's end image, and the clip has no start image.
 function extendBackwards(asset){

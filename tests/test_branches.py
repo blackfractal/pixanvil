@@ -302,7 +302,7 @@ def test_export_selected_names_files_after_labels(setup):
     assert {(c['from_label'],c['to_label'],c['file']) for c in graph['clips']}>={('A1','B/1','clips/A1-B_1.mp4')}
     # Only what was selected is exported, and nothing exportable is refused.
     only=zipfile.ZipFile(io.BytesIO(client.post('/api/branches/export',headers=HEADERS,json={'items':[second['id']]}).content))
-    assert sorted(only.namelist())==['clips/A1-B_1.mp4','graph.json']
+    assert sorted(only.namelist())==['clips/A1-B_1-take2.mp4','graph.json']
     client.delete('/api/assets/'+a1['id'],headers=HEADERS)
     refused=client.post('/api/branches/export',headers=HEADERS,json={'items':['missing:'+a1['id']]})
     assert refused.status_code==422
@@ -344,3 +344,38 @@ def test_export_chain_joins_clips_and_drops_the_repeated_frame(setup):
     assert out_of_order.status_code==422 and 'previous one ends' in out_of_order.json()['detail']
     assert client.delete('/api/assets/'+joined['id'],headers=HEADERS).status_code==200
     assert not (Path(joined['root'])/joined['path']).exists()
+
+
+def test_takes_between_two_images_are_numbered_with_one_preferred(setup):
+    app,client=setup
+    a,b=add_image(client,(20,60,120),'a'),add_image(client,(90,30,10),'b')
+    takes=[clip(app,client,a,end=b) for _ in range(3)]
+    queued=client.post('/api/jobs',headers=HEADERS,json={'prompt':'one more','workflow':'minimax-h3-video',
+        'operation':'img2vid','source_asset_id':a['id'],'end_asset_id':b['id']}).json()['jobs'][0]
+    def state():
+        found=tree(client,a['id'])
+        return found,{c['id']:(c.get('take'),c.get('takes'),c.get('preferred')) for c in found['clips']}
+    found,marks=state()
+    assert [marks[t['id']] for t in takes]==[(1,3,True),(2,3,False),(3,3,False)]
+    assert marks['job:'+queued['id']]==(None,None,None)
+    assert (found['connections'],sum(not c['pending'] for c in found['clips']),found['pending'])==(1,3,1)
+    # Choosing another take, and a custom label, persist.
+    pick=lambda body:client.put('/api/branches/pairs',headers=HEADERS,json=body)
+    assert pick({'clip_id':takes[2]['id'],'preferred':True}).status_code==200
+    assert pick({'clip_id':takes[0]['id'],'label_mode':'custom','label':' Leap '}).status_code==200
+    found,marks=state()
+    assert [marks[t['id']][2] for t in takes]==[False,False,True]
+    assert {(c['pair_label_mode'],c['pair_label']) for c in found['clips']}=={('custom','Leap')}
+    # Export names the preferred take plainly and the others by their take number.
+    import zipfile
+    archive=zipfile.ZipFile(io.BytesIO(client.post('/api/branches/export',headers=HEADERS,json={'items':[t['id'] for t in takes]}).content))
+    a_name,b_name=a['id'],b['id']
+    assert sorted(n for n in archive.namelist() if n.startswith('clips/'))==sorted(
+        [f'clips/{a_name}-{b_name}.mp4',f'clips/{a_name}-{b_name}-take1.mp4',f'clips/{a_name}-{b_name}-take2.mp4'])
+    # Deleting the preferred take makes the first remaining one preferred.
+    client.delete('/api/assets/'+takes[2]['id'],headers=HEADERS)
+    found,marks=state()
+    assert [marks[t['id']] for t in takes[:2]]==[(1,2,True),(2,2,False)]
+    # Only finished clips can be chosen.
+    assert pick({'clip_id':'job:'+queued['id'],'preferred':True}).status_code==404
+    assert pick({'clip_id':takes[0]['id'],'label_mode':'fancy'}).status_code==422

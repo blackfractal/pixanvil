@@ -37,6 +37,11 @@ class Store:
                 -- Keyed by image identity (see branches.label_key), so a label survives saving or deleting its image.
                 CREATE TABLE IF NOT EXISTS branch_labels (
                     image_id TEXT PRIMARY KEY, label TEXT NOT NULL);
+                -- What the user chose about the takes between two images: the preferred take and the connection label.
+                CREATE TABLE IF NOT EXISTS branch_pairs (
+                    start_key TEXT NOT NULL, end_key TEXT NOT NULL, preferred_clip TEXT,
+                    label_mode TEXT NOT NULL DEFAULT 'stats', label TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(start_key, end_key));
             ''')
 
     @contextmanager
@@ -176,6 +181,22 @@ class Store:
             else:
                 db.execute('DELETE FROM branch_labels WHERE image_id=?', (image_id,))
 
+    def branch_pairs(self):
+        """{(start key, end key): {'preferred_clip', 'label_mode', 'label'}} for every pair with a saved choice."""
+        with self.connect() as db:
+            return {(r['start_key'], r['end_key']): {k: r[k] for k in ('preferred_clip', 'label_mode', 'label')}
+                    for r in db.execute('SELECT * FROM branch_pairs')}
+
+    def set_branch_pair(self, start_key, end_key, **values):
+        """Save choices about a pair; a value of None leaves that choice as it was."""
+        if not set(values).issubset({'preferred_clip', 'label_mode', 'label'}):
+            raise ValueError('Invalid pair update')
+        with self.connect() as db:
+            db.execute('INSERT OR IGNORE INTO branch_pairs(start_key,end_key) VALUES(?,?)', (start_key, end_key))
+            for key, value in values.items():
+                if value is not None:
+                    db.execute(f'UPDATE branch_pairs SET {key}=? WHERE start_key=? AND end_key=?', (value, start_key, end_key))
+
     def branch_added(self):
         with self.connect() as db:
             return [r['asset_id'] for r in db.execute('SELECT asset_id FROM branch_added ORDER BY created')]
@@ -202,7 +223,7 @@ class Store:
             removed = [self.decode(r) for r in db.execute('SELECT * FROM assets')]
             db.execute('DELETE FROM assets')
             db.execute('DELETE FROM jobs')
-            for table in ('branch_layout', 'branch_names', 'branch_added', 'branch_labels'):
+            for table in ('branch_layout', 'branch_names', 'branch_added', 'branch_labels', 'branch_pairs'):
                 db.execute('DELETE FROM '+table)
         return removed
 

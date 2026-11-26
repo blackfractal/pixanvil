@@ -185,6 +185,30 @@ def label_key(node):
     return node.get('asset_id') or node.get('frame_asset_id')
 
 
+def pair_keys(nodes, clip):
+    """The two image keys a clip joins, as stored for its pair. A pending end has no key."""
+    return label_key(nodes[clip['source']]), label_key(nodes[clip['target']])
+
+
+def mark_takes(nodes, clips, pairs):
+    """Number the takes between each pair of nodes and mark the preferred one, in place.
+
+    Takes are the finished clips with the same start and end node, numbered in the order made. The preferred
+    take is the one saved in `pairs` while it still exists, otherwise the first take, so a new take never
+    changes a chain on its own. Every clip of a pair, pending ones included, carries the pair's label choice."""
+    groups = {}
+    for clip in clips:
+        groups.setdefault((clip['source'], clip['target']), []).append(clip)
+    for group in groups.values():
+        stored = pairs.get(pair_keys(nodes, group[0]), {})
+        takes = sorted((c for c in group if not c['pending']), key=lambda c: (c['created'], c['id']))
+        preferred = next((c for c in takes if c['id'] == stored.get('preferred_clip')), takes[0] if takes else None)
+        for number, clip in enumerate(takes, 1):
+            clip.update(take=number, takes=len(takes), preferred=clip is preferred)
+        for clip in group:
+            clip.update(pair_label_mode=stored.get('label_mode') or 'stats', pair_label=stored.get('label') or '')
+
+
 def name_key(tree, nodes, names):
     """Where a tree's name is stored: under the oldest node that has a saved name, else under the root.
 
@@ -199,6 +223,7 @@ def summary(tree, nodes, names):
     return {'id': tree['id'], 'name': names.get(name_key(tree, nodes, names)) or tree['root']['prompt'][:80] or 'Untitled tree',
             'thumbnail': tree['root']['thumbnail'], 'nodes': sum(1 for n in tree['nodes'] if nodes[n]['kind'] != 'pending'),
             'clips': len(finished), 'pending': len(tree['clips'])-len(finished),
+            'connections': len({(c['source'], c['target']) for c in finished}),
             'seconds': round(sum(c['seconds'] or 0 for c in finished), 1),
             'updated': max([nodes[n]['created'] for n in tree['nodes']]+[c['created'] for c in tree['clips']])}
 
@@ -234,8 +259,9 @@ def plan_export(tree, nodes, selected, labels):
     """What Export selected writes: images and clips named after node labels, and a graph describing them.
 
     Returns (images, clips, graph). `images` holds (node, name) for nodes with a picture; `clips` holds
-    (clip, name) for finished clips. A clip is named after the nodes it joins, so `A1-B1.mp4`; extra
-    takes between the same two nodes become `A1-B1-take2.mp4` and so on, oldest first."""
+    (clip, name) for finished clips. A clip is named after the nodes it joins, so the preferred take between
+    two nodes is `A1-B1.mp4` and the other takes are `A1-B1-take<n>.mp4`, n being the take's number.
+    Clips must have been through mark_takes."""
     selected = set(selected)
     in_tree = [nodes[n] for n in tree['nodes']]
     # Every node gets a name, selected or not, because clip names use the names of both their ends.
@@ -257,23 +283,22 @@ def plan_export(tree, nodes, selected, labels):
         else:
             reason = {'missing': 'deleted image', 'pending': 'still rendering'}.get(node['kind'], 'no saved frame')
             skipped.append({'id': node['id'], 'label': labels.get(label_key(node), ''), 'reason': reason})
-    takes = {}
     for clip in sorted(tree['clips'], key=lambda c: c['created']):
         if clip['id'] not in selected:
             continue
         if clip['pending']:
             skipped.append({'id': clip['id'], 'reason': 'still rendering'})
             continue
-        pair = (clip['source'], clip['target'])
-        takes[pair] = takes.get(pair, 0)+1
-        take = takes[pair]
-        clips.append((clip, f'{names[clip["source"]]}-{names[clip["target"]]}' + (f'-take{take}' if take > 1 else '')))
+        suffix = '' if clip['preferred'] else f'-take{clip["take"]}'
+        clips.append((clip, f'{names[clip["source"]]}-{names[clip["target"]]}{suffix}'))
     graph = {
         'nodes': [{'id': n['id'], 'label': labels.get(label_key(n), ''), 'file': f'images/{name}.png',
                    'prompt': n['prompt']} for n, name in images],
         'clips': [{'id': c['id'], 'from': c['source'], 'to': c['target'],
                    'from_label': labels.get(label_key(nodes[c['source']]), ''), 'to_label': labels.get(label_key(nodes[c['target']]), ''),
-                   'file': f'clips/{name}.mp4', 'seconds': c['seconds'], 'prompt': c['prompt']} for c, name in clips],
+                   'file': f'clips/{name}.mp4', 'seconds': c['seconds'], 'prompt': c['prompt'],
+                   'take': c['take'], 'takes': c['takes'], 'preferred': c['preferred'],
+                   'connection_label': c['pair_label'] if c['pair_label_mode'] == 'custom' else ''} for c, name in clips],
         'skipped': skipped,
     }
     return images, clips, graph
