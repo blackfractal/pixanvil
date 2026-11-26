@@ -76,7 +76,8 @@ def test_h3_model_is_not_offered_to_flux():
     entries={c['id']:c for c in catalog(video_info())}
     assert entries['minimax-h3-video']['models']==[H3_MODEL]
     assert H3_MODEL not in entries['flux-dev']['models']
-    assert entries['minimax-h3-video']['durations'][1]=={'seconds':5,'frames':124}
+    # The page lists every length this rule allows.
+    assert entries['minimax-h3-video']['frames']=={'step':17,'offset':5,'min':56,'max':362}
 
 
 def test_empty_negative_prompt_falls_back_to_package_default():

@@ -7,6 +7,10 @@ import threading
 import time
 import hashlib
 import io
+import tempfile
+import uuid
+import zipfile
+from datetime import datetime, timezone
 from typing import Literal
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,6 +19,8 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field, field_validator
 
 from .config import Config, ROOT
@@ -22,8 +28,8 @@ from .store import Store
 from .comfy import Comfy
 from .engine import Engine
 from .workflows import catalog, compile_recipe
-from .media import import_image, inspect_image, last_frame_files, safe_path
-from . import branches
+from .media import import_image, inspect_image, last_frame_files, safe_path, save_thumbnail
+from . import branches, sequence
 from .locking import InstanceLock
 from .image_tools import capabilities, compile_upscale, seed as resolve_seed
 
@@ -129,6 +135,18 @@ class TreeName(BaseModel):
 
 class BranchImage(BaseModel):
     asset_id: str = Field(max_length=100)
+
+
+class BranchLabel(BaseModel):
+    label: str = Field(max_length=40)
+
+
+class BranchExport(BaseModel):
+    items: list[str] = Field(min_length=1, max_length=2000)
+
+
+class Chain(BaseModel):
+    clips: list[str] = Field(min_length=1, max_length=200)
 
 
 def make_app(state=None, worker=True, client_factory=Comfy):
@@ -278,7 +296,6 @@ def make_app(state=None, worker=True, client_factory=Comfy):
                 path=safe_path(asset['root'],asset['path'])
                 if path.stat().st_size>80*1024*1024: raise ValueError('Source exceeds 80 MB')
                 payload=path.read_bytes()
-                from PIL import Image
                 with Image.open(io.BytesIO(payload)) as image:
                     if image.format!='PNG' or image.size!=(asset['width'],asset['height']):
                         raise ValueError('Source file no longer matches the saved image')
@@ -568,7 +585,9 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         """Save a virtual node -- a clip's first or last frame -- as a gallery image, keeping its place."""
         clip_id,separator,which=node_id.rpartition(':')
         if not separator or which not in ('first','last'): raise HTTPException(422,'Only a clip frame can be made into an image')
-        asset=save_frame(video_asset(clip_id),which)
+        clip=video_asset(clip_id)
+        if clip['recipe'].get('operation')=='sequence': raise HTTPException(422,'A joined chain is not part of a tree; its clips already are')
+        asset=save_frame(clip,which)
         store.move_branch_position(node_id,asset['id'])
         return asset
 
@@ -588,15 +607,96 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         store.set_branch_name(branches.name_key(tree,nodes,store.branch_names()),value.name.strip())
         return {'ok':True}
 
+    @app.put('/api/branches/labels/{image_id}')
+    def label_node(image_id:str,value:BranchLabel):
+        """Name a node, such as A1. The label is used on the graph and in exported file names."""
+        nodes,_=branch_graph()
+        if not any(branches.label_key(n)==image_id for n in nodes.values()): raise HTTPException(404,'Not in Branches')
+        store.set_branch_label(image_id,value.label.strip())
+        return {'ok':True}
+
+    def node_picture(node):
+        """The full-size PNG behind an image node or a clip frame not yet saved."""
+        if node['kind']=='image':
+            asset=store.asset(node['asset_id'])
+            return safe_path(asset['root'],asset['path'])
+        return clip_frame_files(video_asset(node['clip_id']),node['frame'])[0]
+
+    def asset_path(asset_id):
+        asset=store.asset(asset_id)
+        return safe_path(asset['root'],asset['path'])
+
+    def tree_title(tree,nodes):
+        names=store.branch_names()
+        return names.get(branches.name_key(tree,nodes,names)) or tree['root']['prompt'][:80] or 'Untitled tree'
+
+    @app.post('/api/branches/export')
+    def export_selected(value:BranchExport):
+        """A zip of the selected images and clips, named after node labels, with a graph.json that links them."""
+        nodes,trees=branch_graph()
+        tree=next(filter(None,(branches.find_tree(trees,item) for item in value.items)),None)
+        if not tree: raise HTTPException(404,'Not in Branches')
+        images,clips,graph=branches.plan_export(tree,nodes,value.items,store.branch_labels())
+        if not images and not clips: raise HTTPException(422,'Nothing selected can be exported: select images with a picture, or finished clips')
+        name=tree_title(tree,nodes)
+        graph={'tree':{'id':tree['id'],'name':name},'exported':datetime.now(timezone.utc).isoformat()}|graph
+        folder=config.state/'exports'; folder.mkdir(exist_ok=True)
+        handle,temp=tempfile.mkstemp(suffix='.zip',dir=folder); os.close(handle)
+        temp=Path(temp)
+        try:
+            # Pictures and clips are already compressed, so they are stored as they are.
+            with zipfile.ZipFile(temp,'w',zipfile.ZIP_STORED) as archive:
+                for node,file in images:
+                    archive.write(node_picture(node),f'images/{file}.png')
+                for clip,file in clips:
+                    archive.write(asset_path(clip['id']),f'clips/{file}.mp4')
+                archive.writestr('graph.json',json.dumps(graph,indent=2),compress_type=zipfile.ZIP_DEFLATED)
+        except Exception:
+            temp.unlink(missing_ok=True); raise
+        return FileResponse(temp,media_type='application/zip',filename=branches.file_name(name)+'.zip',
+                            background=BackgroundTask(temp.unlink,missing_ok=True))
+
+    @app.post('/api/branches/sequence',status_code=201)
+    def export_chain(value:Chain):
+        """Join a chain of clips into one video, saved to the gallery as a clip of its own."""
+        nodes,trees=branch_graph()
+        tree=branches.find_tree(trees,value.clips[0])
+        if not tree: raise HTTPException(404,'Not in Branches')
+        problem=branches.chain_errors(tree,value.clips)
+        if problem: raise HTTPException(422,problem)
+        root=Path(config.data['library']).resolve()
+        asset_id='sequence-'+uuid.uuid4().hex
+        folder=root/'Sequences'/datetime.now(timezone.utc).date().isoformat(); folder.mkdir(parents=True,exist_ok=True)
+        path=folder/(asset_id+'.mp4')
+        thumb=root/'.thumbnails'/(asset_id+'.jpg'); thumb.parent.mkdir(parents=True,exist_ok=True)
+        try:
+            width,height,fps,seconds=sequence.render([asset_path(c) for c in value.clips],path)
+            sequence.first_frame(path,path.with_suffix('.png'))
+            with Image.open(path.with_suffix('.png')) as poster:
+                poster.load(); save_thumbnail(poster,thumb)
+        except (RuntimeError,ValueError,OSError,subprocess.TimeoutExpired) as exc:
+            for file in (path,path.with_suffix('.png'),thumb): file.unlink(missing_ok=True)
+            raise HTTPException(500,'Could not join the clips: '+str(exc))
+        prompt=f'{tree_title(tree,nodes)} · chain of {len(value.clips)} clips'
+        recipe={'operation':'sequence','workflow':'sequence','media':'video','prompt':prompt,'resolved_prompt':prompt,
+                'negative':'','model':'','seed':'','steps':'','cfg':'','clips':value.clips,'tree':tree['id'],
+                'width':width,'height':height,'fps':fps,'frames':round(seconds*fps)}
+        store.add_asset({'id':asset_id,'job_id':None,'root':str(root),'path':str(path.relative_to(root)),
+                         'thumbnail':str(thumb.relative_to(root)),'recipe':recipe,'width':width,'height':height})
+        return store.asset(asset_id)
+
     @app.get('/api/branches/{item_id}')
     def branch_tree(item_id:str):
         """The tree holding a node or clip, with everything needed to draw it."""
         nodes,trees=branch_graph()
         tree=branches.find_tree(trees,item_id)
         if not tree: raise HTTPException(404,'Not in Branches')
-        positions=store.branch_positions()
+        positions,labels=store.branch_positions(),store.branch_labels()
+        def drawn(node):
+            key=branches.label_key(node)
+            return node|{'label_key':key,'label':labels.get(key,'')}
         return branches.summary(tree,nodes,store.branch_names())|{
-            'nodes':[nodes[n] for n in tree['nodes']],'clips':tree['clips'],
+            'nodes':[drawn(nodes[n]) for n in tree['nodes']],'clips':tree['clips'],
             'positions':{n:positions[n] for n in tree['nodes'] if n in positions}}
 
     @app.put('/api/assets/{asset_id}')

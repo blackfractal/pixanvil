@@ -45,7 +45,7 @@ function setWorkflowOptions(w){
   const key=w?.canvases?w.id:'image';if(key===optionsWorkflow)return;optionsWorkflow=key;
   $('#dimensions').replaceChildren(...(w?.canvases||imageCanvases).map(c=>{const o=el('option','',c.label);o.value=`${c.width}x${c.height}`;return o;}));
   if(w?.defaults?.width)$('#dimensions').value=`${w.defaults.width}x${w.defaults.height}`;
-  $('#duration').replaceChildren(...(w?.durations||[]).map(d=>{const o=el('option','',`${d.seconds} seconds`);o.value=d.frames;return o;}));
+  $('#duration').replaceChildren(...videoLengths(w).map(frames=>{const o=el('option','',`${(frames/w.defaults.fps).toFixed(1)} s · ${frames} frames`);o.value=frames;return o;}));
   if(w?.defaults?.frames)$('#duration').value=w.defaults.frames;
 }
 function data(){
@@ -59,7 +59,14 @@ function data(){
 }
 function saveDraft(){if(!editingJob)localStorage.setItem('pixanvil-draft',JSON.stringify(data()));}
 function setModelOptions(workflow,model){const w=workflows.find(w=>w.id===workflow);$('#model').replaceChildren(...(w?.models||[]).map(m=>{const o=el('option','',m);o.value=m;return o;}));if(model&&w?.models.includes(model))$('#model').value=model;$('#workflow-description').textContent=w?(w.available?w.description:w.issues.join('; ')):'Connect to SPARK to discover workflows.';$('#negative-label').hidden=!w?.negative;$('#emphasis-section').hidden=!w?.emphasis;$('#negative').disabled=!w?.negative;$('#emphasis-text').disabled=!w?.emphasis;if(!w?.negative)$('#negative').value='';if(!w?.emphasis)$('#emphasis-text').value='';setWorkflowOptions(w);updateOperation();}
-function loadRecipe(r){let wf=r.workflow&&workflows.some(w=>w.id===r.workflow)?r.workflow:null;if(!wf&&r.model&&r.operation!=='upscale'){const match=workflows.find(w=>w.models.includes(r.model));if(match)wf=match.id;else notice('The imported model is unavailable. Select a compatible installed model before generating.');}const source=sourceAsset,end=endAsset;setMode(modeOf({...r,workflow:wf}),wf);sourceAsset=r.operation&&r.operation!=='txt2img'?source:null;endAsset=r.operation==='img2vid'?end:null;setModelOptions($('#workflow').value,r.model);$('#prompt').value=r.prompt||'';const w=workflows.find(w=>w.id===$('#workflow').value);$('#negative').value=w?.negative?(r.negative||''):'';$('#seed').value=r.seed??'-1';if(r.width&&r.height&&r.operation!=='edit')setDimensions(r.width,r.height);if(r.frames){if(![...$('#duration').options].some(o=>o.value===String(r.frames))){const o=el('option','',`${r.frames} frames`);o.value=r.frames;$('#duration').append(o);}$('#duration').value=r.frames;}$('#quality').value=Math.max(0,profiles.indexOf(r.quality||'quality'));$('#steps').value=r.operation==='upscale'?'':r.steps??'';$('#cfg').value=r.operation==='upscale'?'':r.cfg??'';$('#count').value=r.count||1;$('#emphasis-text').value=w?.emphasis?(r.emphasis?.[0]?.text||''):'';$('#emphasis-weight').value=r.emphasis?.[0]?.weight??1;
+// Every clip length a video model accepts: its frame rule allows offset + n × step frames between min and max.
+function videoLengths(w){
+  const rule=w?.frames;if(!rule)return [];
+  const lengths=[];
+  for(let n=Math.ceil((rule.min-rule.offset)/rule.step);rule.offset+n*rule.step<=rule.max;n++)lengths.push(rule.offset+n*rule.step);
+  return lengths;
+}
+function loadRecipe(r){let wf=r.workflow&&workflows.some(w=>w.id===r.workflow)?r.workflow:null;if(!wf&&r.model&&r.operation!=='upscale'){const match=workflows.find(w=>w.models.includes(r.model));if(match)wf=match.id;else notice('The imported model is unavailable. Select a compatible installed model before generating.');}const source=sourceAsset,end=endAsset;setMode(modeOf({...r,workflow:wf}),wf);sourceAsset=r.operation&&r.operation!=='txt2img'?source:null;endAsset=r.operation==='img2vid'?end:null;setModelOptions($('#workflow').value,r.model);$('#prompt').value=r.prompt||'';const w=workflows.find(w=>w.id===$('#workflow').value);$('#negative').value=w?.negative?(r.negative||''):'';$('#seed').value=r.seed??'-1';if(r.width&&r.height&&r.operation!=='edit')setDimensions(r.width,r.height);if(r.frames){if(![...$('#duration').options].some(o=>o.value===String(r.frames))){const o=el('option','',`${(r.frames/(r.fps||24)).toFixed(1)} s · ${r.frames} frames`);o.value=r.frames;$('#duration').append(o);}$('#duration').value=r.frames;}$('#quality').value=Math.max(0,profiles.indexOf(r.quality||'quality'));$('#steps').value=r.operation==='upscale'?'':r.steps??'';$('#cfg').value=r.operation==='upscale'?'':r.cfg??'';$('#count').value=r.count||1;$('#emphasis-text').value=w?.emphasis?(r.emphasis?.[0]?.text||''):'';$('#emphasis-weight').value=r.emphasis?.[0]?.weight??1;
   $('#variation-seed').value=r.variation_seed??'-1';$('#variation-strength').value=r.variation_strength??.15;$('#denoise').value=r.denoise??.25;$('#upscale-factor').value=r.scale||2;if(r.upscale_model)$('#upscale-model').value=r.upscale_model;
   $('#refinement-enabled').checked=!!r.refinement;$('#refinement-workflow').value=r.refinement?.workflow||'sdxl';refinementModels(r.refinement?.model);$('#refinement-steps').value=r.refinement?.steps||20;$('#refinement-denoise').value=r.refinement?.denoise??.25;updateOperation();if(r.operation==='img2vid'&&r.width&&r.height)setDimensions(r.width,r.height);updateLabels();saveDraft();
 }
@@ -260,7 +267,7 @@ function renderPending(){
 let searchTimer;$('#search').oninput=()=>{clearTimeout(searchTimer);searchTimer=setTimeout(run(()=>refreshGallery()),250);};$('#favorites').onclick=run(async()=>{favorites=true;$('#favorites').classList.add('selected');$('#all-images').classList.remove('selected');await refreshGallery();});$('#all-images').onclick=run(async()=>{favorites=false;$('#all-images').classList.add('selected');$('#favorites').classList.remove('selected');await refreshGallery();});$('#load-more').onclick=run(()=>refreshGallery(true));
 function openAsset(a){selected=a;const video=isVideo(a),file=`/api/assets/${a.id}/file`;$('#full-image').hidden=video;$('#full-video').hidden=!video;
   if(video){if(!$('#full-video').src.endsWith(file)){$('#full-video').poster=`/api/assets/${a.id}/thumbnail`;$('#full-video').src=file;}}else{$('#full-video').removeAttribute('src');$('#full-image').src=file;$('#full-image').alt=a.recipe.prompt;}
-  $('#image-prompt').textContent=a.recipe.prompt;$('#image-details').replaceChildren();const details={Operation:a.recipe.operation||'txt2img',Model:a.recipe.model,Seed:a.recipe.seed,Size:`${a.width} × ${a.height}`,Steps:a.recipe.steps,Guidance:a.recipe.cfg,Workflow:a.recipe.workflow,File:a.path};if(video)details.Length=`${clipSeconds(a.recipe)} s · ${a.recipe.frames} frames at ${a.recipe.fps} fps`;if(a.recipe.operation==='variation'){details['Variation seed']=a.recipe.variation_seed;details.Strength=a.recipe.variation_strength;}if(a.recipe.operation==='refine')details.Denoise=a.recipe.denoise;if(a.recipe.refinement)details['Second model']=a.recipe.refinement.model;for(const [k,v]of Object.entries(details)){ $('#image-details').append(el('dt','',k),el('dd','',String(v)));}$('#image-recipe').textContent=JSON.stringify(a.recipe,null,2);$('#download-image').href=file;$('#download-image').download=a.id+(video?'.mp4':'.png');$('#download-image').textContent=video?'Download MP4':'Download PNG';$('#refine-image').disabled=$('#upscale-image').disabled=$('#animate-image').disabled=$('#edit-image').disabled=video;$('#frame-image').hidden=!video;$('#favorite-image').textContent=a.favorite?'♥ Favorited':'♡ Favorite';$('#parent-image').hidden=!a.recipe.parent_asset_id;$('#vary-image').disabled=video||!['txt2img','variation'].includes(a.recipe.operation||'txt2img');run(updateBranchButton)(a);if(!$('#viewer').open)$('#viewer').showModal();}
+  $('#image-prompt').textContent=a.recipe.prompt;$('#image-details').replaceChildren();const details={Operation:a.recipe.operation||'txt2img',Model:a.recipe.model,Seed:a.recipe.seed,Size:`${a.width} × ${a.height}`,Steps:a.recipe.steps,Guidance:a.recipe.cfg,Workflow:a.recipe.workflow,File:a.path};if(video)details.Length=`${clipSeconds(a.recipe)} s · ${a.recipe.frames} frames at ${a.recipe.fps} fps`;if(a.recipe.operation==='variation'){details['Variation seed']=a.recipe.variation_seed;details.Strength=a.recipe.variation_strength;}if(a.recipe.operation==='refine')details.Denoise=a.recipe.denoise;if(a.recipe.refinement)details['Second model']=a.recipe.refinement.model;for(const [k,v]of Object.entries(details)){ $('#image-details').append(el('dt','',k),el('dd','',String(v)));}$('#image-recipe').textContent=JSON.stringify(a.recipe,null,2);$('#download-image').href=file;$('#download-image').download=a.id+(video?'.mp4':'.png');$('#download-image').textContent=video?'Download MP4':'Download PNG';$('#refine-image').disabled=$('#upscale-image').disabled=$('#animate-image').disabled=$('#edit-image').disabled=video;$('#frame-image').hidden=!video;$('#reuse-image').disabled=a.recipe.operation==='sequence';$('#favorite-image').textContent=a.favorite?'♥ Favorited':'♡ Favorite';$('#parent-image').hidden=!a.recipe.parent_asset_id;$('#vary-image').disabled=video||!['txt2img','variation'].includes(a.recipe.operation||'txt2img');run(updateBranchButton)(a);if(!$('#viewer').open)$('#viewer').showModal();}
 // Left and right arrows step through the gallery in its displayed order, loading more as needed.
 $('#viewer').addEventListener('keydown',run(async e=>{
   if(!['ArrowLeft','ArrowRight'].includes(e.key)||e.target.closest('input,textarea,select'))return;
@@ -431,12 +438,12 @@ async function refreshJobs(){
 const NODE_W=128,NODE_H=84,COLUMN=250,ROW=124;
 let cy=null,branchTree=null,branchOpenId=null,branchSignature='',positionQueue={},positionTimer=null;
 // The clip a playing chain is on, kept so a redraw can highlight it again; redrawingTree hides the redraw's own reselection.
-let chainPlaying=null,redrawingTree=false,chainTimer=null;
+let chainPlaying=null,redrawingTree=false,chainTimer=null,branchFocus=[];
 // Loading and drawing run one at a time, so a poll arriving mid-draw cannot build the graph twice.
 let branchWork=Promise.resolve();
 function branchTask(fn){branchWork=branchWork.catch(()=>{}).then(fn);return branchWork;}
 function showBranches(){return branchTask(()=>branchOpenId?loadTree(branchOpenId).catch(()=>loadTrees()):loadTrees());}
-function openInBranches(id){branchOpenId=id;tab('branches');}
+function openInBranches(id,focus=[]){branchOpenId=id;branchFocus=focus;tab('branches');}
 async function loadTrees(){
   branchOpenId=null;branchTree=null;branchSignature='';
   const {items}=await api('/branches');
@@ -460,9 +467,13 @@ async function loadTree(id){
   if(document.activeElement!==$('#tree-name'))$('#tree-name').value=tree.name;
   $('#tree-summary').textContent=`${count(tree.clips.filter(c=>!c.pending).length,'clip','clips')} · ${tree.seconds} s of footage`+(tree.pending?` · ${tree.pending} rendering`:'');
   const signature=JSON.stringify([tree.nodes,tree.clips]);
-  if(!fresh&&signature===branchSignature){cy?.resize();return;}
-  branchSignature=signature;
-  await drawTree(tree,fresh);
+  if(fresh||signature!==branchSignature){branchSignature=signature;await drawTree(tree,fresh);}
+  else cy?.resize();
+  // Opened to show particular items, such as the clips a joined chain was made from.
+  if(branchFocus.length&&cy){
+    const focus=branchFocus;branchFocus=[];
+    cy.elements().unselect();for(const item of focus)cy.getElementById(item).select();
+  }
 }
 // Saved positions win. A tree seen for the first time is laid out left to right by dagre; after that a new node
 // goes one column right of its start, or one column left of its end for a clip built backwards, and nothing
@@ -530,11 +541,16 @@ function branchStyle(){
     {selector:'edge.playing',style:{'line-color':'#f4f1e8','target-arrow-color':'#f4f1e8',width:6}},
   ];
 }
+// The text under a node: its label, and its state when it has no picture.
+function nodeCaption(n){
+  const state={pending:'Rendering…',missing:'Deleted image'}[n.kind]||(n.available?'':'No saved frame');
+  return [n.label,state].filter(Boolean).join(' · ');
+}
 async function drawTree(tree,fit){
   const positions=await placeNodes(tree);
   const elements=[
     ...tree.nodes.map(n=>({group:'nodes',classes:n.kind,position:{...positions[n.id]},
-      data:{id:n.id,label:{pending:'Rendering…',missing:'Deleted image'}[n.kind]||(n.available?'':'No saved frame'),...(n.thumbnail?{thumb:n.thumbnail}:{})}})),
+      data:{id:n.id,label:nodeCaption(n),...(n.thumbnail?{thumb:n.thumbnail}:{})}})),
     ...tree.clips.map(c=>({group:'edges',classes:c.pending?'pending':'',data:{id:c.id,source:c.source,target:c.target,label:c.pending?c.state:`${c.seconds} s`}})),
   ];
   if(!cy){
@@ -634,8 +650,39 @@ function showChainSelection(){
   const poster=el('img');poster.src=chain.clips[0].thumbnail;poster.alt=chain.clips[0].prompt;
   $('#branch-preview').replaceChildren(poster);
   $('#branch-info').replaceChildren(chainHeading(chain.clips),el('p','muted','Plays the clips back to back. Each join may hitch slightly in the browser.'));
-  $('#branch-actions').replaceChildren(actionButton('▶ Play chain',()=>playChain(chain.clips)));
+  const grid=el('div','branch-grid');
+  grid.append(actionButton('▶ Play chain',()=>playChain(chain.clips)),exportChainButton(chain.clips));
+  $('#branch-actions').replaceChildren(grid);
 }
+// Joins the chain into one video on this computer and saves it to the gallery.
+function exportChainButton(clips){
+  const button=actionButton('Export chain ↓',async()=>{
+    button.disabled=true;button.textContent='Joining…';
+    try{
+      const joined=await api('/branches/sequence','POST',{clips:clips.map(c=>c.id)});
+      const download=el('a','quiet','Download MP4');download.href=`/api/assets/${joined.id}/file`;download.download=joined.id+'.mp4';
+      const saved=el('div','branch-saved');
+      saved.append(el('p','muted','Saved to the gallery as one video.'),download,actionButton('View in gallery',()=>openAsset(joined)));
+      $('#branch-actions').append(saved);refreshGallery();
+    }finally{button.disabled=false;button.textContent='Export chain ↓';}
+  });
+  return button;
+}
+$('#export-selected').onclick=run(async()=>{
+  const items=cy?cy.$(':selected').map(e=>e.id()):[];
+  if(!items.length){notice('Select images and clips to export first: shift-click them, or shift-drag a box around them.');return;}
+  const button=$('#export-selected');button.disabled=true;button.textContent='Exporting…';
+  try{
+    const r=await fetch('/api/branches/export',{method:'POST',headers:{'X-PixAnvil':'local','Content-Type':'application/json'},body:JSON.stringify({items})});
+    if(!r.ok){const data=await r.json().catch(()=>({}));throw new Error(typeof data.detail==='string'?data.detail:'Export failed');}
+    // The server names the zip after the tree.
+    // A name with spaces or other characters arrives encoded, as filename*=utf-8''...
+    const disposition=r.headers.get('content-disposition')||'';
+    const encoded=/filename\*=utf-8''([^;]+)/i.exec(disposition)?.[1],plain=/filename="?([^";]+)"?/i.exec(disposition)?.[1];
+    const link=el('a');link.href=URL.createObjectURL(await r.blob());link.download=encoded?decodeURIComponent(encoded):plain||'branches.zip';
+    link.click();setTimeout(()=>URL.revokeObjectURL(link.href),60000);notice('');
+  }finally{button.disabled=false;button.textContent='Export selected';}
+});
 function chainHeading(clips){
   const seconds=Math.round(clips.reduce((sum,c)=>sum+(c.seconds||0),0)*10)/10;
   return el('span','eyebrow',`CHAIN · ${clips.length} CLIPS · ${seconds} S`);
@@ -672,6 +719,7 @@ function showBranchNode(n){
   else $('#branch-preview').replaceChildren(el('p','muted',{pending:'This clip is still rendering.',missing:'This image was deleted. The clips made from it are kept.'}[n.kind]||'This clip was made before last frames were saved, so its end cannot be extended from.'));
   const label=n.kind==='missing'?'DELETED IMAGE':n.kind==='pending'?'ON ITS WAY':n.kind==='virtual'?(n.frame==='last'?'LAST FRAME · NOT SAVED YET':'FIRST FRAME · NOT SAVED YET'):'IMAGE';
   $('#branch-info').replaceChildren(el('span','eyebrow',label),el('p','',n.prompt));
+  if(n.label_key)$('#branch-info').append(labelField(n));
   const actions=[];
   if(n.available&&n.kind!=='pending'){
     // Two rows: build backward or forward, then look at the image or edit it into a new one.
@@ -686,6 +734,15 @@ function showBranchNode(n){
   if(n.added&&!branchTree.clips.some(c=>c.source===n.id||c.target===n.id))
     actions.push(actionButton('Remove from Branches',async()=>{await api('/branches/images/'+n.asset_id,'DELETE');branchOpenId=null;await showBranches();}));
   $('#branch-actions').replaceChildren(...actions);
+}
+// A short name such as A1, shown on the node and used for exported file names.
+function labelField(n){
+  const input=el('input');input.maxLength=40;input.placeholder='e.g. A1';input.value=n.label||'';
+  input.onchange=run(async()=>{
+    await api('/branches/labels/'+encodeURIComponent(n.label_key),'PUT',{label:input.value});
+    n.label=input.value.trim();cy?.getElementById(n.id).data('label',nodeCaption(n));
+  });
+  const field=el('label','branch-label','Label');field.append(input);return field;
 }
 function showBranchClip(c){
   if(!c)return;
@@ -711,6 +768,15 @@ function extendBackwards(asset){
 }
 async function updateBranchButton(a){
   const button=$('#branch-image');button.hidden=true;
+  // A joined chain is not a step in a tree; it shows the clips it was made from, while they still exist.
+  if(a.recipe.operation==='sequence'){
+    const clips=a.recipe.clips||[];
+    const found=clips.length?await api('/branches/'+clips[0]).catch(()=>null):null;
+    if(selected?.id!==a.id||!found)return;
+    button.textContent='Show chain in branches';
+    button.onclick=()=>{$('#viewer').close();openInBranches(found.id,clips);};
+    button.hidden=false;return;
+  }
   const found=await api('/branches/'+a.id).catch(()=>null);
   if(selected?.id!==a.id)return;
   if(found){button.textContent='Show in branches';button.onclick=()=>{$('#viewer').close();openInBranches(found.id);};}

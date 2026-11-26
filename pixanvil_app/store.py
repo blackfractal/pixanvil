@@ -34,6 +34,9 @@ class Store:
                     root_id TEXT PRIMARY KEY, name TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS branch_added (
                     asset_id TEXT PRIMARY KEY, created TEXT NOT NULL);
+                -- Keyed by image identity (see branches.label_key), so a label survives saving or deleting its image.
+                CREATE TABLE IF NOT EXISTS branch_labels (
+                    image_id TEXT PRIMARY KEY, label TEXT NOT NULL);
             ''')
 
     @contextmanager
@@ -127,8 +130,8 @@ class Store:
     def forget_branch_node(db, asset_id):
         """Drop Branches data about a deleted asset, including the virtual frame nodes of a clip.
 
-        A tree's name is kept: the deleted image may still stand in the tree as a placeholder, and the
-        tree should keep its name."""
+        A tree's name and the image's label are kept: the deleted image may still stand in the tree as a
+        placeholder, which should keep both."""
         db.execute('DELETE FROM branch_layout WHERE node_id IN (?,?,?)', (asset_id, asset_id+':first', asset_id+':last'))
         db.execute('DELETE FROM branch_added WHERE asset_id=?', (asset_id,))
 
@@ -162,6 +165,17 @@ class Store:
             else:
                 db.execute('DELETE FROM branch_names WHERE root_id=?', (root_id,))
 
+    def branch_labels(self):
+        with self.connect() as db:
+            return {r['image_id']:r['label'] for r in db.execute('SELECT * FROM branch_labels')}
+
+    def set_branch_label(self, image_id, label):
+        with self.connect() as db:
+            if label:
+                db.execute('INSERT OR REPLACE INTO branch_labels(image_id,label) VALUES(?,?)', (image_id, label))
+            else:
+                db.execute('DELETE FROM branch_labels WHERE image_id=?', (image_id,))
+
     def branch_added(self):
         with self.connect() as db:
             return [r['asset_id'] for r in db.execute('SELECT asset_id FROM branch_added ORDER BY created')]
@@ -188,7 +202,7 @@ class Store:
             removed = [self.decode(r) for r in db.execute('SELECT * FROM assets')]
             db.execute('DELETE FROM assets')
             db.execute('DELETE FROM jobs')
-            for table in ('branch_layout', 'branch_names', 'branch_added'):
+            for table in ('branch_layout', 'branch_names', 'branch_added', 'branch_labels'):
                 db.execute('DELETE FROM '+table)
         return removed
 

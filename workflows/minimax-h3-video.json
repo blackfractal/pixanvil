@@ -6,7 +6,6 @@
   "frames":{"step":17,"offset":5,"min":56,"max":362},
   "start_image":{"node":"cond","input":"first_frame","pixels":500000},
   "end_image":{"node":"cond","input":"last_frame"},
-  "durations":[{"seconds":3,"frames":73},{"seconds":5,"frames":124},{"seconds":8,"frames":192},{"seconds":10,"frames":243}],
   "canvases":[{"width":832,"height":448,"label":"Landscape · 832 × 448"},{"width":448,"height":832,"label":"Portrait · 448 × 832"},{"width":768,"height":768,"label":"Square · 768 × 768"},{"width":1344,"height":768,"label":"Native 16:9 · 1344 × 768 (slow)"}],
   "model_source":["UNETLoader","unet_name"], "model_contains":["minimax_h3_fl2va"],
   "profiles":{"fast":{"steps":8,"cfg":1},"balanced":{"steps":8,"cfg":1},"quality":{"steps":8,"cfg":1},"maximum":{"steps":8,"cfg":1}},

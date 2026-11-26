@@ -249,3 +249,98 @@ def test_a_tree_keeps_its_name_when_its_root_image_is_deleted(setup):
     # Renaming the tree in that state still sticks.
     client.put(f'/api/branches/{listed["id"]}/name',headers=HEADERS,json={'name':'Wizard duel, part two'})
     assert tree(client,video['id'])['name']=='Wizard duel, part two'
+
+
+def label(client,image_id,text):
+    response=client.put('/api/branches/labels/'+image_id,headers=HEADERS,json={'label':text})
+    assert response.status_code==200,response.text
+
+
+def test_labels_follow_a_frame_when_it_is_saved_and_when_it_is_deleted(setup):
+    app,client=setup
+    start=add_image(client,(20,60,120))
+    video=clip(app,client,start)
+    label(client,start['id'],'A1')
+    virtual=next(n for n in tree(client,start['id'])['nodes'] if n['kind']=='virtual')
+    label(client,virtual['label_key'],'B1')
+    labels=lambda:{n['id']:n['label'] for n in tree(client,video['id'])['nodes']}
+    assert labels()=={start['id']:'A1',video['id']+':last':'B1'}
+    frame=client.post(f'/api/branches/nodes/{video["id"]}:last/real',headers=HEADERS).json()
+    assert labels()=={start['id']:'A1',frame['id']:'B1'}
+    client.delete('/api/assets/'+start['id'],headers=HEADERS)
+    assert labels()=={'missing:'+start['id']:'A1',frame['id']:'B1'}
+    label(client,frame['id'],'  ')
+    assert labels()[frame['id']]==''
+    assert client.put('/api/branches/labels/nonsense',headers=HEADERS,json={'label':'X'}).status_code==404
+    assert client.put('/api/branches/labels/'+frame['id'],headers=HEADERS,json={'label':'X'*41}).status_code==422
+
+
+def test_export_selected_names_files_after_labels(setup):
+    import json, zipfile
+    app,client=setup
+    a1,b1=add_image(client,(20,60,120),'a1'),add_image(client,(90,30,10),'b1')
+    first,second=clip(app,client,a1,end=b1),clip(app,client,a1,end=b1)
+    forward=clip(app,client,b1)
+    label(client,a1['id'],'A1'); label(client,b1['id'],'B/1')
+    client.delete('/api/assets/'+forward['id'],headers=HEADERS)
+    forward=clip(app,client,b1)
+    virtual=forward['id']+':last'
+    items=[a1['id'],b1['id'],virtual,first['id'],second['id'],forward['id']]
+    response=client.post('/api/branches/export',headers=HEADERS,json={'items':items})
+    assert response.status_code==200,response.text
+    assert response.headers['content-type']=='application/zip'
+    archive=zipfile.ZipFile(io.BytesIO(response.content))
+    names=sorted(archive.namelist())
+    frame_name=f'frame-{forward["id"]}-last'
+    assert names==sorted(['graph.json','images/A1.png','images/B_1.png',f'images/{frame_name}.png',
+                          'clips/A1-B_1.mp4','clips/A1-B_1-take2.mp4',f'clips/B_1-{frame_name}.mp4'])
+    assert archive.read('images/A1.png')==(Path(a1['root'])/a1['path']).read_bytes()
+    assert archive.read(f'images/{frame_name}.png')==image((200,40,40))
+    assert archive.read('clips/A1-B_1.mp4')==(Path(first['root'])/first['path']).read_bytes()
+    graph=json.loads(archive.read('graph.json'))
+    assert graph['tree']['id']==a1['id'] and graph['skipped']==[]
+    assert {(c['from_label'],c['to_label'],c['file']) for c in graph['clips']}>={('A1','B/1','clips/A1-B_1.mp4')}
+    # Only what was selected is exported, and nothing exportable is refused.
+    only=zipfile.ZipFile(io.BytesIO(client.post('/api/branches/export',headers=HEADERS,json={'items':[second['id']]}).content))
+    assert sorted(only.namelist())==['clips/A1-B_1.mp4','graph.json']
+    client.delete('/api/assets/'+a1['id'],headers=HEADERS)
+    refused=client.post('/api/branches/export',headers=HEADERS,json={'items':['missing:'+a1['id']]})
+    assert refused.status_code==422
+    assert list((app.state.config.state/'exports').iterdir())==[]
+
+
+def real_video(path,seconds=1,sound=True,size='160x120'):
+    """Replace a simulated clip with a real MP4 of `seconds` at 24 fps."""
+    from pixanvil_app import sequence
+    audio=['-f','lavfi','-i',f'sine=frequency=440:duration={seconds}','-c:a','aac'] if sound else []
+    sequence.ffmpeg('-y','-f','lavfi','-i',f'testsrc=size={size}:rate=24:duration={seconds}',*audio,
+                    '-c:v','libx264','-pix_fmt','yuv420p','-shortest',path)
+
+
+def test_export_chain_joins_clips_and_drops_the_repeated_frame(setup):
+    from pixanvil_app import sequence
+    app,client=setup
+    start=add_image(client,(20,60,120))
+    first=clip(app,client,start)
+    frame=client.post(f'/api/branches/nodes/{first["id"]}:last/real',headers=HEADERS).json()
+    second=clip(app,client,frame)
+    # One clip with sound, one without and at another size: the join fits and pads both.
+    real_video(Path(first['root'])/first['path'])
+    real_video(Path(second['root'])/second['path'],sound=False,size='120x120')
+    response=client.post('/api/branches/sequence',headers=HEADERS,json={'clips':[first['id'],second['id']]})
+    assert response.status_code==201,response.text
+    joined=response.json()
+    recipe=joined['recipe']
+    assert (recipe['operation'],recipe['media'],recipe['clips'])==('sequence','video',[first['id'],second['id']])
+    assert (joined['width'],joined['height'],recipe['frames'])==(160,120,47)
+    made=sequence.probe(Path(joined['root'])/joined['path'])
+    assert (made.width,made.height,made.audio)==(160,120,True) and abs(made.seconds-47/24)<0.1
+    assert client.get(f'/api/assets/{joined["id"]}/thumbnail').status_code==200
+    # The joined video is a gallery clip, not a step in the tree.
+    assert {c['id'] for c in tree(client,start['id'])['clips']}=={first['id'],second['id']}
+    # Nor can it be added through its frames: its clips are already in the tree.
+    assert client.post(f'/api/branches/nodes/{joined["id"]}:first/real',headers=HEADERS).status_code==422
+    out_of_order=client.post('/api/branches/sequence',headers=HEADERS,json={'clips':[second['id'],first['id']]})
+    assert out_of_order.status_code==422 and 'previous one ends' in out_of_order.json()['detail']
+    assert client.delete('/api/assets/'+joined['id'],headers=HEADERS).status_code==200
+    assert not (Path(joined['root'])/joined['path']).exists()

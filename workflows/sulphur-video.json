@@ -4,7 +4,6 @@
   "sampler":"one_stage", "scheduler":"distilled", "seed_max":2147483647,
   "defaults":{"width":768,"height":512,"frames":97,"fps":24,"negative":"blurry, out of focus, subtitles, overexposed, underexposed, low contrast, washed out colors, excessive noise, flickering, distorted proportions, deformed facial features, extra limbs, disfigured hands, camera shake, silent or muted audio, distorted voice, jittery movement"},
   "frames":{"step":8,"offset":1,"min":25,"max":241},
-  "durations":[{"seconds":2,"frames":49},{"seconds":4,"frames":97},{"seconds":6,"frames":145},{"seconds":8,"frames":193},{"seconds":10,"frames":241}],
   "canvases":[{"width":768,"height":512,"label":"Landscape · 768 × 512"},{"width":512,"height":768,"label":"Portrait · 512 × 768"},{"width":640,"height":640,"label":"Square · 640 × 640"}],
   "model_source":["LTX2_SM_Model","gguf"], "model_contains":["sulphur"],
   "profiles":{"fast":{"steps":8,"cfg":1},"balanced":{"steps":8,"cfg":1},"quality":{"steps":8,"cfg":1},"maximum":{"steps":8,"cfg":1}},

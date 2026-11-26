@@ -99,7 +99,8 @@ def build(assets, active_jobs, added, has_last_frame):
 
     for clip in assets:
         recipe = clip['recipe']
-        if recipe.get('media') != 'video':
+        # A joined chain is a finished product made from clips, not a step in a tree.
+        if recipe.get('media') != 'video' or recipe.get('operation') == 'sequence':
             continue
         source_id, end_id = recipe.get('source_asset_id'), recipe.get('end_asset_id')
         first, last = frames.get((clip['id'], 'first')), frames.get((clip['id'], 'last'))
@@ -177,14 +178,20 @@ def trees(nodes, clips):
     return result
 
 
+def label_key(node):
+    """The image a node stands for, which stays the same through the node's life: a clip frame not yet saved
+    already carries the id it will be saved under, and a deleted image's placeholder keeps the image's id.
+    Pending nodes have none."""
+    return node.get('asset_id') or node.get('frame_asset_id')
+
+
 def name_key(tree, nodes, names):
     """Where a tree's name is stored: under the oldest node that has a saved name, else under the root.
 
-    Names are keyed by image id (a deleted image's id included, through its placeholder), so a tree keeps
-    its name when its root image is deleted, and after a merge the older tree's name wins."""
-    def key(node): return node.get('asset_id') or node.get('frame_asset_id')
+    Names are keyed by image identity (see label_key), so a tree keeps its name when its root image is
+    deleted, and after a merge the older tree's name wins."""
     ordered = sorted((nodes[n] for n in tree['nodes']), key=lambda n: n['created'])
-    return next((key(n) for n in ordered if key(n) in names), key(tree['root']))
+    return next((label_key(n) for n in ordered if label_key(n) in names), label_key(tree['root']))
 
 
 def summary(tree, nodes, names):
@@ -199,3 +206,74 @@ def summary(tree, nodes, names):
 def find_tree(all_trees, item_id):
     """The tree holding a node or a clip with this id."""
     return next((t for t in all_trees if item_id in t['nodes'] or any(c['id'] == item_id for c in t['clips'])), None)
+
+
+def chain_errors(tree, clip_ids):
+    """Why these clips, in this order, are not a chain that plays as one shot, or None if they are."""
+    clips = {c['id']: c for c in tree['clips']}
+    if not clip_ids:
+        return 'Select at least one clip'
+    for clip_id in clip_ids:
+        if clip_id not in clips:
+            return 'A clip in the chain is not in this tree'
+        if clips[clip_id]['pending']:
+            return 'A clip in the chain is still rendering'
+    for before, after in zip(clip_ids, clip_ids[1:]):
+        if clips[before]['target'] != clips[after]['source']:
+            return 'Each clip must start on the image the previous one ends on'
+    return None
+
+
+def file_name(text):
+    """Text made safe as a file name: letters, digits, dot, dash, underscore and space are kept."""
+    safe = ''.join(ch if ch.isalnum() or ch in '._- ' else '_' for ch in text).strip(' .')
+    return safe[:60] or 'image'
+
+
+def plan_export(tree, nodes, selected, labels):
+    """What Export selected writes: images and clips named after node labels, and a graph describing them.
+
+    Returns (images, clips, graph). `images` holds (node, name) for nodes with a picture; `clips` holds
+    (clip, name) for finished clips. A clip is named after the nodes it joins, so `A1-B1.mp4`; extra
+    takes between the same two nodes become `A1-B1-take2.mp4` and so on, oldest first."""
+    selected = set(selected)
+    in_tree = [nodes[n] for n in tree['nodes']]
+    # Every node gets a name, selected or not, because clip names use the names of both their ends.
+    names, used = {}, set()
+    for node in sorted(in_tree, key=lambda n: n['created']):
+        key = label_key(node)
+        base = file_name(labels.get(key) or key or node['id'])
+        name, count = base, 2
+        while name.lower() in used:
+            name, count = f'{base}-{count}', count+1
+        used.add(name.lower())
+        names[node['id']] = name
+    images, clips, skipped = [], [], []
+    for node in in_tree:
+        if node['id'] not in selected:
+            continue
+        if node['kind'] in ('image', 'virtual') and node['available']:
+            images.append((node, names[node['id']]))
+        else:
+            reason = {'missing': 'deleted image', 'pending': 'still rendering'}.get(node['kind'], 'no saved frame')
+            skipped.append({'id': node['id'], 'label': labels.get(label_key(node), ''), 'reason': reason})
+    takes = {}
+    for clip in sorted(tree['clips'], key=lambda c: c['created']):
+        if clip['id'] not in selected:
+            continue
+        if clip['pending']:
+            skipped.append({'id': clip['id'], 'reason': 'still rendering'})
+            continue
+        pair = (clip['source'], clip['target'])
+        takes[pair] = takes.get(pair, 0)+1
+        take = takes[pair]
+        clips.append((clip, f'{names[clip["source"]]}-{names[clip["target"]]}' + (f'-take{take}' if take > 1 else '')))
+    graph = {
+        'nodes': [{'id': n['id'], 'label': labels.get(label_key(n), ''), 'file': f'images/{name}.png',
+                   'prompt': n['prompt']} for n, name in images],
+        'clips': [{'id': c['id'], 'from': c['source'], 'to': c['target'],
+                   'from_label': labels.get(label_key(nodes[c['source']]), ''), 'to_label': labels.get(label_key(nodes[c['target']]), ''),
+                   'file': f'clips/{name}.mp4', 'seconds': c['seconds'], 'prompt': c['prompt']} for c, name in clips],
+        'skipped': skipped,
+    }
+    return images, clips, graph
