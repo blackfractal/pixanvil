@@ -13,9 +13,9 @@ async function api(path,method='GET',body){const options={method,headers:{'X-Pix
 function notice(message){$('#notice').hidden=!message;$('#notice').textContent=message;}
 function run(fn){return async(...args)=>{try{await fn(...args);}catch(e){notice(e.message);}};}
 function tab(name){if(!titles[name])name='gallery';
-  // The newest clip on Live activity plays only while that page is showing.
+  // The newest clip on Activity plays only while that page is showing.
   if(name!=='live')$('#latest-preview video')?.pause();
-  if(name!=='branches')$('#branch-preview video')?.pause();
+  if(name!=='branches')stopBranchVideo();
   document.querySelectorAll('.page').forEach(p=>p.hidden=p.id!==name);document.querySelectorAll('.nav').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));$('#section-label').textContent=name.toUpperCase();$('#page-title').replaceChildren(document.createTextNode(titles[name]),el('span','orange','.'));$('#new-image').hidden=name==='generate';location.hash=name;
   if(name==='branches')run(showBranches)();}
 document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>tab(b.dataset.tab));
@@ -223,7 +223,7 @@ $('#generation-form').onsubmit=run(async e=>{e.preventDefault();if(editingJob)re
 async function refreshGallery(append=false){if(!append)offset=0;const response=await api(`/assets?limit=48&offset=${offset}&favorites=${favorites}&q=${encodeURIComponent($('#search').value)}`);total=response.total;assets=append?[...assets,...response.items]:response.items;offset=assets.length;$('#image-count').textContent=`${total} image${total===1?'':'s'}`;$('#empty-gallery').hidden=total>0;$('#load-more').hidden=offset>=total;const grid=$('#gallery-grid');grid.replaceChildren();for(const a of assets){const card=el('button','card');card.setAttribute('aria-label',a.recipe.prompt);const imgWrap=el('div','card-image');const img=el('img');img.src=`/api/assets/${a.id}/thumbnail`;img.alt=a.recipe.prompt;img.loading='lazy';imgWrap.append(img);if(a.favorite)imgWrap.append(el('span','heart','♥'));if(isVideo(a))imgWrap.append(el('span','play',`▶ ${clipSeconds(a.recipe)}s`));const text=el('div','card-text');text.append(el('strong','',a.recipe.prompt),el('span','',`${a.width} × ${a.height}`));card.append(imgWrap,text,el('small','',`${a.recipe.workflow} / ${new Date(a.created).toLocaleDateString()}`));card.onclick=()=>openAsset(a);grid.append(card);}renderPending();if(!favorites&&!$('#search').value){if(assets.length)showLatest(assets[0]);else if(latestId===''){$('#latest-preview').replaceChildren(...latestPlaceholder.map(n=>n.cloneNode(true)));$('#latest-caption').textContent='';}}}
 // The Live tab's empty state, restored when its last result is deleted.
 const latestPlaceholder=[...$('#latest-preview').childNodes].map(n=>n.cloneNode(true));
-// The Live activity tab shows the newest result: a clip plays in place, an image opens in the viewer.
+// The Activity tab shows the newest result: a clip plays in place, an image opens in the viewer.
 function showLatest(a){
   if(a.id===latestId)return;latestId=a.id;let node;
   if(isVideo(a)){node=el('video');node.controls=true;node.loop=true;node.playsInline=true;node.poster=`/api/assets/${a.id}/thumbnail`;node.src=`/api/assets/${a.id}/file`;}
@@ -430,6 +430,8 @@ async function refreshJobs(){
 // The server derives the graph from recipes; this page lays it out left to right and remembers where nodes sit.
 const NODE_W=128,NODE_H=84,COLUMN=250,ROW=124;
 let cy=null,branchTree=null,branchOpenId=null,branchSignature='',positionQueue={},positionTimer=null;
+// The clip a playing chain is on, kept so a redraw can highlight it again; redrawingTree hides the redraw's own reselection.
+let chainPlaying=null,redrawingTree=false,chainTimer=null;
 // Loading and drawing run one at a time, so a poll arriving mid-draw cannot build the graph twice.
 let branchWork=Promise.resolve();
 function branchTask(fn){branchWork=branchWork.catch(()=>{}).then(fn);return branchWork;}
@@ -525,6 +527,7 @@ function branchStyle(){
       label:'data(label)',color:'#cbd0c3','font-size':10,'text-background-color':'#101210','text-background-opacity':1,'text-background-padding':3}},
     {selector:'edge.pending',style:{'line-style':'dashed'}},
     {selector:'edge:selected',style:{'line-color':accent,'target-arrow-color':accent,width:4}},
+    {selector:'edge.playing',style:{'line-color':'#f4f1e8','target-arrow-color':'#f4f1e8',width:6}},
   ];
 }
 async function drawTree(tree,fit){
@@ -539,6 +542,8 @@ async function drawTree(tree,fit){
     cy.on('tap','node',e=>showBranchNode(branchTree.nodes.find(n=>n.id===e.target.id())));
     cy.on('tap','edge',e=>showBranchClip(branchTree.clips.find(c=>c.id===e.target.id())));
     cy.on('tap',e=>{if(e.target===cy)clearBranchPanel();});
+    // Selecting several items offers them as a chain. Runs after the tap handlers, so it wins over a single item's panel.
+    cy.on('select unselect',()=>{if(redrawingTree)return;clearTimeout(chainTimer);chainTimer=setTimeout(showChainSelection,0);});
     // Dropped nodes keep their place; a dragged selection saves in one request.
     cy.on('dragfree','node',e=>{
       const id=e.target.id();if(id.startsWith('job:'))return;
@@ -547,40 +552,145 @@ async function drawTree(tree,fit){
     });
   }else{
     const viewport={zoom:cy.zoom(),pan:{...cy.pan()}},chosen=cy.$(':selected').map(e=>e.id());
-    cy.resize();cy.elements().remove();cy.add(elements);
-    for(const id of chosen)cy.getElementById(id).select();
+    redrawingTree=true;
+    try{
+      cy.resize();cy.elements().remove();cy.add(elements);
+      for(const id of chosen)cy.getElementById(id).select();
+    }finally{redrawingTree=false;}
+    if(chainPlaying)cy.getElementById(chainPlaying).addClass('playing');
     if(!fit)cy.viewport(viewport);
   }
   if(fit){clearBranchPanel();cy.fit(undefined,40);}
 }
+const BRANCH_HINT='Click an image or a clip. Shift-click clips, or two images, to play a chain. Drag to move, scroll to zoom, F to fit.';
 function clearBranchPanel(){
-  $('#branch-preview video')?.pause();
-  $('#branch-preview').replaceChildren(el('p','muted','Click an image or a clip. Drag to move, scroll to zoom, F to fit.'));
+  stopBranchVideo();
+  $('#branch-preview').replaceChildren(el('p','muted',BRANCH_HINT));
   $('#branch-info').replaceChildren();$('#branch-actions').replaceChildren();
+}
+function stopBranchVideo(){
+  document.querySelectorAll('#branch-preview video').forEach(v=>{v.onended=null;v.pause();});
+  cy?.edges().removeClass('playing');chainPlaying=null;
+}
+// ---- Chains: clips that each start where the previous one ended, played back to back. ----
+// From the selection: the selected clips in order, or else the one route between two selected images.
+function chainFromSelection(tree,ids){
+  const clips=tree.clips.filter(c=>ids.includes(c.id)),nodes=tree.nodes.filter(n=>ids.includes(n.id));
+  if(clips.length){
+    if(clips.some(c=>c.pending))return {error:'A selected clip is still rendering.'};
+    return orderClips(clips);
+  }
+  if(nodes.length===2){
+    const [left,right]=[...nodes].sort((a,b)=>cy.getElementById(a.id).position('x')-cy.getElementById(b.id).position('x'));
+    return routeBetween(tree,left.id,right.id)||routeBetween(tree,right.id,left.id)||{error:'No finished clips lead from one of these images to the other.'};
+  }
+  return {error:'To play a chain, select clips that follow on from each other, or two images with a route between them.'};
+}
+function orderClips(clips){
+  const broken={error:'The selected clips do not connect end to start. Select clips where each one starts on the image the previous one ends on.'};
+  const from=new Map();
+  for(const c of clips){
+    if(from.has(c.source))return {error:'The selected clips split into more than one path from one image. Select a single route.'};
+    from.set(c.source,c);
+  }
+  const targets=new Set(clips.map(c=>c.target)),starts=clips.filter(c=>!targets.has(c.source));
+  if(starts.length>1)return broken;
+  // A selection that loops all the way round starts from its oldest clip.
+  let clip=starts[0]||[...clips].sort((a,b)=>a.created.localeCompare(b.created))[0];
+  const order=[];
+  while(clip&&!order.includes(clip)){order.push(clip);clip=from.get(clip.target);}
+  return order.length===clips.length?{clips:order}:broken;
+}
+// The shortest route of finished clips from one node to another, or null. Two equally short routes are ambiguous.
+function routeBetween(tree,start,end){
+  if(start===end)return null;
+  const finished=tree.clips.filter(c=>!c.pending);
+  const depth=new Map([[start,0]]),routes=new Map([[start,1]]),via=new Map(),queue=[start];
+  while(queue.length){
+    const node=queue.shift();
+    for(const c of finished.filter(c=>c.source===node)){
+      if(!depth.has(c.target)){depth.set(c.target,depth.get(node)+1);routes.set(c.target,0);via.set(c.target,c);queue.push(c.target);}
+      if(depth.get(c.target)===depth.get(node)+1)routes.set(c.target,routes.get(c.target)+routes.get(node));
+    }
+  }
+  if(!depth.has(end))return null;
+  if(routes.get(end)>1)return {error:'More than one route joins these images. Shift-click the clips you want instead.'};
+  const order=[];
+  for(let node=end;node!==start;node=via.get(node).source)order.unshift(via.get(node));
+  return {clips:order};
+}
+function showChainSelection(){
+  if(!cy||!branchTree)return;
+  const ids=cy.$(':selected').map(e=>e.id());
+  if(ids.length<2)return;
+  stopBranchVideo();
+  const chain=chainFromSelection(branchTree,ids);
+  $('#branch-actions').replaceChildren();
+  if(chain.error){
+    $('#branch-preview').replaceChildren(el('p','muted',chain.error));
+    $('#branch-info').replaceChildren(el('span','eyebrow',`${ids.length} SELECTED`));
+    return;
+  }
+  const poster=el('img');poster.src=chain.clips[0].thumbnail;poster.alt=chain.clips[0].prompt;
+  $('#branch-preview').replaceChildren(poster);
+  $('#branch-info').replaceChildren(chainHeading(chain.clips),el('p','muted','Plays the clips back to back. Each join may hitch slightly in the browser.'));
+  $('#branch-actions').replaceChildren(actionButton('▶ Play chain',()=>playChain(chain.clips)));
+}
+function chainHeading(clips){
+  const seconds=Math.round(clips.reduce((sum,c)=>sum+(c.seconds||0),0)*10)/10;
+  return el('span','eyebrow',`CHAIN · ${clips.length} CLIPS · ${seconds} S`);
+}
+// Two players take turns: while one plays, the other loads the next clip, so each join waits as little as possible.
+function playChain(clips){
+  stopBranchVideo();
+  const players=[0,1].map(()=>{const v=el('video');v.controls=true;v.playsInline=true;v.preload='auto';v.hidden=true;return v;});
+  const caption=el('p','');
+  $('#branch-preview').replaceChildren(...players);
+  $('#branch-info').replaceChildren(chainHeading(clips),caption);
+  $('#branch-actions').replaceChildren(actionButton('↺ Restart chain',()=>playChain(clips)));
+  let active=0,index=0;
+  const load=(player,i)=>{player.poster=clips[i].thumbnail;player.src=clips[i].file;};
+  const show=()=>{
+    const current=players[active],other=players[1-active];
+    other.pause();other.hidden=true;current.hidden=false;
+    current.play().catch(()=>{});
+    load(other,(index+1)%clips.length);
+    caption.textContent=`Clip ${index+1} of ${clips.length} · ${clips[index].prompt}`;
+    cy.edges().removeClass('playing');cy.getElementById(clips[index].id).addClass('playing');chainPlaying=clips[index].id;
+  };
+  // The chain loops, like a single clip does.
+  for(const player of players)player.onended=()=>{if(player!==players[active])return;active=1-active;index=(index+1)%clips.length;show();};
+  load(players[0],0);show();
 }
 function actionButton(label,handler){const b=el('button','quiet',label);b.type='button';b.onclick=run(handler);return b;}
 // A virtual node is saved as a gallery image the first time something is built from it.
 function realNode(n){return n.kind==='image'?api('/assets/'+n.asset_id):api(`/branches/nodes/${encodeURIComponent(n.id)}/real`,'POST');}
 function showBranchNode(n){
   if(!n)return;
-  $('#branch-preview video')?.pause();
+  stopBranchVideo();
   if(n.image){const img=el('img');img.src=n.image;img.alt=n.prompt;$('#branch-preview').replaceChildren(img);}
   else $('#branch-preview').replaceChildren(el('p','muted',{pending:'This clip is still rendering.',missing:'This image was deleted. The clips made from it are kept.'}[n.kind]||'This clip was made before last frames were saved, so its end cannot be extended from.'));
   const label=n.kind==='missing'?'DELETED IMAGE':n.kind==='pending'?'ON ITS WAY':n.kind==='virtual'?(n.frame==='last'?'LAST FRAME · NOT SAVED YET':'FIRST FRAME · NOT SAVED YET'):'IMAGE';
   $('#branch-info').replaceChildren(el('span','eyebrow',label),el('p','',n.prompt));
   const actions=[];
   if(n.available&&n.kind!=='pending'){
-    actions.push(actionButton('Extend from here ↗',async()=>startImageTool('img2vid',await realNode(n))));
-    actions.push(actionButton('Extend backwards ↗',async()=>extendBackwards(await realNode(n))));
+    // Two rows: build backward or forward, then look at the image or edit it into a new one.
+    const gallery=actionButton('View in gallery',async()=>openAsset(await api('/assets/'+n.asset_id)));
+    if(n.kind!=='image'){gallery.disabled=true;gallery.title='This frame is saved to the gallery once something is built from it.';}
+    const grid=el('div','branch-grid');
+    grid.append(actionButton('← Extend backward',async()=>extendBackwards(await realNode(n))),
+      actionButton('Extend forward →',async()=>startImageTool('img2vid',await realNode(n))),
+      gallery,actionButton('Edit into new ↗',async()=>startImageTool('edit',await realNode(n))));
+    actions.push(grid);
   }
-  if(n.kind==='image')actions.push(actionButton('View in gallery',async()=>openAsset(await api('/assets/'+n.asset_id))));
   if(n.added&&!branchTree.clips.some(c=>c.source===n.id||c.target===n.id))
     actions.push(actionButton('Remove from Branches',async()=>{await api('/branches/images/'+n.asset_id,'DELETE');branchOpenId=null;await showBranches();}));
   $('#branch-actions').replaceChildren(...actions);
 }
 function showBranchClip(c){
   if(!c)return;
-  if(c.pending){$('#branch-preview video')?.pause();$('#branch-preview').replaceChildren(el('p','muted','This clip is '+c.state+'.'));}
+  stopBranchVideo();
+  if(c.pending){$('#branch-preview').replaceChildren(el('p','muted','This clip is '+c.state+'.'));}
   else{
     const video=el('video');video.controls=true;video.loop=true;video.playsInline=true;video.poster=c.thumbnail;video.src=c.file;
     $('#branch-preview').replaceChildren(video);video.play().catch(()=>{});

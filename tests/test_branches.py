@@ -218,3 +218,34 @@ def test_gallery_listing_can_be_limited_to_images_or_clips(setup):
     assert ids('image')==[start['id']] and ids('video')==[video['id']]
     assert sorted(ids(''))==sorted([start['id'],video['id']])
     assert client.get('/api/assets?media=sound').status_code==422
+
+
+def test_deleting_a_joining_frame_keeps_the_chain_in_one_tree(setup):
+    app,client=setup
+    start=add_image(client,(20,60,120))
+    first=clip(app,client,start)
+    frame=client.post(f'/api/branches/nodes/{first["id"]}:last/real',headers=HEADERS).json()
+    second=clip(app,client,frame)
+    client.delete('/api/assets/'+frame['id'],headers=HEADERS)
+    [only]=client.get('/api/branches').json()['items']
+    links={c['id']:(c['source'],c['target']) for c in tree(client,start['id'])['clips']}
+    assert links[first['id']]==(start['id'],first['id']+':last') and links[second['id']][0]==first['id']+':last'
+    assert only['clips']==2
+    # Saving the frame again restores the same image identity, so the chain is whole again.
+    again=client.post(f'/api/branches/nodes/{first["id"]}:last/real',headers=HEADERS).json()
+    assert again['id']==frame['id']
+    links={c['id']:(c['source'],c['target']) for c in tree(client,start['id'])['clips']}
+    assert links[first['id']][1]==frame['id'] and links[second['id']][0]==frame['id']
+
+
+def test_a_tree_keeps_its_name_when_its_root_image_is_deleted(setup):
+    app,client=setup
+    start=add_image(client,(20,60,120))
+    video=clip(app,client,start)
+    client.put(f'/api/branches/{start["id"]}/name',headers=HEADERS,json={'name':'Wizard duel'})
+    client.delete('/api/assets/'+start['id'],headers=HEADERS)
+    [listed]=client.get('/api/branches').json()['items']
+    assert listed['name']=='Wizard duel' and listed['id']=='missing:'+start['id']
+    # Renaming the tree in that state still sticks.
+    client.put(f'/api/branches/{listed["id"]}/name',headers=HEADERS,json={'name':'Wizard duel, part two'})
+    assert tree(client,video['id'])['name']=='Wizard duel, part two'

@@ -528,7 +528,7 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         if not image.is_file():
             raise HTTPException(404,f'This clip was saved before {which} frames were kept; generate it again to use its {which} frame')
         # Keyed by clip and frame, not content: identical frames from two clips are two nodes with their own parents.
-        return import_image(store,config.data['library'],image.read_bytes(),image.name,asset_id=f'frame-{clip["id"]}-{which}',operation='frame',frame=which,
+        return import_image(store,config.data['library'],image.read_bytes(),image.name,asset_id=branches.frame_asset_id(clip['id'],which),operation='frame',frame=which,
                             prompt=clip['recipe']['prompt'],resolved_prompt=clip['recipe']['prompt'],parent_asset_id=clip['id'])
 
     @app.post('/api/assets/{asset_id}/first-frame',status_code=201)
@@ -579,9 +579,14 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         if not path.is_file(): raise HTTPException(404,f'This clip has no saved {which} frame')
         return FileResponse(path,media_type='image/jpeg' if thumbnail else 'image/png')
 
-    @app.put('/api/branches/{root_id}/name')
-    def name_tree(root_id:str,value:TreeName):
-        store.set_branch_name(root_id,value.name.strip()); return {'ok':True}
+    @app.put('/api/branches/{tree_id}/name')
+    def name_tree(tree_id:str,value:TreeName):
+        nodes,trees=branch_graph()
+        tree=branches.find_tree(trees,tree_id)
+        if not tree: raise HTTPException(404,'Not in Branches')
+        # Written where the name is read from, so a rename sticks whichever node currently holds the name.
+        store.set_branch_name(branches.name_key(tree,nodes,store.branch_names()),value.name.strip())
+        return {'ok':True}
 
     @app.get('/api/branches/{item_id}')
     def branch_tree(item_id:str):

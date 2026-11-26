@@ -125,10 +125,12 @@ class Store:
 
     @staticmethod
     def forget_branch_node(db, asset_id):
-        """Drop Branches data about a deleted asset, including the virtual frame nodes of a clip."""
+        """Drop Branches data about a deleted asset, including the virtual frame nodes of a clip.
+
+        A tree's name is kept: the deleted image may still stand in the tree as a placeholder, and the
+        tree should keep its name."""
         db.execute('DELETE FROM branch_layout WHERE node_id IN (?,?,?)', (asset_id, asset_id+':first', asset_id+':last'))
         db.execute('DELETE FROM branch_added WHERE asset_id=?', (asset_id,))
-        db.execute('DELETE FROM branch_names WHERE root_id=?', (asset_id,))
 
     def branch_positions(self):
         with self.connect() as db:

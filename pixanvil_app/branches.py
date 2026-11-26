@@ -5,6 +5,20 @@ saved frame came from -- so anything made from Generate, the CLI or an agent app
 A clip end that has not been saved as an image yet is a *virtual* node named after its clip."""
 
 
+def frame_asset_id(clip_id, which):
+    """The id of the image saved from a clip's first or last frame. Fixed by clip and frame, never by pixels,
+    so a deleted frame can be recognised and saving it again restores the same identity."""
+    return f'frame-{clip_id}-{which}'
+
+
+def parse_frame_asset_id(asset_id):
+    """(clip id, 'first' or 'last') for an id made by frame_asset_id, otherwise None."""
+    if not asset_id.startswith('frame-'):
+        return None
+    clip_id, _, which = asset_id[len('frame-'):].rpartition('-')
+    return (clip_id, which) if clip_id and which in ('first', 'last') else None
+
+
 def frame_of(asset):
     """'first' or 'last' for an image saved from a clip's frame, otherwise None.
 
@@ -31,6 +45,7 @@ def image_node(asset, added=False):
 def virtual_node(clip, which, available):
     frame = f'/api/branches/frames/{clip["id"]}/{which}'
     return {'id': f'{clip["id"]}:{which}', 'kind': 'virtual', 'clip_id': clip['id'], 'frame': which,
+            'frame_asset_id': frame_asset_id(clip['id'], which),
             'prompt': clip['recipe'].get('prompt', ''), 'created': clip['created'],
             'thumbnail': frame+'?thumbnail=true' if available else None, 'image': frame if available else None,
             'available': available}
@@ -64,10 +79,20 @@ def build(assets, active_jobs, added, has_last_frame):
         nodes.setdefault(asset['id'], image_node(asset, asset['id'] in added))
         return asset['id']
 
+    def virtual(clip, which):
+        available = which == 'first' or has_last_frame(clip)
+        return nodes.setdefault(f'{clip["id"]}:{which}', virtual_node(clip, which, available))['id']
+
     def recorded(asset_id, created):
-        """The node for an image a recipe names: the image itself, or a placeholder if it was deleted."""
+        """The node for an image a recipe names: the image itself, or what stands in for it if it was deleted.
+
+        A deleted frame goes back to being its clip's virtual node, the same node the clip itself now ends
+        on, so a chain joined through that frame stays one tree. Any other deleted image is a placeholder."""
         if asset_id in by_id:
             return real(by_id[asset_id])
+        frame = parse_frame_asset_id(asset_id)
+        if frame and by_id.get(frame[0], {}).get('recipe', {}).get('media') == 'video':
+            return virtual(by_id[frame[0]], frame[1])
         node = nodes.setdefault(f'missing:{asset_id}', missing_node(asset_id, created))
         node['created'] = min(node['created'], created)
         return node['id']
@@ -87,13 +112,13 @@ def build(assets, active_jobs, added, has_last_frame):
         elif first:
             start_id = real(first)
         else:
-            start_id = nodes.setdefault(f'{clip["id"]}:first', virtual_node(clip, 'first', True))['id']
+            start_id = virtual(clip, 'first')
         if end_id:
             target_id = recorded(end_id, clip['created'])
         elif last:
             target_id = real(last)
         else:
-            target_id = nodes.setdefault(f'{clip["id"]}:last', virtual_node(clip, 'last', has_last_frame(clip)))['id']
+            target_id = virtual(clip, 'last')
         clips.append({'id': clip['id'], 'source': start_id, 'target': target_id, 'pending': False,
                       'seconds': clip_seconds(recipe), 'prompt': recipe.get('prompt', ''),
                       'workflow': recipe.get('workflow'), 'created': clip['created'],
@@ -152,9 +177,19 @@ def trees(nodes, clips):
     return result
 
 
+def name_key(tree, nodes, names):
+    """Where a tree's name is stored: under the oldest node that has a saved name, else under the root.
+
+    Names are keyed by image id (a deleted image's id included, through its placeholder), so a tree keeps
+    its name when its root image is deleted, and after a merge the older tree's name wins."""
+    def key(node): return node.get('asset_id') or node.get('frame_asset_id')
+    ordered = sorted((nodes[n] for n in tree['nodes']), key=lambda n: n['created'])
+    return next((key(n) for n in ordered if key(n) in names), key(tree['root']))
+
+
 def summary(tree, nodes, names):
     finished = [c for c in tree['clips'] if not c['pending']]
-    return {'id': tree['id'], 'name': names.get(tree['id']) or tree['root']['prompt'][:80] or 'Untitled tree',
+    return {'id': tree['id'], 'name': names.get(name_key(tree, nodes, names)) or tree['root']['prompt'][:80] or 'Untitled tree',
             'thumbnail': tree['root']['thumbnail'], 'nodes': sum(1 for n in tree['nodes'] if nodes[n]['kind'] != 'pending'),
             'clips': len(finished), 'pending': len(tree['clips'])-len(finished),
             'seconds': round(sum(c['seconds'] or 0 for c in finished), 1),
