@@ -99,6 +99,14 @@ Each video package in `workflows/` declares its own canvases, lengths and frame-
 
 - **Start and end images (MiniMax H3 only):** with the H3 workflow selected, Generate shows two optional slots, **Start image** and **End image**. Fill either or both with **Choose an image file** (the file is imported into the gallery first), or open a gallery image and choose **Animate** to set it as the start image. The clip opens on the start image and finishes on the end image; the prompt describes the motion and sound. With both slots empty it is plain text-to-video. On the command line use `--source` and `--end`. By default the canvas matches the image's shape at about half a megapixel (a 5:4 image becomes 768 × 640); picking a listed canvas center-crops the image to it. An end image is cropped to the same canvas; with only an end image the canvas follows that image. The result links back to its source with **View source**. Sulphur has not been tested for this and does not offer it.
 - **First frame:** open a clip and choose **First frame** to add its opening frame to the gallery as an image, linked to the clip. From there it can be edited and animated again. Clips saved before 2026-11-24 did not keep a full-size first frame.
+- **Last frame:** clips made since 2026-11-25 also keep their last frame (`<clip>.last.png`), which Branches continues from.
+- **Branches:** a node graph of long shots. Images are nodes and image-to-video clips connect them, left to right.
+  - **What's shown:** the graph comes from what each clip already records (start image, end image), so clips made anywhere appear automatically.
+  - **Clip ends:** a clip's end is its end image, or its last frame drawn faded until something is built from it.
+  - **Building:** **Extend from here** and **Extend backwards** open Generate with the node as the start or end image.
+  - **The view:** drag nodes to arrange them (positions are saved), scroll to zoom, press F to fit. Click a clip to play it.
+  - **Adding to Branches:** open an image or a text-to-video clip in Gallery and choose **Add to Branches**.
+  - **Status:** phase 1 of `_plans/generation_tree.md`. Takes, the timeline, export, splits and groups come later.
 - **Storage:** clips save as `.mp4` beside images in the dated library folder, with a poster-frame thumbnail and the JSON recipe sidecar. The recipe is not embedded in the MP4, so keep the sidecar with the file. Read PNG settings does not apply to videos; use **Reuse settings** from the gallery.
 - **Gallery:** video cards carry a play badge with the length. The viewer plays the clip with sound and offers Download MP4. Vary, Refine, Upscale, and second-model refinement are image-only.
 - **Verified:** Sulphur 4-second 768 × 512 clips render in roughly 3.5 to 4 minutes on SPARK including model loading. A 5-second 768 × 640 MiniMax H3 clip from a start image took 163 seconds. The other canvases and lengths are offered but have not each been rendered.

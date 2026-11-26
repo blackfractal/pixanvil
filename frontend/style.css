@@ -33,3 +33,14 @@ fieldset.plain{border:0;padding:0;margin:0;min-width:0}
 .edit-banner{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 12px;margin-bottom:12px;border:1px solid var(--accent);border-radius:4px;font-size:12px;color:#cbd0c3}
 .edit-banner.locked{border-color:#c46a5a}
 .card.pending{cursor:pointer}
+.branch-toolbar{gap:12px}
+.branch-toolbar .quiet{display:inline-block;width:auto;margin:0;padding:8px 12px;white-space:nowrap}
+.branch-toolbar input{margin:0;max-width:320px;padding:8px 10px}
+.branch-toolbar #tree-summary{flex:1}
+.branch-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:20px;align-items:start}
+#branch-graph{height:calc(100vh - 290px);min-height:440px;background:var(--deep);border:1px solid var(--line);border-radius:6px}
+.branch-panel{margin-top:0}
+#branch-preview img,#branch-preview video{display:block;width:100%;border-radius:4px;background:#000}
+#branch-info p{margin:8px 0 4px;font-size:13px;overflow-wrap:anywhere}
+#branch-actions .quiet{margin-top:8px}
+@media (max-width:1100px){.branch-layout{grid-template-columns:1fr}#branch-graph{height:60vh}}

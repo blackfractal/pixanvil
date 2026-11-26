@@ -1,5 +1,5 @@
 {
-  "id":"minimax-h3-video", "version":1, "name":"MiniMax H3 · Video", "description":"Video with stereo sound on the local MiniMax H3 model, from a prompt, optionally with a start image, an end image, or both, using its 8-step turbo LoRA. A 5-second clip takes a couple of minutes. No negative prompt.",
+  "id":"minimax-h3-video", "version":2, "name":"MiniMax H3 · Video", "description":"Video with stereo sound on the local MiniMax H3 model, from a prompt, optionally with a start image, an end image, or both, using its 8-step turbo LoRA. A 5-second clip takes a couple of minutes. No negative prompt.",
   "family":"minimax-h3", "media":"video", "emphasis":false, "negative":false,
   "sampler":"res_multistep", "scheduler":"simple",
   "defaults":{"width":832,"height":448,"frames":124,"fps":24},
@@ -28,6 +28,8 @@
     "video":{"class_type":"CreateVideo","inputs":{"images":["decode-video",0],"audio":["decode-audio",0],"fps":24}},
     "save":{"class_type":"SaveVideo","inputs":{"video":["video",0],"filename_prefix":"video/PixAnvil","format":"auto","codec":"auto"}},
     "poster-frame":{"class_type":"ImageFromBatch","inputs":{"image":["decode-video",0],"batch_index":0,"length":1}},
-    "poster":{"class_type":"SaveImage","inputs":{"images":["poster-frame",0],"filename_prefix":"PixAnvil_poster"}}
+    "poster":{"class_type":"SaveImage","inputs":{"images":["poster-frame",0],"filename_prefix":"PixAnvil_poster"}},
+    "last-frame":{"class_type":"ImageFromBatch","inputs":{"image":["decode-video",0],"batch_index":4095,"length":1}},
+    "last":{"class_type":"SaveImage","inputs":{"images":["last-frame",0],"filename_prefix":"PixAnvil_last"}}
   }
 }

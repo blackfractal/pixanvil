@@ -6,6 +6,19 @@ from .media import collect, collect_video, safe_path
 import hashlib
 
 
+def execution_error(status):
+    """A readable account of a failed ComfyUI run: which node failed and the exception, then the last traceback lines.
+
+    ComfyUI's report also holds the node's inputs (whole image tensors), so keeping the end of the raw
+    report used to lose the exception message itself."""
+    for kind, data in status.get('messages', []):
+        if kind == 'execution_error':
+            where = f'{data.get("node_type")} (node {data.get("node_id")})'
+            traceback = ''.join(data.get('traceback') or [])[-1500:]
+            return f'ComfyUI execution failed in {where}: {data.get("exception_type")}: {data.get("exception_message", "").strip()}\n{traceback}'
+    return 'ComfyUI execution failed: '+json.dumps(status.get('messages', []))[-3000:]
+
+
 class Engine:
     def __init__(self, store, config, client_factory=Comfy):
         self.store, self.config, self.client_factory = store, config, client_factory
@@ -114,9 +127,12 @@ class Engine:
             for node_id, output in history.get('outputs',{}).items():
                 for item in output.get('images',[]):
                     if item.get('type')=='output': outputs.append(item)
-            # SaveVideo reports its MP4 under "images"; the still beside it is the poster frame.
+            # SaveVideo reports its MP4 under "images"; the stills beside it are the poster (first) frame
+            # and, for clips made since Branches, the last frame.
             videos=[item for item in outputs if item.get('filename','').lower().endswith('.mp4')]
-            poster=next((item for item in outputs if item not in videos),None)
+            stills=[item for item in outputs if item not in videos]
+            last=next((item for item in stills if item.get('filename','').startswith('PixAnvil_last')),None)
+            poster=next((item for item in stills if item is not last),None)
             if videos:
                 outputs=videos
                 if not poster and not failed:
@@ -127,13 +143,13 @@ class Engine:
             for index, output in enumerate(outputs):
                 asset_id=f'{job["id"]}-{index}'
                 if not self.store.asset(asset_id):
-                    if videos: collect_video(self.store,job,client.download(output),client.download(poster),index)
+                    if videos: collect_video(self.store,job,client.download(output),client.download(poster),index,
+                                             client.download(last) if last else None)
                     else: collect(self.store,job,client.download(output),index)
                 saved.append(asset_id)
                 self.store.update_job(job['id'],outputs=saved)
             if failed:
-                message=json.dumps(status.get('messages',[]))[-6000:]
-                self.store.update_job(job['id'],state='failed',error='ComfyUI execution failed: '+message)
+                self.store.update_job(job['id'],state='failed',error=execution_error(status))
             elif not saved:
                 self.store.update_job(job['id'],state='failed',error='Workflow completed without saved outputs')
             else:

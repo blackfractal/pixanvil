@@ -44,7 +44,12 @@ def register(store, job, asset_id, root, path, thumb, width, height):
     return asset_id
 
 
-def collect_video(store, job, data, poster, index):
+def last_frame_files(path, thumb):
+    """Where a clip keeps its full-size last frame and that frame's thumbnail."""
+    return path.with_suffix('.last.png'), thumb.with_suffix('.last.jpg')
+
+
+def collect_video(store, job, data, poster, index, last=None):
     """Save an MP4 with a poster thumbnail. The recipe lives in the JSON sidecar, not in the file."""
     if data[4:8]!=b'ftyp':
         raise ValueError('Video output is not an MP4 file')
@@ -54,6 +59,14 @@ def collect_video(store, job, data, poster, index):
     # The full-size first frame stays beside the clip so it can be edited and animated again.
     frame=path.with_suffix('.png.part')
     frame.write_bytes(poster); frame.replace(path.with_suffix('.png'))
+    # The last frame is where Branches continues the shot from.
+    if last:
+        last_path, last_thumb = last_frame_files(path, thumb)
+        with Image.open(io.BytesIO(last)) as source:
+            source.load()
+            save_thumbnail(source, last_thumb)
+        part=last_path.with_suffix('.part')
+        part.write_bytes(last); part.replace(last_path)
     with Image.open(io.BytesIO(poster)) as source:
         source.load()
         save_thumbnail(source, thumb)
@@ -81,12 +94,14 @@ def collect(store, job, data, index):
     return register(store, job, asset_id, root, path, thumb, width, height)
 
 
-def import_image(store, library, data, name, **extra):
+def import_image(store, library, data, name, asset_id=None, **extra):
     """Add an image file to the library. The same file imported twice is one asset.
 
-    `extra` adds recipe fields, such as the clip a first frame was taken from."""
+    `asset_id` replaces that content-based identity when provenance matters more than the pixels: a frame
+    saved from a clip is its own image even if another clip produced identical bytes.
+    `extra` adds recipe fields, such as the clip a frame was taken from."""
     digest=hashlib.sha256(data).hexdigest()
-    asset_id='import-'+digest[:20]
+    asset_id=asset_id or 'import-'+digest[:20]
     existing=store.asset(asset_id)
     if existing: return existing
     root=Path(library).resolve()

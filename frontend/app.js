@@ -1,3 +1,5 @@
+import cytoscape from './vendor/cytoscape-3.30.4.esm.min.js';
+// dagre (layered graph layout) is loaded by index.html as a classic script and sets window.dagre.
 const $=s=>document.querySelector(s);
 const el=(tag,cls,text)=>{const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=text;return n;};
 let workflows=[],presets=[],assets=[],selected=null,metadata=null,favorites=false,offset=0,total=0,lastSignature='',busy=false;
@@ -6,16 +8,19 @@ let activeJobs=[],latestId='';
 // The queued job the Generate form is editing, if any; the user's own draft waits in stashedDraft meanwhile.
 let editingJob=null,editLocked=false,stashedDraft=null;
 const profiles=['fast','balanced','quality','maximum'];
-const titles={gallery:'Your image collection',live:'Watch it take shape',generate:'Give an idea its shape',history:'Every step, remembered',settings:'Make yourself at home'};
+const titles={gallery:'Your image collection',live:'Watch it take shape',generate:'Give an idea its shape',branches:'Shots that keep going',history:'Every step, remembered',settings:'Make yourself at home'};
 async function api(path,method='GET',body){const options={method,headers:{'X-PixAnvil':'local'}};if(body instanceof FormData)options.body=body;else if(body!==undefined){options.headers['Content-Type']='application/json';options.body=JSON.stringify(body);}const r=await fetch('/api'+path,options);const data=await r.json();if(!r.ok)throw new Error(typeof data.detail==='string'?data.detail:JSON.stringify(data.detail));return data;}
 function notice(message){$('#notice').hidden=!message;$('#notice').textContent=message;}
 function run(fn){return async(...args)=>{try{await fn(...args);}catch(e){notice(e.message);}};}
 function tab(name){if(!titles[name])name='gallery';
   // The newest clip on Live activity plays only while that page is showing.
-  if(name!=='live')$('#latest-preview video')?.pause();document.querySelectorAll('.page').forEach(p=>p.hidden=p.id!==name);document.querySelectorAll('.nav').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));$('#section-label').textContent=name.toUpperCase();$('#page-title').replaceChildren(document.createTextNode(titles[name]),el('span','orange','.'));$('#new-image').hidden=name==='generate';location.hash=name;}
+  if(name!=='live')$('#latest-preview video')?.pause();
+  if(name!=='branches')$('#branch-preview video')?.pause();
+  document.querySelectorAll('.page').forEach(p=>p.hidden=p.id!==name);document.querySelectorAll('.nav').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));$('#section-label').textContent=name.toUpperCase();$('#page-title').replaceChildren(document.createTextNode(titles[name]),el('span','orange','.'));$('#new-image').hidden=name==='generate';location.hash=name;
+  if(name==='branches')run(showBranches)();}
 document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>tab(b.dataset.tab));
 $('#new-image').onclick=$('#first-image').onclick=()=>tab('generate');
-window.addEventListener('hashchange',()=>tab(location.hash.slice(1)));
+window.addEventListener('hashchange',()=>{const name=location.hash.slice(1);if(document.getElementById(name)?.hidden!==false)tab(name);});
 const imageCanvases=[{width:1024,height:1024,label:'Square · 1024 × 1024'},{width:832,height:1216,label:'Portrait · 832 × 1216'},{width:1216,height:832,label:'Landscape · 1216 × 832'},{width:768,height:768,label:'Draft · 768 × 768'},{width:512,height:512,label:'Small · 512 × 512'}];
 let optionsWorkflow='';
 const isVideo=a=>a.recipe.media==='video';
@@ -221,7 +226,7 @@ function renderPending(){
 let searchTimer;$('#search').oninput=()=>{clearTimeout(searchTimer);searchTimer=setTimeout(run(()=>refreshGallery()),250);};$('#favorites').onclick=run(async()=>{favorites=true;$('#favorites').classList.add('selected');$('#all-images').classList.remove('selected');await refreshGallery();});$('#all-images').onclick=run(async()=>{favorites=false;$('#all-images').classList.add('selected');$('#favorites').classList.remove('selected');await refreshGallery();});$('#load-more').onclick=run(()=>refreshGallery(true));
 function openAsset(a){selected=a;const video=isVideo(a),file=`/api/assets/${a.id}/file`;$('#full-image').hidden=video;$('#full-video').hidden=!video;
   if(video){if(!$('#full-video').src.endsWith(file)){$('#full-video').poster=`/api/assets/${a.id}/thumbnail`;$('#full-video').src=file;}}else{$('#full-video').removeAttribute('src');$('#full-image').src=file;$('#full-image').alt=a.recipe.prompt;}
-  $('#image-prompt').textContent=a.recipe.prompt;$('#image-details').replaceChildren();const details={Operation:a.recipe.operation||'txt2img',Model:a.recipe.model,Seed:a.recipe.seed,Size:`${a.width} × ${a.height}`,Steps:a.recipe.steps,Guidance:a.recipe.cfg,Workflow:a.recipe.workflow,File:a.path};if(video)details.Length=`${clipSeconds(a.recipe)} s · ${a.recipe.frames} frames at ${a.recipe.fps} fps`;if(a.recipe.operation==='variation'){details['Variation seed']=a.recipe.variation_seed;details.Strength=a.recipe.variation_strength;}if(a.recipe.operation==='refine')details.Denoise=a.recipe.denoise;if(a.recipe.refinement)details['Second model']=a.recipe.refinement.model;for(const [k,v]of Object.entries(details)){ $('#image-details').append(el('dt','',k),el('dd','',String(v)));}$('#image-recipe').textContent=JSON.stringify(a.recipe,null,2);$('#download-image').href=file;$('#download-image').download=a.id+(video?'.mp4':'.png');$('#download-image').textContent=video?'Download MP4':'Download PNG';$('#refine-image').disabled=$('#upscale-image').disabled=$('#animate-image').disabled=$('#edit-image').disabled=video;$('#frame-image').hidden=!video;$('#favorite-image').textContent=a.favorite?'♥ Favorited':'♡ Favorite';$('#parent-image').hidden=!a.recipe.parent_asset_id;$('#vary-image').disabled=video||!['txt2img','variation'].includes(a.recipe.operation||'txt2img');if(!$('#viewer').open)$('#viewer').showModal();}
+  $('#image-prompt').textContent=a.recipe.prompt;$('#image-details').replaceChildren();const details={Operation:a.recipe.operation||'txt2img',Model:a.recipe.model,Seed:a.recipe.seed,Size:`${a.width} × ${a.height}`,Steps:a.recipe.steps,Guidance:a.recipe.cfg,Workflow:a.recipe.workflow,File:a.path};if(video)details.Length=`${clipSeconds(a.recipe)} s · ${a.recipe.frames} frames at ${a.recipe.fps} fps`;if(a.recipe.operation==='variation'){details['Variation seed']=a.recipe.variation_seed;details.Strength=a.recipe.variation_strength;}if(a.recipe.operation==='refine')details.Denoise=a.recipe.denoise;if(a.recipe.refinement)details['Second model']=a.recipe.refinement.model;for(const [k,v]of Object.entries(details)){ $('#image-details').append(el('dt','',k),el('dd','',String(v)));}$('#image-recipe').textContent=JSON.stringify(a.recipe,null,2);$('#download-image').href=file;$('#download-image').download=a.id+(video?'.mp4':'.png');$('#download-image').textContent=video?'Download MP4':'Download PNG';$('#refine-image').disabled=$('#upscale-image').disabled=$('#animate-image').disabled=$('#edit-image').disabled=video;$('#frame-image').hidden=!video;$('#favorite-image').textContent=a.favorite?'♥ Favorited':'♡ Favorite';$('#parent-image').hidden=!a.recipe.parent_asset_id;$('#vary-image').disabled=video||!['txt2img','variation'].includes(a.recipe.operation||'txt2img');run(updateBranchButton)(a);if(!$('#viewer').open)$('#viewer').showModal();}
 // Left and right arrows step through the gallery in its displayed order, loading more as needed.
 $('#viewer').addEventListener('keydown',run(async e=>{
   if(!['ArrowLeft','ArrowRight'].includes(e.key)||e.target.closest('input,textarea,select'))return;
@@ -333,12 +338,17 @@ function showJob(j,active){
 }
 $('#close-job').onclick=()=>$('#job-dialog').close();
 let galleryJobSignature='';
+// Each job's last seen state, so a job that fails while the page is open is announced instead of silently vanishing.
+let jobStates=null;
 async function refreshJobs(){
   const jobs=(await api('/jobs')).items;
   checkEditing(jobs);
   const sig=JSON.stringify(jobs.map(j=>[j.id,j.state,j.outputs,j.error,j.progress]));
   if(sig===lastSignature)return;
   lastSignature=sig;
+  const failed=jobStates?jobs.filter(j=>j.state==='failed'&&jobStates[j.id]&&jobStates[j.id]!=='failed'):[];
+  jobStates=Object.fromEntries(jobs.map(j=>[j.id,j.state]));
+  if(failed.length)notice(`${failed.length===1?'A job':count(failed.length,'job','jobs')} failed: ${(failed[0].error||'no reason given').split('\n')[0]} Details are in History.`);
   const gallerySig=JSON.stringify(jobs.map(j=>[j.id,j.outputs]));
   const changed=galleryJobSignature!==''&&galleryJobSignature!==gallerySig;
   galleryJobSignature=gallerySig;
@@ -380,7 +390,208 @@ async function refreshJobs(){
   const shown=$('#job-dialog').open&&jobs.find(j=>j.id===openJobId);
   if(shown)showJob(shown,active);
   if(changed)await refreshGallery();
+  if(!$('#branches').hidden)run(showBranches)();
 }
+// ---- Branches: images are nodes, and clips are the connections between them. ----
+// The server derives the graph from recipes; this page lays it out left to right and remembers where nodes sit.
+const NODE_W=128,NODE_H=84,COLUMN=250,ROW=124;
+let cy=null,branchTree=null,branchOpenId=null,branchSignature='',positionQueue={},positionTimer=null;
+// Loading and drawing run one at a time, so a poll arriving mid-draw cannot build the graph twice.
+let branchWork=Promise.resolve();
+function branchTask(fn){branchWork=branchWork.catch(()=>{}).then(fn);return branchWork;}
+function showBranches(){return branchTask(()=>branchOpenId?loadTree(branchOpenId).catch(()=>loadTrees()):loadTrees());}
+function openInBranches(id){branchOpenId=id;tab('branches');}
+async function loadTrees(){
+  branchOpenId=null;branchTree=null;branchSignature='';
+  const {items}=await api('/branches');
+  $('#tree-view').hidden=true;$('#tree-picker').hidden=false;$('#empty-branches').hidden=items.length>0;
+  $('#tree-grid').replaceChildren(...items.map(t=>{
+    const card=el('button','card');card.setAttribute('aria-label','Open tree: '+t.name);
+    const frame=el('div','card-image');
+    if(t.thumbnail){const img=el('img');img.src=t.thumbnail;img.alt='';img.loading='lazy';frame.append(img);}
+    if(t.pending)frame.append(el('span','play',`${t.pending} rendering`));
+    const text=el('div','card-text');text.append(el('strong','',t.name),el('span','',`${count(t.clips,'clip','clips')} · ${t.seconds} s of footage`));
+    card.append(frame,text,el('small','',`${count(t.nodes,'image','images')} / ${new Date(t.updated).toLocaleDateString()}`));
+    card.onclick=()=>{branchOpenId=t.id;run(showBranches)();};
+    return card;
+  }));
+}
+async function loadTree(id){
+  const tree=await api('/branches/'+encodeURIComponent(id));
+  const fresh=branchTree?.id!==tree.id;
+  branchOpenId=tree.id;branchTree=tree;
+  $('#tree-picker').hidden=true;$('#tree-view').hidden=false;
+  if(document.activeElement!==$('#tree-name'))$('#tree-name').value=tree.name;
+  $('#tree-summary').textContent=`${count(tree.clips.filter(c=>!c.pending).length,'clip','clips')} · ${tree.seconds} s of footage`+(tree.pending?` · ${tree.pending} rendering`:'');
+  const signature=JSON.stringify([tree.nodes,tree.clips]);
+  if(!fresh&&signature===branchSignature){cy?.resize();return;}
+  branchSignature=signature;
+  await drawTree(tree,fresh);
+}
+// Saved positions win. A tree seen for the first time is laid out left to right by dagre; after that a new node
+// goes one column right of its start, or one column left of its end for a clip built backwards, and nothing
+// already placed moves.
+async function placeNodes(tree){
+  const known={...tree.positions},placed={};
+  const missing=tree.nodes.filter(n=>!known[n.id]);
+  if(!missing.length)return known;
+  const at=id=>known[id]||placed[id];
+  if(!Object.keys(known).length){
+    const graph=new dagre.graphlib.Graph({multigraph:true});
+    graph.setGraph({rankdir:'LR',nodesep:40,ranksep:COLUMN-NODE_W});graph.setDefaultEdgeLabel(()=>({}));
+    for(const n of tree.nodes)graph.setNode(n.id,{width:NODE_W,height:NODE_H});
+    for(const c of tree.clips)graph.setEdge(c.source,c.target,{},c.id);
+    dagre.layout(graph);
+    for(const n of tree.nodes){const {x,y}=graph.node(n.id);placed[n.id]={x,y};}
+  }else{
+    let waiting=missing;
+    while(waiting.length){
+      const later=[];
+      for(const n of waiting){
+        const forward=tree.clips.find(c=>c.target===n.id&&at(c.source));
+        const backward=!forward&&tree.clips.find(c=>c.source===n.id&&at(c.target));
+        if(!forward&&!backward){later.push(n);continue;}
+        const anchor=forward?at(forward.source):at(backward.target);
+        placed[n.id]=freeSpot(anchor.x+(forward?COLUMN:-COLUMN),anchor.y,{...known,...placed});
+      }
+      // Nothing placed connects to what is left: start the first of it on a new row below.
+      if(later.length===waiting.length){
+        const spots=Object.values({...known,...placed});
+        placed[later[0].id]=freeSpot(Math.min(...spots.map(p=>p.x)),Math.max(...spots.map(p=>p.y))+ROW,{...known,...placed});
+        later.shift();
+      }
+      waiting=later;
+    }
+  }
+  // Placeholders for clips still rendering are replaced when they finish, so their spots are not kept.
+  const keep=Object.fromEntries(Object.entries(placed).filter(([id])=>!id.startsWith('job:')));
+  if(Object.keys(keep).length)await api('/branches/layout','PUT',{positions:keep});
+  Object.assign(tree.positions,keep);
+  return {...known,...placed};
+}
+// The nearest free spot in a column, trying alternately below and above.
+function freeSpot(x,y,taken){
+  const spots=Object.values(taken);
+  for(let i=0;;i++){
+    const candidate={x,y:y+(i%2?1:-1)*Math.ceil(i/2)*ROW};
+    if(!spots.some(p=>Math.abs(p.x-x)<NODE_W&&Math.abs(p.y-candidate.y)<NODE_H+16))return candidate;
+  }
+}
+function branchStyle(){
+  const accent=getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
+  return [
+    {selector:'node',style:{shape:'round-rectangle',width:NODE_W,height:NODE_H,'background-color':'#252922','border-width':2,'border-color':'#3b4235',
+      label:'data(label)',color:'#cbd0c3','font-size':10,'text-valign':'bottom','text-margin-y':6,'text-wrap':'ellipsis','text-max-width':NODE_W}},
+    {selector:'node[thumb]',style:{'background-image':'data(thumb)','background-fit':'cover'}},
+    {selector:'node.virtual',style:{opacity:.55,'border-style':'dashed'}},
+    {selector:'node.pending',style:{'border-style':'dashed','text-valign':'center','text-margin-y':0}},
+    {selector:'node.missing',style:{'border-style':'dashed','border-color':'#a5523f','text-valign':'center','text-margin-y':0}},
+    {selector:'node:selected',style:{'border-color':accent,'border-width':3,opacity:1}},
+    {selector:'edge',style:{'curve-style':'bezier','control-point-step-size':40,width:3,'line-color':'#5b6450','target-arrow-shape':'triangle','target-arrow-color':'#5b6450',
+      label:'data(label)',color:'#cbd0c3','font-size':10,'text-background-color':'#101210','text-background-opacity':1,'text-background-padding':3}},
+    {selector:'edge.pending',style:{'line-style':'dashed'}},
+    {selector:'edge:selected',style:{'line-color':accent,'target-arrow-color':accent,width:4}},
+  ];
+}
+async function drawTree(tree,fit){
+  const positions=await placeNodes(tree);
+  const elements=[
+    ...tree.nodes.map(n=>({group:'nodes',classes:n.kind,position:{...positions[n.id]},
+      data:{id:n.id,label:{pending:'Rendering…',missing:'Deleted image'}[n.kind]||(n.available?'':'No saved frame'),...(n.thumbnail?{thumb:n.thumbnail}:{})}})),
+    ...tree.clips.map(c=>({group:'edges',classes:c.pending?'pending':'',data:{id:c.id,source:c.source,target:c.target,label:c.pending?c.state:`${c.seconds} s`}})),
+  ];
+  if(!cy){
+    cy=cytoscape({container:$('#branch-graph'),elements,layout:{name:'preset'},style:branchStyle(),boxSelectionEnabled:true,maxZoom:3,minZoom:.1});
+    cy.on('tap','node',e=>showBranchNode(branchTree.nodes.find(n=>n.id===e.target.id())));
+    cy.on('tap','edge',e=>showBranchClip(branchTree.clips.find(c=>c.id===e.target.id())));
+    cy.on('tap',e=>{if(e.target===cy)clearBranchPanel();});
+    // Dropped nodes keep their place; a dragged selection saves in one request.
+    cy.on('dragfree','node',e=>{
+      const id=e.target.id();if(id.startsWith('job:'))return;
+      positionQueue[id]={...e.target.position()};branchTree.positions[id]=positionQueue[id];
+      clearTimeout(positionTimer);positionTimer=setTimeout(run(async()=>{const positions=positionQueue;positionQueue={};await api('/branches/layout','PUT',{positions});}),250);
+    });
+  }else{
+    const viewport={zoom:cy.zoom(),pan:{...cy.pan()}},chosen=cy.$(':selected').map(e=>e.id());
+    cy.resize();cy.elements().remove();cy.add(elements);
+    for(const id of chosen)cy.getElementById(id).select();
+    if(!fit)cy.viewport(viewport);
+  }
+  if(fit){clearBranchPanel();cy.fit(undefined,40);}
+}
+function clearBranchPanel(){
+  $('#branch-preview video')?.pause();
+  $('#branch-preview').replaceChildren(el('p','muted','Click an image or a clip. Drag to move, scroll to zoom, F to fit.'));
+  $('#branch-info').replaceChildren();$('#branch-actions').replaceChildren();
+}
+function actionButton(label,handler){const b=el('button','quiet',label);b.type='button';b.onclick=run(handler);return b;}
+// A virtual node is saved as a gallery image the first time something is built from it.
+function realNode(n){return n.kind==='image'?api('/assets/'+n.asset_id):api(`/branches/nodes/${encodeURIComponent(n.id)}/real`,'POST');}
+function showBranchNode(n){
+  if(!n)return;
+  $('#branch-preview video')?.pause();
+  if(n.image){const img=el('img');img.src=n.image;img.alt=n.prompt;$('#branch-preview').replaceChildren(img);}
+  else $('#branch-preview').replaceChildren(el('p','muted',{pending:'This clip is still rendering.',missing:'This image was deleted. The clips made from it are kept.'}[n.kind]||'This clip was made before last frames were saved, so its end cannot be extended from.'));
+  const label=n.kind==='missing'?'DELETED IMAGE':n.kind==='pending'?'ON ITS WAY':n.kind==='virtual'?(n.frame==='last'?'LAST FRAME · NOT SAVED YET':'FIRST FRAME · NOT SAVED YET'):'IMAGE';
+  $('#branch-info').replaceChildren(el('span','eyebrow',label),el('p','',n.prompt));
+  const actions=[];
+  if(n.available&&n.kind!=='pending'){
+    actions.push(actionButton('Extend from here ↗',async()=>startImageTool('img2vid',await realNode(n))));
+    actions.push(actionButton('Extend backwards ↗',async()=>extendBackwards(await realNode(n))));
+  }
+  if(n.kind==='image')actions.push(actionButton('View in gallery',async()=>openAsset(await api('/assets/'+n.asset_id))));
+  if(n.added&&!branchTree.clips.some(c=>c.source===n.id||c.target===n.id))
+    actions.push(actionButton('Remove from Branches',async()=>{await api('/branches/images/'+n.asset_id,'DELETE');branchOpenId=null;await showBranches();}));
+  $('#branch-actions').replaceChildren(...actions);
+}
+function showBranchClip(c){
+  if(!c)return;
+  if(c.pending){$('#branch-preview video')?.pause();$('#branch-preview').replaceChildren(el('p','muted','This clip is '+c.state+'.'));}
+  else{
+    const video=el('video');video.controls=true;video.loop=true;video.playsInline=true;video.poster=c.thumbnail;video.src=c.file;
+    $('#branch-preview').replaceChildren(video);video.play().catch(()=>{});
+  }
+  $('#branch-info').replaceChildren(el('span','eyebrow',`CLIP · ${c.seconds} S · ${c.workflow}`),el('p','',c.prompt));
+  $('#branch-actions').replaceChildren(...(c.pending?[]:[actionButton('View in gallery',async()=>openAsset(await api('/assets/'+c.id)))]));
+}
+// Building backwards: the node becomes the clip's end image, and the clip has no start image.
+function extendBackwards(asset){
+  endEditing(false);
+  const w=workflows.find(w=>w.end_image&&w.available)||workflows.find(w=>w.end_image);
+  sourceAsset=null;endAsset=asset;
+  loadRecipe({...asset.recipe,operation:'img2vid',workflow:w?.id||asset.recipe.workflow,model:'',source_asset_id:null,end_asset_id:asset.id,
+    prompt:asset.recipe.operation==='import'?'':asset.recipe.prompt,steps:null,cfg:null,width:null,height:null,frames:null,refinement:null,
+    negative:'',emphasis:[],seed:'-1',count:1,variation_seed:'-1'});
+  $('#viewer').close();tab('generate');
+  notice(toolCapabilities.img2vid?.available?'':toolCapabilities.img2vid?.issues?.join('; ')||'Connect to SPARK to animate images.');
+}
+async function updateBranchButton(a){
+  const button=$('#branch-image');button.hidden=true;
+  const found=await api('/branches/'+a.id).catch(()=>null);
+  if(selected?.id!==a.id)return;
+  if(found){button.textContent='Show in branches';button.onclick=()=>{$('#viewer').close();openInBranches(found.id);};}
+  else{
+    button.textContent='Add to Branches';
+    // A clip joins through its first frame; an image is listed as a tree of its own.
+    button.onclick=run(async()=>{
+      const id=isVideo(a)?(await api(`/branches/nodes/${encodeURIComponent(a.id+':first')}/real`,'POST')).id:(await api('/branches/images','POST',{asset_id:a.id})).tree;
+      $('#viewer').close();await refreshGallery();openInBranches(id);
+    });
+  }
+  button.hidden=false;
+}
+$('#back-to-trees').onclick=()=>{branchOpenId=null;run(showBranches)();};
+$('#fit-tree').onclick=()=>cy?.fit(undefined,40);
+$('#tidy-tree').onclick=run(async()=>{
+  if(!branchTree||!confirm('Lay out this whole tree again? Positions you set by hand are replaced.'))return;
+  await api('/branches/layout','PUT',{positions:Object.fromEntries(branchTree.nodes.map(n=>[n.id,null]))});
+  branchTree.positions={};await branchTask(()=>drawTree(branchTree,true));
+});
+$('#tree-name').onchange=run(async()=>{if(!branchTree)return;await api(`/branches/${encodeURIComponent(branchTree.id)}/name`,'PUT',{name:$('#tree-name').value});branchSignature='';await showBranches();});
+document.addEventListener('keydown',e=>{
+  if((e.key==='f'||e.key==='F')&&!e.ctrlKey&&!e.metaKey&&!e.altKey&&cy&&!$('#tree-view').hidden&&!$('#branches').hidden
+     &&!e.target.closest('input,textarea,select')&&!document.querySelector('dialog[open]'))cy.fit(undefined,40);
+});
 async function connection(){const c=await api('/connection');$('#connection-dot').classList.toggle('ready',c.state==='ready');$('#connection-label').textContent=c.state==='ready'?'Connected · ready':c.state==='starting'?'Starting ComfyUI…':'Unavailable';$('#start-comfy').hidden=c.state==='ready';$('#start-comfy').disabled=c.state==='starting';$('#connection-detail').textContent=c.state==='ready'?`Connected to ${c.url}`:(c.startup?.message||c.error||'');if(c.state==='ready'&&!workflows.length)await loadWorkflows();}
 async function loadWorkflows(){try{workflows=(await api('/workflows')).items;toolCapabilities=await api('/image-tools');$('#upscale-model').replaceChildren(...(toolCapabilities.upscale?.models||[]).filter(m=>m==='RealESRGAN_x4plus.pth').map(m=>{const o=el('option','',m);o.value=m;return o;}));setMode(mode(),$('#workflow').value||'flux-dev');setModelOptions($('#workflow').value);refinementModels();const draft=localStorage.getItem('pixanvil-draft');// A fresh visit always starts with a random seed; a fixed seed lasts only until the page is reloaded.
   if(draft)await restoreRecipe({...JSON.parse(draft),seed:'-1'});}catch(e){$('#workflow-description').textContent=e.message;$('#generate-button').disabled=true;}}

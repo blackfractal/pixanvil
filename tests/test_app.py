@@ -332,3 +332,20 @@ def test_queued_job_edit_makes_one_output(app):
     job=submit(app)[0]
     with TestClient(app) as client:
         assert client.put('/api/jobs/'+job['id'],json={'prompt':'x','workflow':'sdxl','count':2},headers=HEADERS).status_code==422
+
+
+def test_comfyui_failure_keeps_the_node_and_exception(app,monkeypatch):
+    # ComfyUI's report includes the failing node's inputs, which can be whole image tensors.
+    report={'node_id':'negative','node_type':'TextEncodeQwenImageEditPlus','exception_type':'RuntimeError',
+            'exception_message':'GET was unable to find an engine to execute this computation\n',
+            'traceback':['  File "conv.py", line 712, in _conv_forward\n','    return F.conv3d(\n'],
+            'current_inputs':{'image1':['tensor('+'0.1255, '*5000+')']}}
+    monkeypatch.setattr(Fake,'history',lambda self,prompt_id:{'status':{'completed':False,'status_str':'error',
+        'messages':[['execution_start',{}],['execution_error',report]]},'outputs':{}})
+    job=submit(app)[0]
+    app.state.engine.tick(); app.state.engine.tick()
+    found=app.state.store.job(job['id'])
+    assert found['state']=='failed'
+    assert found['error'].startswith('ComfyUI execution failed in TextEncodeQwenImageEditPlus (node negative): '
+                                     'RuntimeError: GET was unable to find an engine to execute this computation\n')
+    assert 'F.conv3d' in found['error'] and 'tensor(' not in found['error']

@@ -1,0 +1,3 @@
+/* The one rule Cytoscape would otherwise inject as an inline <style>, which the page's CSP blocks.
+   index.html links this file with the id Cytoscape checks for, so it skips the injection. */
+.__________cytoscape_container{position:relative}

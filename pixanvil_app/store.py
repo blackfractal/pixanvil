@@ -27,6 +27,13 @@ class Store:
                     UNIQUE(job_id,path));
                 CREATE TABLE IF NOT EXISTS presets (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, data TEXT NOT NULL);
+                -- Branches: the graph itself is derived from recipes; these hold only what recipes cannot.
+                CREATE TABLE IF NOT EXISTS branch_layout (
+                    node_id TEXT PRIMARY KEY, x REAL NOT NULL, y REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS branch_names (
+                    root_id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS branch_added (
+                    asset_id TEXT PRIMARY KEY, created TEXT NOT NULL);
             ''')
 
     @contextmanager
@@ -109,7 +116,58 @@ class Store:
             removed = [self.decode(r) for r in db.execute('SELECT * FROM assets WHERE job_id=?', (job_id,))]
             db.execute('DELETE FROM assets WHERE job_id=?', (job_id,))
             db.execute('DELETE FROM jobs WHERE id=?', (job_id,))
+            for asset in removed:
+                self.forget_branch_node(db, asset['id'])
         return removed
+
+    @staticmethod
+    def forget_branch_node(db, asset_id):
+        """Drop Branches data about a deleted asset, including the virtual frame nodes of a clip."""
+        db.execute('DELETE FROM branch_layout WHERE node_id IN (?,?,?)', (asset_id, asset_id+':first', asset_id+':last'))
+        db.execute('DELETE FROM branch_added WHERE asset_id=?', (asset_id,))
+        db.execute('DELETE FROM branch_names WHERE root_id=?', (asset_id,))
+
+    def branch_positions(self):
+        with self.connect() as db:
+            return {r['node_id']:{'x':r['x'],'y':r['y']} for r in db.execute('SELECT * FROM branch_layout')}
+
+    def set_branch_positions(self, positions):
+        """Save node positions; a value of None forgets that node's position."""
+        with self.connect() as db:
+            for node_id, position in positions.items():
+                if position is None:
+                    db.execute('DELETE FROM branch_layout WHERE node_id=?', (node_id,))
+                else:
+                    db.execute('INSERT OR REPLACE INTO branch_layout(node_id,x,y) VALUES(?,?,?)',
+                               (node_id, position['x'], position['y']))
+
+    def move_branch_position(self, old_id, new_id):
+        """A virtual node made real keeps its place under its new asset id."""
+        with self.connect() as db:
+            db.execute('UPDATE OR IGNORE branch_layout SET node_id=? WHERE node_id=?', (new_id, old_id))
+
+    def branch_names(self):
+        with self.connect() as db:
+            return {r['root_id']:r['name'] for r in db.execute('SELECT * FROM branch_names')}
+
+    def set_branch_name(self, root_id, name):
+        with self.connect() as db:
+            if name:
+                db.execute('INSERT OR REPLACE INTO branch_names(root_id,name) VALUES(?,?)', (root_id, name))
+            else:
+                db.execute('DELETE FROM branch_names WHERE root_id=?', (root_id,))
+
+    def branch_added(self):
+        with self.connect() as db:
+            return [r['asset_id'] for r in db.execute('SELECT asset_id FROM branch_added ORDER BY created')]
+
+    def add_branch_image(self, asset_id):
+        with self.connect() as db:
+            db.execute('INSERT OR IGNORE INTO branch_added(asset_id,created) VALUES(?,?)', (asset_id, now()))
+
+    def remove_branch_image(self, asset_id):
+        with self.connect() as db:
+            db.execute('DELETE FROM branch_added WHERE asset_id=?', (asset_id,))
 
     def all_assets(self):
         with self.connect() as db:
@@ -120,16 +178,19 @@ class Store:
             return db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0]
 
     def clear_history(self):
-        """Remove every job and gallery entry, keeping presets. Returns the removed asset rows."""
+        """Remove every job, gallery entry and Branches record, keeping presets. Returns the removed asset rows."""
         with self.connect() as db:
             removed = [self.decode(r) for r in db.execute('SELECT * FROM assets')]
             db.execute('DELETE FROM assets')
             db.execute('DELETE FROM jobs')
+            for table in ('branch_layout', 'branch_names', 'branch_added'):
+                db.execute('DELETE FROM '+table)
         return removed
 
     def delete_asset(self, asset_id):
         with self.connect() as db:
             db.execute('DELETE FROM assets WHERE id=?', (asset_id,))
+            self.forget_branch_node(db, asset_id)
 
     def input_in_use(self, name):
         """True when any remaining job still needs this saved source snapshot."""

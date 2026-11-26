@@ -22,7 +22,8 @@ from .store import Store
 from .comfy import Comfy
 from .engine import Engine
 from .workflows import catalog, compile_recipe
-from .media import import_image, inspect_image, safe_path
+from .media import import_image, inspect_image, last_frame_files, safe_path
+from . import branches
 from .locking import InstanceLock
 from .image_tools import capabilities, compile_upscale, seed as resolve_seed
 
@@ -110,6 +111,24 @@ class Preset(BaseModel):
 class Mark(BaseModel):
     favorite: bool = False
     rating: int = Field(default=0,ge=0,le=5)
+
+
+class Position(BaseModel):
+    x: float = Field(allow_inf_nan=False)
+    y: float = Field(allow_inf_nan=False)
+
+
+class Layout(BaseModel):
+    # None forgets a node's position, so automatic placement takes it again.
+    positions: dict[str, Position | None] = Field(max_length=5000)
+
+
+class TreeName(BaseModel):
+    name: str = Field(max_length=100)
+
+
+class BranchImage(BaseModel):
+    asset_id: str = Field(max_length=100)
 
 
 def make_app(state=None, worker=True, client_factory=Comfy):
@@ -387,7 +406,9 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         path=safe_path(asset['root'],asset['path'])
         # A generated output keeps its recipe in a JSON sidecar; a clip also keeps its full-size first frame.
         files=[path,safe_path(asset['root'],asset['thumbnail']),path.with_suffix('.json')]
-        if path.suffix.lower()=='.mp4': files.append(path.with_suffix('.png'))
+        if path.suffix.lower()=='.mp4':
+            # A clip also keeps its full-size first frame, and its last frame with a thumbnail.
+            files+=[path.with_suffix('.png'),*last_frame_files(path,safe_path(asset['root'],asset['thumbnail']))]
         return files
 
     def remove_asset_files(asset):
@@ -490,14 +511,88 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         try: return import_image(store,config.data['library'],data,file.filename)
         except Exception as exc: raise HTTPException(422,'Cannot import this file as an image: '+str(exc))
 
-    @app.post('/api/assets/{asset_id}/first-frame',status_code=201)
-    def first_frame(asset_id:str):
+    def video_asset(asset_id):
         asset=store.asset(asset_id)
         if not asset or asset['recipe'].get('media')!='video': raise HTTPException(404,'Video not found')
-        path=safe_path(asset['root'],asset['path']).with_suffix('.png')
-        if not path.is_file(): raise HTTPException(404,'This clip was saved before first frames were kept; generate it again to edit its first frame')
-        return import_image(store,config.data['library'],path.read_bytes(),path.name,operation='frame',
-                            prompt=asset['recipe']['prompt'],resolved_prompt=asset['recipe']['prompt'],parent_asset_id=asset_id)
+        return asset
+
+    def clip_frame_files(clip,which):
+        """A clip's full-size first or last frame, and that frame's thumbnail."""
+        path=safe_path(clip['root'],clip['path'])
+        thumbnail=safe_path(clip['root'],clip['thumbnail'])
+        return (path.with_suffix('.png'),thumbnail) if which=='first' else last_frame_files(path,thumbnail)
+
+    def save_frame(clip,which):
+        """Add a clip's first or last frame to the gallery as an image linked to the clip."""
+        image,_=clip_frame_files(clip,which)
+        if not image.is_file():
+            raise HTTPException(404,f'This clip was saved before {which} frames were kept; generate it again to use its {which} frame')
+        # Keyed by clip and frame, not content: identical frames from two clips are two nodes with their own parents.
+        return import_image(store,config.data['library'],image.read_bytes(),image.name,asset_id=f'frame-{clip["id"]}-{which}',operation='frame',frame=which,
+                            prompt=clip['recipe']['prompt'],resolved_prompt=clip['recipe']['prompt'],parent_asset_id=clip['id'])
+
+    @app.post('/api/assets/{asset_id}/first-frame',status_code=201)
+    def first_frame(asset_id:str): return save_frame(video_asset(asset_id),'first')
+
+    def branch_graph():
+        def has_last_frame(clip): return clip_frame_files(clip,'last')[0].is_file()
+        nodes,clips=branches.build(store.all_assets(),store.active(),store.branch_added(),has_last_frame)
+        return nodes,branches.trees(nodes,clips)
+
+    @app.get('/api/branches')
+    def branch_trees():
+        nodes,trees=branch_graph()
+        names=store.branch_names()
+        items=[branches.summary(t,nodes,names) for t in trees]
+        return {'items':sorted(items,key=lambda t:t['updated'],reverse=True)}
+
+    @app.put('/api/branches/layout')
+    def branch_layout(value:Layout):
+        store.set_branch_positions({k:v.model_dump() if v else None for k,v in value.positions.items()})
+        return {'ok':True}
+
+    @app.post('/api/branches/images',status_code=201)
+    def add_branch_image(value:BranchImage):
+        asset=store.asset(value.asset_id)
+        if not asset: raise HTTPException(404,'Image not found')
+        if asset['recipe'].get('media')=='video': raise HTTPException(422,'Add a clip to Branches through its first frame')
+        store.add_branch_image(asset['id'])
+        return {'tree':branches.find_tree(branch_graph()[1],asset['id'])['id']}
+
+    @app.delete('/api/branches/images/{asset_id}')
+    def remove_branch_image(asset_id:str):
+        store.remove_branch_image(asset_id); return {'ok':True}
+
+    @app.post('/api/branches/nodes/{node_id}/real',status_code=201)
+    def make_node_real(node_id:str):
+        """Save a virtual node -- a clip's first or last frame -- as a gallery image, keeping its place."""
+        clip_id,separator,which=node_id.rpartition(':')
+        if not separator or which not in ('first','last'): raise HTTPException(422,'Only a clip frame can be made into an image')
+        asset=save_frame(video_asset(clip_id),which)
+        store.move_branch_position(node_id,asset['id'])
+        return asset
+
+    @app.get('/api/branches/frames/{clip_id}/{which}')
+    def clip_frame(clip_id:str,which:Literal['first','last'],thumbnail:bool=False):
+        image,thumb=clip_frame_files(video_asset(clip_id),which)
+        path=thumb if thumbnail else image
+        if not path.is_file(): raise HTTPException(404,f'This clip has no saved {which} frame')
+        return FileResponse(path,media_type='image/jpeg' if thumbnail else 'image/png')
+
+    @app.put('/api/branches/{root_id}/name')
+    def name_tree(root_id:str,value:TreeName):
+        store.set_branch_name(root_id,value.name.strip()); return {'ok':True}
+
+    @app.get('/api/branches/{item_id}')
+    def branch_tree(item_id:str):
+        """The tree holding a node or clip, with everything needed to draw it."""
+        nodes,trees=branch_graph()
+        tree=branches.find_tree(trees,item_id)
+        if not tree: raise HTTPException(404,'Not in Branches')
+        positions=store.branch_positions()
+        return branches.summary(tree,nodes,store.branch_names())|{
+            'nodes':[nodes[n] for n in tree['nodes']],'clips':tree['clips'],
+            'positions':{n:positions[n] for n in tree['nodes'] if n in positions}}
 
     @app.put('/api/assets/{asset_id}')
     def mark(asset_id:str,value:Mark):

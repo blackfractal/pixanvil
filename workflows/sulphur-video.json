@@ -1,5 +1,5 @@
 {
-  "id":"sulphur-video", "version":1, "name":"Sulphur · Video", "description":"Text-to-video with sound on the local LTX 2.3 Sulphur model. Eight-step distilled; a 4-second clip takes a few minutes.",
+  "id":"sulphur-video", "version":2, "name":"Sulphur · Video", "description":"Text-to-video with sound on the local LTX 2.3 Sulphur model. Eight-step distilled; a 4-second clip takes a few minutes.",
   "family":"ltx2", "media":"video", "emphasis":false, "negative":true,
   "sampler":"one_stage", "scheduler":"distilled", "seed_max":2147483647,
   "defaults":{"width":768,"height":512,"frames":97,"fps":24,"negative":"blurry, out of focus, subtitles, overexposed, underexposed, low contrast, washed out colors, excessive noise, flickering, distorted proportions, deformed facial features, extra limbs, disfigured hands, camera shake, silent or muted audio, distorted voice, jittery movement"},
@@ -22,6 +22,8 @@
     "video":{"class_type":"CreateVideo","inputs":{"images":["decode-video",0],"audio":["decode-audio",0],"fps":24}},
     "save":{"class_type":"SaveVideo","inputs":{"video":["video",0],"filename_prefix":"video/PixAnvil","format":"auto","codec":"auto"}},
     "poster-frame":{"class_type":"ImageFromBatch","inputs":{"image":["decode-video",0],"batch_index":0,"length":1}},
-    "poster":{"class_type":"SaveImage","inputs":{"images":["poster-frame",0],"filename_prefix":"PixAnvil_poster"}}
+    "poster":{"class_type":"SaveImage","inputs":{"images":["poster-frame",0],"filename_prefix":"PixAnvil_poster"}},
+    "last-frame":{"class_type":"ImageFromBatch","inputs":{"image":["decode-video",0],"batch_index":4095,"length":1}},
+    "last":{"class_type":"SaveImage","inputs":{"images":["last-frame",0],"filename_prefix":"PixAnvil_last"}}
   }
 }
