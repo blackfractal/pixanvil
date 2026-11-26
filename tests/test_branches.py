@@ -208,3 +208,13 @@ def test_deleting_an_image_leaves_a_placeholder_and_keeps_its_clips(setup):
     links={c['id']:(c['source'],c['target']) for c in found['clips']}
     assert links=={forward['id']:(missing['id'],forward['id']+':last'),backward['id']:(backward['id']+':first',missing['id'])}
     assert [t['clips'] for t in client.get('/api/branches').json()['items']]==[2]
+
+
+def test_gallery_listing_can_be_limited_to_images_or_clips(setup):
+    app,client=setup
+    start=add_image(client,(20,60,120))
+    video=clip(app,client,start)
+    ids=lambda media:[a['id'] for a in client.get('/api/assets?media='+media).json()['items']]
+    assert ids('image')==[start['id']] and ids('video')==[video['id']]
+    assert sorted(ids(''))==sorted([start['id'],video['id']])
+    assert client.get('/api/assets?media=sound').status_code==422

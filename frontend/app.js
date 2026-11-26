@@ -142,6 +142,40 @@ function dropZone(node,onFile){
 for(const type of ['dragover','drop'])window.addEventListener(type,e=>{if(e.dataTransfer.types.includes('Files'))e.preventDefault();});
 $('#source-file').onchange=run(e=>{const file=pickedFile(e);if(file)return attachFile(file,'source');});$('#end-file').onchange=run(e=>{const file=pickedFile(e);if(file)return attachFile(file,'end');});
 dropZone($('#source-card'),file=>attachFile(file,'source'));dropZone($('#end-card'),file=>attachFile(file,'end'));
+// Any image slot can also be filled from the gallery, without exporting and re-importing a file.
+let pickerSlot='source',pickerOffset=0,pickerTimer=null;
+async function openPicker(slot){
+  pickerSlot=slot;
+  $('#picker-title').textContent=slot==='end'?'Choose the end image':$('#source-title').textContent.startsWith('START')?'Choose the start image':'Choose the source image';
+  $('#picker-search').value='';
+  await loadPicker();
+  $('#picker-dialog').showModal();
+  $('#picker-search').focus();
+}
+async function loadPicker(append=false){
+  if(!append){pickerOffset=0;$('#picker-grid').replaceChildren();}
+  const response=await api(`/assets?media=image&limit=48&offset=${pickerOffset}&q=${encodeURIComponent($('#picker-search').value)}`);
+  pickerOffset+=response.items.length;
+  for(const a of response.items){
+    const item=el('button','picker-item');item.type='button';item.title=`${a.recipe.prompt} · ${a.width} × ${a.height}`;
+    const img=el('img');img.src=`/api/assets/${a.id}/thumbnail`;img.alt=a.recipe.prompt;img.loading='lazy';item.append(img);
+    item.onclick=()=>pickImage(a);
+    $('#picker-grid').append(item);
+  }
+  $('#picker-empty').hidden=pickerOffset>0;
+  $('#picker-more').hidden=pickerOffset>=response.total;
+}
+function pickImage(asset){
+  if(pickerSlot==='end')endAsset=asset;
+  else{sourceAsset=asset;if(mode()==='refine')fitRefineCanvas(asset);}
+  $('#picker-dialog').close();
+  updateOperation();saveDraft();
+}
+$('#pick-source').onclick=run(()=>openPicker('source'));
+$('#pick-end').onclick=run(()=>openPicker('end'));
+$('#close-picker').onclick=()=>$('#picker-dialog').close();
+$('#picker-more').onclick=run(()=>loadPicker(true));
+$('#picker-search').oninput=()=>{clearTimeout(pickerTimer);pickerTimer=setTimeout(run(()=>loadPicker()),250);};
 $('#clear-end').onclick=()=>{endAsset=null;updateOperation();saveDraft();};
 $('#clear-source').onclick=()=>{sourceAsset=null;if(mode()==='variation'){setMode('image');setModelOptions($('#workflow').value);}updateOperation();saveDraft();};
 for(const id of ['variation-strength','denoise','refinement-denoise','upscale-factor','refinement-enabled'])$('#'+id).oninput=()=>{updateOperation();saveDraft();};

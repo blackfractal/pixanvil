@@ -44,3 +44,11 @@ fieldset.plain{border:0;padding:0;margin:0;min-width:0}
 #branch-info p{margin:8px 0 4px;font-size:13px;overflow-wrap:anywhere}
 #branch-actions .quiet{margin-top:8px}
 @media (max-width:1100px){.branch-layout{grid-template-columns:1fr}#branch-graph{height:60vh}}
+#picker-dialog{padding:35px;max-width:980px}
+.picker-search{display:flex;align-items:center;gap:8px;margin:14px 0 18px}
+.picker-search input{width:100%;margin:0}
+.picker-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;max-height:58vh;overflow-y:auto}
+.picker-item{padding:0;background:#252922;border:2px solid transparent;border-radius:5px;overflow:hidden;aspect-ratio:1;cursor:pointer}
+.picker-item:hover,.picker-item:focus-visible{border-color:var(--accent)}
+.picker-item img{display:block;width:100%;height:100%;object-fit:cover}
+#picker-more{margin-top:14px}

@@ -479,8 +479,8 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         return {'deleted_jobs':jobs,'deleted_assets':len(removed),'deleted_inputs':len(inputs),'leftover_files':leftover}
 
     @app.get('/api/assets')
-    def assets(q:str='',model:str='',offset:int=0,limit:int=60,favorites:bool=False):
-        return store.assets(q,model,max(0,offset),max(1,min(limit,100)),favorites)
+    def assets(q:str='',model:str='',offset:int=0,limit:int=60,favorites:bool=False,media:Literal['','image','video']=''):
+        return store.assets(q,model,max(0,offset),max(1,min(limit,100)),favorites,media)
 
     @app.get('/api/assets/{asset_id}')
     def asset_detail(asset_id:str):

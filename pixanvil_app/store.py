@@ -92,8 +92,11 @@ class Store:
                 (asset['id'],asset['job_id'],now(),asset['root'],asset['path'],asset['thumbnail'],
                  json.dumps(asset['recipe']),asset['width'],asset['height']))
 
-    def assets(self, q='', model='', offset=0, limit=60, favorites=False):
+    def assets(self, q='', model='', offset=0, limit=60, favorites=False, media=''):
         clauses, args = [], []
+        if media:
+            # Older and upscaled images carry no media field; only clips say 'video'.
+            clauses.append("COALESCE(json_extract(recipe,'$.media'),'image')=?"); args.append(media)
         if q:
             clauses.append('recipe LIKE ?'); args.append('%'+q+'%')
         if model:
