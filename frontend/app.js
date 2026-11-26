@@ -10,7 +10,9 @@ const titles={gallery:'Your image collection',live:'Watch it take shape',generat
 async function api(path,method='GET',body){const options={method,headers:{'X-PixAnvil':'local'}};if(body instanceof FormData)options.body=body;else if(body!==undefined){options.headers['Content-Type']='application/json';options.body=JSON.stringify(body);}const r=await fetch('/api'+path,options);const data=await r.json();if(!r.ok)throw new Error(typeof data.detail==='string'?data.detail:JSON.stringify(data.detail));return data;}
 function notice(message){$('#notice').hidden=!message;$('#notice').textContent=message;}
 function run(fn){return async(...args)=>{try{await fn(...args);}catch(e){notice(e.message);}};}
-function tab(name){if(!titles[name])name='gallery';document.querySelectorAll('.page').forEach(p=>p.hidden=p.id!==name);document.querySelectorAll('.nav').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));$('#section-label').textContent=name.toUpperCase();$('#page-title').replaceChildren(document.createTextNode(titles[name]),el('span','orange','.'));$('#new-image').hidden=name==='generate';location.hash=name;}
+function tab(name){if(!titles[name])name='gallery';
+  // The newest clip on Live activity plays only while that page is showing.
+  if(name!=='live')$('#latest-preview video')?.pause();document.querySelectorAll('.page').forEach(p=>p.hidden=p.id!==name);document.querySelectorAll('.nav').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));$('#section-label').textContent=name.toUpperCase();$('#page-title').replaceChildren(document.createTextNode(titles[name]),el('span','orange','.'));$('#new-image').hidden=name==='generate';location.hash=name;}
 document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>tab(b.dataset.tab));
 $('#new-image').onclick=$('#first-image').onclick=()=>tab('generate');
 window.addEventListener('hashchange',()=>tab(location.hash.slice(1)));
@@ -320,6 +322,7 @@ function showJob(j,active){
   $('#job-title').textContent=r.prompt||'Untitled job';
   $('#job-body').replaceChildren(progressView(j),...(j.error?[el('p','error',j.error)]:[]),inputThumbs(r),list);
   const actions=[];
+  const reuse=el('button','quiet','Reuse settings');reuse.onclick=run(async()=>{endEditing(false);await restoreRecipe(r);$('#job-dialog').close();tab('generate');});actions.push(reuse);
   if(j.state==='queued'){const edit=el('button','quiet','Edit settings');edit.onclick=run(()=>editJob(j));actions.push(edit);}
   if(j.state==='queued'||j.state==='unknown'){
     const b=el('button','quiet',j.state==='queued'?'Cancel queued':'Abandon local job');
