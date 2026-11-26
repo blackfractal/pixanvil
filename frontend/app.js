@@ -45,8 +45,7 @@ function setWorkflowOptions(w){
   const key=w?.canvases?w.id:'image';if(key===optionsWorkflow)return;optionsWorkflow=key;
   $('#dimensions').replaceChildren(...(w?.canvases||imageCanvases).map(c=>{const o=el('option','',c.label);o.value=`${c.width}x${c.height}`;return o;}));
   if(w?.defaults?.width)$('#dimensions').value=`${w.defaults.width}x${w.defaults.height}`;
-  $('#duration').replaceChildren(...videoLengths(w).map(frames=>{const o=el('option','',`${(frames/w.defaults.fps).toFixed(1)} s · ${frames} frames`);o.value=frames;return o;}));
-  if(w?.defaults?.frames)$('#duration').value=w.defaults.frames;
+  setLengths(w);
 }
 function data(){
   const operation=apiOperation(),upscale=operation==='upscale',video=videoMode();
@@ -66,7 +65,36 @@ function videoLengths(w){
   for(let n=Math.ceil((rule.min-rule.offset)/rule.step);rule.offset+n*rule.step<=rule.max;n++)lengths.push(rule.offset+n*rule.step);
   return lengths;
 }
-function loadRecipe(r){let wf=r.workflow&&workflows.some(w=>w.id===r.workflow)?r.workflow:null;if(!wf&&r.model&&r.operation!=='upscale'){const match=workflows.find(w=>w.models.includes(r.model));if(match)wf=match.id;else notice('The imported model is unavailable. Select a compatible installed model before generating.');}const source=sourceAsset,end=endAsset;setMode(modeOf({...r,workflow:wf}),wf);sourceAsset=r.operation&&r.operation!=='txt2img'?source:null;endAsset=r.operation==='img2vid'?end:null;setModelOptions($('#workflow').value,r.model);$('#prompt').value=r.prompt||'';const w=workflows.find(w=>w.id===$('#workflow').value);$('#negative').value=w?.negative?(r.negative||''):'';$('#seed').value=r.seed??'-1';if(r.width&&r.height&&r.operation!=='edit')setDimensions(r.width,r.height);if(r.frames){if(![...$('#duration').options].some(o=>o.value===String(r.frames))){const o=el('option','',`${(r.frames/(r.fps||24)).toFixed(1)} s · ${r.frames} frames`);o.value=r.frames;$('#duration').append(o);}$('#duration').value=r.frames;}$('#quality').value=Math.max(0,profiles.indexOf(r.quality||'quality'));$('#steps').value=r.operation==='upscale'?'':r.steps??'';$('#cfg').value=r.operation==='upscale'?'':r.cfg??'';$('#count').value=r.count||1;$('#emphasis-text').value=w?.emphasis?(r.emphasis?.[0]?.text||''):'';$('#emphasis-weight').value=r.emphasis?.[0]?.weight??1;
+// The length slider stops only on lengths the model accepts: its step is the frame rule's step, starting at the shortest.
+// Every accepted length gets a tick, and whole multiples of 5 seconds get a label.
+// Switching models keeps the length closest in time to the one chosen before; the first video model starts at its default.
+function setLengths(w){
+  const lengths=videoLengths(w),range=$('#duration');
+  if(!lengths.length)return;
+  const before=range.dataset.fps?Number(range.value)/Number(range.dataset.fps):null;
+  const first=lengths[0],last=lengths.at(-1),fps=w.defaults.fps;
+  range.min=first;range.max=last;range.step=w.frames.step;range.dataset.fps=fps;range.dataset.default=w.defaults.frames;
+  const at=frames=>`${(frames-first)/(last-first)*100}%`;
+  const ticks=lengths.map(frames=>{const tick=el('i');tick.style.left=at(frames);return tick;});
+  const labels=[];
+  for(let seconds=5;seconds*fps<=last;seconds+=5){
+    if(seconds*fps<first)continue;
+    const label=el('span','',`${seconds} s`);label.style.left=at(seconds*fps);labels.push(label);
+  }
+  $('#duration-ticks').replaceChildren(...ticks,...labels);
+  range.value=before===null?w.defaults.frames:lengths.reduce((best,f)=>Math.abs(f/fps-before)<Math.abs(best/fps-before)?f:best);
+  showLength();
+}
+function showLength(){
+  const range=$('#duration'),frames=Number(range.value),fps=Number(range.dataset.fps||24);
+  $('#duration-value').textContent=`${(frames/fps).toFixed(1)} s · ${frames} frames`;
+  const fallback=Number(range.dataset.default);
+  $('#duration-default').disabled=frames===fallback;
+  $('#duration-default').title=`Set to this model's default length, ${(fallback/fps).toFixed(1)} s · ${fallback} frames`;
+}
+$('#duration').oninput=showLength;
+$('#duration-default').onclick=()=>{$('#duration').value=$('#duration').dataset.default;showLength();};
+function loadRecipe(r){let wf=r.workflow&&workflows.some(w=>w.id===r.workflow)?r.workflow:null;if(!wf&&r.model&&r.operation!=='upscale'){const match=workflows.find(w=>w.models.includes(r.model));if(match)wf=match.id;else notice('The imported model is unavailable. Select a compatible installed model before generating.');}const source=sourceAsset,end=endAsset;setMode(modeOf({...r,workflow:wf}),wf);sourceAsset=r.operation&&r.operation!=='txt2img'?source:null;endAsset=r.operation==='img2vid'?end:null;setModelOptions($('#workflow').value,r.model);$('#prompt').value=r.prompt||'';const w=workflows.find(w=>w.id===$('#workflow').value);$('#negative').value=w?.negative?(r.negative||''):'';$('#seed').value=r.seed??'-1';if(r.width&&r.height&&r.operation!=='edit')setDimensions(r.width,r.height);if(r.frames){$('#duration').value=r.frames;showLength();}$('#quality').value=Math.max(0,profiles.indexOf(r.quality||'quality'));$('#steps').value=r.operation==='upscale'?'':r.steps??'';$('#cfg').value=r.operation==='upscale'?'':r.cfg??'';$('#count').value=r.count||1;$('#emphasis-text').value=w?.emphasis?(r.emphasis?.[0]?.text||''):'';$('#emphasis-weight').value=r.emphasis?.[0]?.weight??1;
   $('#variation-seed').value=r.variation_seed??'-1';$('#variation-strength').value=r.variation_strength??.15;$('#denoise').value=r.denoise??.25;$('#upscale-factor').value=r.scale||2;if(r.upscale_model)$('#upscale-model').value=r.upscale_model;
   $('#refinement-enabled').checked=!!r.refinement;$('#refinement-workflow').value=r.refinement?.workflow||'sdxl';refinementModels(r.refinement?.model);$('#refinement-steps').value=r.refinement?.steps||20;$('#refinement-denoise').value=r.refinement?.denoise??.25;updateOperation();if(r.operation==='img2vid'&&r.width&&r.height)setDimensions(r.width,r.height);updateLabels();saveDraft();
 }
