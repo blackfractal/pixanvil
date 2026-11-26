@@ -157,6 +157,10 @@ class Chain(BaseModel):
     clips: list[str] = Field(min_length=1, max_length=200)
 
 
+class SavedChain(Chain):
+    name: str = Field(default='', max_length=80)
+
+
 def make_app(state=None, worker=True, client_factory=Comfy):
     config=Config(state)
     store=Store(config.state/'pixanvil.sqlite3')
@@ -562,7 +566,9 @@ def make_app(state=None, worker=True, client_factory=Comfy):
     def branch_graph():
         def has_last_frame(clip): return clip_frame_files(clip,'last')[0].is_file()
         nodes,clips=branches.build(store.all_assets(),store.active(),store.branch_added(),has_last_frame)
-        branches.mark_takes(nodes,clips,store.branch_pairs())
+        numbers,highest=store.take_numbers()
+        new=branches.mark_takes(nodes,clips,store.branch_pairs(),numbers,highest)
+        if new: store.add_take_numbers(new)
         return nodes,branches.trees(nodes,clips)
 
     @app.get('/api/branches')
@@ -676,6 +682,30 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         return FileResponse(temp,media_type='application/zip',filename=branches.file_name(name)+'.zip',
                             background=BackgroundTask(temp.unlink,missing_ok=True))
 
+    def saved_chain(chain_id,value):
+        """Check a chain from the builder and save it under this id, new or not."""
+        nodes,trees=branch_graph()
+        tree=branches.find_tree(trees,value.clips[0])
+        if not tree: raise HTTPException(404,'Not in Branches')
+        problem=branches.chain_errors(tree,value.clips)
+        if problem: raise HTTPException(422,problem)
+        store.save_branch_chain(chain_id,value.name.strip() or 'Untitled chain',branches.chain_steps(tree,nodes,value.clips))
+        return store.branch_chain(chain_id)
+
+    @app.post('/api/branches/chains',status_code=201)
+    def save_chain(value:SavedChain): return saved_chain('chain-'+uuid.uuid4().hex,value)
+
+    @app.put('/api/branches/chains/{chain_id}')
+    def update_chain(chain_id:str,value:SavedChain):
+        if not store.branch_chain(chain_id): raise HTTPException(404,'Saved chain not found')
+        return saved_chain(chain_id,value)
+
+    @app.delete('/api/branches/chains/{chain_id}')
+    def delete_chain(chain_id:str):
+        if not store.branch_chain(chain_id): raise HTTPException(404,'Saved chain not found')
+        store.delete_branch_chain(chain_id)
+        return {'ok':True}
+
     @app.post('/api/branches/sequence',status_code=201)
     def export_chain(value:Chain):
         """Join a chain of clips into one video, saved to the gallery as a clip of its own."""
@@ -700,6 +730,7 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         prompt=f'{tree_title(tree,nodes)} · chain of {len(value.clips)} clips'
         recipe={'operation':'sequence','workflow':'sequence','media':'video','prompt':prompt,'resolved_prompt':prompt,
                 'negative':'','model':'','seed':'','steps':'','cfg':'','clips':value.clips,'tree':tree['id'],
+                'chain':branches.chain_steps(tree,nodes,value.clips),
                 'width':width,'height':height,'fps':fps,'frames':round(seconds*fps)}
         store.add_asset({'id':asset_id,'job_id':None,'root':str(root),'path':str(path.relative_to(root)),
                          'thumbnail':str(thumb.relative_to(root)),'recipe':recipe,'width':width,'height':height})
@@ -712,11 +743,13 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         tree=branches.find_tree(trees,item_id)
         if not tree: raise HTTPException(404,'Not in Branches')
         positions,labels=store.branch_positions(),store.branch_labels()
+        defaults=branches.keyframe_names(tree,nodes)
         def drawn(node):
             key=branches.label_key(node)
-            return node|{'label_key':key,'label':labels.get(key,'')}
+            return node|{'label_key':key,'label':labels.get(key,''),'default_label':defaults[node['id']]}
         return branches.summary(tree,nodes,store.branch_names())|{
             'nodes':[drawn(nodes[n]) for n in tree['nodes']],'clips':tree['clips'],
+            'chains':branches.tree_chains(tree,nodes,store.branch_chains()),
             'positions':{n:positions[n] for n in tree['nodes'] if n in positions}}
 
     @app.put('/api/assets/{asset_id}')

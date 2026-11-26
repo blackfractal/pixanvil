@@ -265,6 +265,11 @@ def test_labels_follow_a_frame_when_it_is_saved_and_when_it_is_deleted(setup):
     label(client,virtual['label_key'],'B1')
     labels=lambda:{n['id']:n['label'] for n in tree(client,video['id'])['nodes']}
     assert labels()=={start['id']:'A1',video['id']+':last':'B1'}
+    # Without a typed label, an image is named by the order the tree's images were made.
+    defaults=lambda:{n['id']:n['default_label'] for n in tree(client,video['id'])['nodes']}
+    later=clip(app,client,start)
+    assert defaults()=={start['id']:'Keyframe 1',video['id']+':last':'Keyframe 2',later['id']+':last':'Keyframe 3'}
+    client.delete('/api/assets/'+later['id'],headers=HEADERS)
     frame=client.post(f'/api/branches/nodes/{video["id"]}:last/real',headers=HEADERS).json()
     assert labels()=={start['id']:'A1',frame['id']:'B1'}
     client.delete('/api/assets/'+start['id'],headers=HEADERS)
@@ -291,7 +296,7 @@ def test_export_selected_names_files_after_labels(setup):
     assert response.headers['content-type']=='application/zip'
     archive=zipfile.ZipFile(io.BytesIO(response.content))
     names=sorted(archive.namelist())
-    frame_name=f'frame-{forward["id"]}-last'
+    frame_name='Keyframe 3'  # unlabelled: named by the order the tree's images were made
     assert names==sorted(['graph.json','images/A1.png','images/B_1.png',f'images/{frame_name}.png',
                           'clips/A1-B_1.mp4','clips/A1-B_1-take2.mp4',f'clips/B_1-{frame_name}.mp4'])
     assert archive.read('images/A1.png')==(Path(a1['root'])/a1['path']).read_bytes()
@@ -332,6 +337,9 @@ def test_export_chain_joins_clips_and_drops_the_repeated_frame(setup):
     joined=response.json()
     recipe=joined['recipe']
     assert (recipe['operation'],recipe['media'],recipe['clips'])==('sequence','video',[first['id'],second['id']])
+    # The steps are kept with the images they join, so the chain can be opened in the builder again.
+    assert recipe['chain']==[{'clip':first['id'],'start_key':start['id'],'end_key':frame['id']},
+                             {'clip':second['id'],'start_key':frame['id'],'end_key':f"frame-{second['id']}-last"}]
     assert (joined['width'],joined['height'],recipe['frames'])==(160,120,47)
     made=sequence.probe(Path(joined['root'])/joined['path'])
     assert (made.width,made.height,made.audio)==(160,120,True) and abs(made.seconds-47/24)<0.1
@@ -369,13 +377,48 @@ def test_takes_between_two_images_are_numbered_with_one_preferred(setup):
     # Export names the preferred take plainly and the others by their take number.
     import zipfile
     archive=zipfile.ZipFile(io.BytesIO(client.post('/api/branches/export',headers=HEADERS,json={'items':[t['id'] for t in takes]}).content))
-    a_name,b_name=a['id'],b['id']
+    a_name,b_name='Keyframe 1','Keyframe 2'
     assert sorted(n for n in archive.namelist() if n.startswith('clips/'))==sorted(
         [f'clips/{a_name}-{b_name}.mp4',f'clips/{a_name}-{b_name}-take1.mp4',f'clips/{a_name}-{b_name}-take2.mp4'])
-    # Deleting the preferred take makes the first remaining one preferred.
+    # Deleting the preferred take makes the lowest-numbered remaining one preferred.
     client.delete('/api/assets/'+takes[2]['id'],headers=HEADERS)
     found,marks=state()
     assert [marks[t['id']] for t in takes[:2]]==[(1,2,True),(2,2,False)]
+    # Numbers are kept: deleting take 1 leaves take 2 as take 2, and new takes never reuse 1 or 3. Running the
+    # worker for another clip also finishes the queued job, which becomes take 4.
+    client.delete('/api/assets/'+takes[0]['id'],headers=HEADERS)
+    later=clip(app,client,a,end=b)
+    found,marks=state()
+    finished=next(c for c in found['clips'] if c.get('take')==4)
+    assert finished['prompt']=='one more'
+    assert (marks[takes[1]['id']],marks[later['id']])==((2,3,True),(5,3,False))
     # Only finished clips can be chosen.
     assert pick({'clip_id':'job:'+queued['id'],'preferred':True}).status_code==404
     assert pick({'clip_id':takes[0]['id'],'label_mode':'fancy'}).status_code==422
+
+
+def test_saved_chains_keep_their_steps_and_images(setup):
+    app,client=setup
+    a,b=add_image(client,(20,60,120),'a'),add_image(client,(90,30,10),'b')
+    there,back,again=clip(app,client,a,end=b),clip(app,client,b,end=a),clip(app,client,a,end=b)
+    steps=[there['id'],back['id'],again['id']]
+    response=client.post('/api/branches/chains',headers=HEADERS,json={'name':' Ping pong ','clips':steps})
+    assert response.status_code==201,response.text
+    saved=response.json()
+    assert saved['name']=='Ping pong'
+    assert saved['steps']==[{'clip':there['id'],'start_key':a['id'],'end_key':b['id']},
+                            {'clip':back['id'],'start_key':b['id'],'end_key':a['id']},
+                            {'clip':again['id'],'start_key':a['id'],'end_key':b['id']}]
+    assert [c['id'] for c in tree(client,a['id'])['chains']]==[saved['id']]
+    # Re-saving replaces the steps and name; a blank name becomes Untitled chain.
+    updated=client.put('/api/branches/chains/'+saved['id'],headers=HEADERS,json={'name':'','clips':steps[:2]})
+    assert updated.status_code==200 and updated.json()['name']=='Untitled chain' and len(updated.json()['steps'])==2
+    # A chain that does not join up is refused, as are unknown chains.
+    assert client.post('/api/branches/chains',headers=HEADERS,json={'clips':[there['id'],there['id']]}).status_code==422
+    assert client.put('/api/branches/chains/nonsense',headers=HEADERS,json={'clips':steps}).status_code==404
+    # Deleting a take keeps the chain listed with the tree: its images are still there.
+    client.delete('/api/assets/'+there['id'],headers=HEADERS)
+    assert [c['id'] for c in tree(client,a['id'])['chains']]==[saved['id']]
+    assert client.delete('/api/branches/chains/'+saved['id'],headers=HEADERS).status_code==200
+    assert tree(client,a['id'])['chains']==[]
+    assert client.delete('/api/branches/chains/'+saved['id'],headers=HEADERS).status_code==404

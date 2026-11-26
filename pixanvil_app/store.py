@@ -42,6 +42,15 @@ class Store:
                     start_key TEXT NOT NULL, end_key TEXT NOT NULL, preferred_clip TEXT,
                     label_mode TEXT NOT NULL DEFAULT 'stats', label TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY(start_key, end_key));
+                -- Chains saved from the chain builder. Steps are JSON: each step's clip and the image keys it joins, so
+                -- a step whose take was deleted can use another take between the same two images.
+                -- Each finished clip's take number between its two images, given once and kept, so deleting a take never
+                -- renumbers the others. Rows stay after their clip is deleted, so a number is never given twice.
+                CREATE TABLE IF NOT EXISTS branch_takes (
+                    clip_id TEXT PRIMARY KEY, start_key TEXT NOT NULL, end_key TEXT NOT NULL, number INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS branch_chains (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, steps TEXT NOT NULL,
+                    created TEXT NOT NULL, updated TEXT NOT NULL);
             ''')
 
     @contextmanager
@@ -197,6 +206,47 @@ class Store:
                 if value is not None:
                     db.execute(f'UPDATE branch_pairs SET {key}=? WHERE start_key=? AND end_key=?', (value, start_key, end_key))
 
+    def take_numbers(self):
+        """({clip id: take number}, {(start key, end key): highest number ever given})."""
+        with self.connect() as db:
+            rows = db.execute('SELECT * FROM branch_takes').fetchall()
+        highest = {}
+        for r in rows:
+            key = (r['start_key'], r['end_key'])
+            highest[key] = max(highest.get(key, 0), r['number'])
+        return {r['clip_id']: r['number'] for r in rows}, highest
+
+    def add_take_numbers(self, rows):
+        """Keep new take numbers: (clip id, start key, end key, number). A clip already numbered keeps its number."""
+        with self.connect() as db:
+            db.executemany('INSERT OR IGNORE INTO branch_takes(clip_id,start_key,end_key,number) VALUES(?,?,?,?)', rows)
+
+    def branch_chains(self):
+        """Every saved chain, most recently saved first."""
+        with self.connect() as db:
+            return [self.decode_chain(r) for r in db.execute('SELECT * FROM branch_chains ORDER BY updated DESC, id')]
+
+    def branch_chain(self, chain_id):
+        with self.connect() as db:
+            row = db.execute('SELECT * FROM branch_chains WHERE id=?', (chain_id,)).fetchone()
+        return self.decode_chain(row) if row else None
+
+    def save_branch_chain(self, chain_id, name, steps):
+        """Create the chain, or replace the name and steps of a saved one."""
+        stamp = now()
+        with self.connect() as db:
+            db.execute('INSERT INTO branch_chains(id,name,steps,created,updated) VALUES(?,?,?,?,?) '
+                       'ON CONFLICT(id) DO UPDATE SET name=excluded.name, steps=excluded.steps, updated=excluded.updated',
+                       (chain_id, name, json.dumps(steps), stamp, stamp))
+
+    def delete_branch_chain(self, chain_id):
+        with self.connect() as db:
+            db.execute('DELETE FROM branch_chains WHERE id=?', (chain_id,))
+
+    @staticmethod
+    def decode_chain(row):
+        return dict(row) | {'steps': json.loads(row['steps'])}
+
     def branch_added(self):
         with self.connect() as db:
             return [r['asset_id'] for r in db.execute('SELECT asset_id FROM branch_added ORDER BY created')]
@@ -223,7 +273,7 @@ class Store:
             removed = [self.decode(r) for r in db.execute('SELECT * FROM assets')]
             db.execute('DELETE FROM assets')
             db.execute('DELETE FROM jobs')
-            for table in ('branch_layout', 'branch_names', 'branch_added', 'branch_labels', 'branch_pairs'):
+            for table in ('branch_layout', 'branch_names', 'branch_added', 'branch_labels', 'branch_pairs', 'branch_chains', 'branch_takes'):
                 db.execute('DELETE FROM '+table)
         return removed
 

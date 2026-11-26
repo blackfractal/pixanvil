@@ -190,23 +190,35 @@ def pair_keys(nodes, clip):
     return label_key(nodes[clip['source']]), label_key(nodes[clip['target']])
 
 
-def mark_takes(nodes, clips, pairs):
+def mark_takes(nodes, clips, pairs, numbers, highest):
     """Number the takes between each pair of nodes and mark the preferred one, in place.
 
-    Takes are the finished clips with the same start and end node, numbered in the order made. The preferred
-    take is the one saved in `pairs` while it still exists, otherwise the first take, so a new take never
-    changes a chain on its own. Every clip of a pair, pending ones included, carries the pair's label choice."""
-    groups = {}
+    Takes are the finished clips with the same start and end node. A take keeps the number it was first given
+    (`numbers`, by clip id); a new take gets one more than the highest number its pair ever had (`highest`, by
+    pair keys), so numbers never shift or repeat. Returns the new numbers to keep, as
+    (clip id, start key, end key, number). The preferred take is the one saved in `pairs` while it still exists,
+    otherwise the lowest-numbered take, so a new take never changes a chain on its own. Every clip of a pair,
+    pending ones included, carries the pair's label choice."""
+    groups, new = {}, []
     for clip in clips:
         groups.setdefault((clip['source'], clip['target']), []).append(clip)
     for group in groups.values():
-        stored = pairs.get(pair_keys(nodes, group[0]), {})
         takes = sorted((c for c in group if not c['pending']), key=lambda c: (c['created'], c['id']))
+        keys = pair_keys(nodes, takes[0] if takes else group[0])
+        stored = pairs.get(keys, {})
+        top = max([highest.get(keys, 0)]+[numbers[c['id']] for c in takes if c['id'] in numbers])
+        for clip in takes:
+            if clip['id'] not in numbers:
+                top += 1
+                numbers[clip['id']] = top
+                new.append((clip['id'], *keys, top))
+        takes.sort(key=lambda c: numbers[c['id']])
         preferred = next((c for c in takes if c['id'] == stored.get('preferred_clip')), takes[0] if takes else None)
-        for number, clip in enumerate(takes, 1):
-            clip.update(take=number, takes=len(takes), preferred=clip is preferred)
+        for clip in takes:
+            clip.update(take=numbers[clip['id']], takes=len(takes), preferred=clip is preferred)
         for clip in group:
             clip.update(pair_label_mode=stored.get('label_mode') or 'stats', pair_label=stored.get('label') or '')
+    return new
 
 
 def name_key(tree, nodes, names):
@@ -255,8 +267,37 @@ def file_name(text):
     return safe[:60] or 'image'
 
 
+def chain_steps(tree, nodes, clip_ids):
+    """A chain as saved: each step's clip and the image keys it joins, so a step whose take is deleted later can
+    use another take between the same two images. The clips must be in the tree (see chain_errors)."""
+    clips = {c['id']: c for c in tree['clips']}
+    return [{'clip': i, 'start_key': label_key(nodes[clips[i]['source']]), 'end_key': label_key(nodes[clips[i]['target']])}
+            for i in clip_ids]
+
+
+def tree_chains(tree, nodes, chains):
+    """The saved chains that belong to a tree: those with a clip or an image in it, even after some were deleted."""
+    clip_ids = {c['id'] for c in tree['clips']}
+    keys = {label_key(nodes[n]) for n in tree['nodes']} - {None}
+    return [c for c in chains
+            if any(s['clip'] in clip_ids or s.get('start_key') in keys or s.get('end_key') in keys for s in c['steps'])]
+
+
+def keyframe_names(tree, nodes):
+    """Default names for a tree's images, used where no label was typed: Keyframe 1, Keyframe 2, ... in the order
+    the images were made, so a new image gets the next number. Removing an image entirely renumbers the later ones."""
+    ordered = sorted((nodes[n] for n in tree['nodes']), key=lambda n: (n['created'], n['id']))
+    return {node['id']: f'Keyframe {number}' for number, node in enumerate(ordered, 1)}
+
+
+def node_names(tree, nodes, labels):
+    """Each node's name: its typed label, else its keyframe name."""
+    defaults = keyframe_names(tree, nodes)
+    return {n: labels.get(label_key(nodes[n])) or defaults[n] for n in tree['nodes']}
+
+
 def plan_export(tree, nodes, selected, labels):
-    """What Export selected writes: images and clips named after node labels, and a graph describing them.
+    """What Export selected writes: images and clips named after node names (labels or keyframe names), and a graph.
 
     Returns (images, clips, graph). `images` holds (node, name) for nodes with a picture; `clips` holds
     (clip, name) for finished clips. A clip is named after the nodes it joins, so the preferred take between
@@ -264,11 +305,11 @@ def plan_export(tree, nodes, selected, labels):
     Clips must have been through mark_takes."""
     selected = set(selected)
     in_tree = [nodes[n] for n in tree['nodes']]
+    shown = node_names(tree, nodes, labels)
     # Every node gets a name, selected or not, because clip names use the names of both their ends.
     names, used = {}, set()
-    for node in sorted(in_tree, key=lambda n: n['created']):
-        key = label_key(node)
-        base = file_name(labels.get(key) or key or node['id'])
+    for node in sorted(in_tree, key=lambda n: (n['created'], n['id'])):
+        base = file_name(shown[node['id']])
         name, count = base, 2
         while name.lower() in used:
             name, count = f'{base}-{count}', count+1
@@ -282,7 +323,7 @@ def plan_export(tree, nodes, selected, labels):
             images.append((node, names[node['id']]))
         else:
             reason = {'missing': 'deleted image', 'pending': 'still rendering'}.get(node['kind'], 'no saved frame')
-            skipped.append({'id': node['id'], 'label': labels.get(label_key(node), ''), 'reason': reason})
+            skipped.append({'id': node['id'], 'label': shown[node['id']], 'reason': reason})
     for clip in sorted(tree['clips'], key=lambda c: c['created']):
         if clip['id'] not in selected:
             continue
@@ -292,10 +333,10 @@ def plan_export(tree, nodes, selected, labels):
         suffix = '' if clip['preferred'] else f'-take{clip["take"]}'
         clips.append((clip, f'{names[clip["source"]]}-{names[clip["target"]]}{suffix}'))
     graph = {
-        'nodes': [{'id': n['id'], 'label': labels.get(label_key(n), ''), 'file': f'images/{name}.png',
+        'nodes': [{'id': n['id'], 'label': shown[n['id']], 'file': f'images/{name}.png',
                    'prompt': n['prompt']} for n, name in images],
         'clips': [{'id': c['id'], 'from': c['source'], 'to': c['target'],
-                   'from_label': labels.get(label_key(nodes[c['source']]), ''), 'to_label': labels.get(label_key(nodes[c['target']]), ''),
+                   'from_label': shown[c['source']], 'to_label': shown[c['target']],
                    'file': f'clips/{name}.mp4', 'seconds': c['seconds'], 'prompt': c['prompt'],
                    'take': c['take'], 'takes': c['takes'], 'preferred': c['preferred'],
                    'connection_label': c['pair_label'] if c['pair_label_mode'] == 'custom' else ''} for c, name in clips],
