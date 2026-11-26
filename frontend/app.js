@@ -468,13 +468,18 @@ let cy=null,branchTree=null,branchOpenId=null,branchSignature='',positionQueue={
 // The clip a playing chain is on, kept so a redraw can highlight it again; redrawingTree hides the redraw's own reselection.
 let chainPlaying=null,redrawingTree=false,chainTimer=null,branchFocus=[];
 // Takes: the clips between the same two nodes form one pair, drawn as one connection whose id is its preferred take's.
-let branchPairs=new Map(),pairByEdge=new Map(),pairByClip=new Map();
+let branchPairs=new Map(),pairByEdge=new Map(),pairByClip=new Map(),clipById=new Map();
+// Selections: the order items were clicked in (Cytoscape does not keep it), and which items a box selected.
+let selectionOrder=[],boxedIds=new Set();
+// The chain builder, while open: its start node and its steps as clip ids, in order, repeats allowed.
+let builder=null;
 // Loading and drawing run one at a time, so a poll arriving mid-draw cannot build the graph twice.
 let branchWork=Promise.resolve();
 function branchTask(fn){branchWork=branchWork.catch(()=>{}).then(fn);return branchWork;}
 function showBranches(){return branchTask(()=>branchOpenId?loadTree(branchOpenId).catch(()=>loadTrees()):loadTrees());}
 function openInBranches(id,focus=[]){branchOpenId=id;branchFocus=focus;tab('branches');}
 async function loadTrees(){
+  if(builder){builder=null;cy?.autounselectify(false);renderChainStrip();}
   branchOpenId=null;branchTree=null;branchSignature='';
   const {items}=await api('/branches');
   $('#tree-view').hidden=true;$('#tree-picker').hidden=false;$('#empty-branches').hidden=items.length>0;
@@ -578,6 +583,8 @@ function branchStyle(){
     {selector:'edge.rendering',style:{'line-color':GENERATING,'target-arrow-color':GENERATING}},
     {selector:'edge.queued',style:{'line-color':accent,'target-arrow-color':accent}},
     {selector:'edge.rendering.blink',style:{'line-opacity':.3}},
+    // In the chain builder, the connections that can be added next.
+    {selector:'edge.next-step',style:{'line-color':SELECTED,'target-arrow-color':SELECTED,width:5,'line-opacity':1}},
     {selector:'edge:selected',style:{'line-color':SELECTED,'target-arrow-color':SELECTED,width:4}},
     {selector:'edge.playing',style:{'line-color':'#f4f1e8','target-arrow-color':'#f4f1e8',width:6}},
   ];
@@ -600,7 +607,7 @@ function setPairs(tree){
     (c.pending?pair.pending:pair.takes).push(c);
     pair.labelMode=c.pair_label_mode||'stats';pair.label=c.pair_label||'';
   }
-  pairByEdge=new Map();pairByClip=new Map();
+  pairByEdge=new Map();pairByClip=new Map();clipById=new Map(tree.clips.filter(c=>!c.pending).map(c=>[c.id,c]));
   for(const pair of branchPairs.values()){
     pair.takes.sort((a,b)=>a.take-b.take);
     pair.preferred=pair.takes.find(c=>c.preferred)||pair.takes[0]||null;
@@ -652,11 +659,15 @@ async function drawTree(tree,fit){
   ];
   if(!cy){
     cy=cytoscape({container:$('#branch-graph'),elements,layout:{name:'preset'},style:branchStyle(),boxSelectionEnabled:true,maxZoom:3,minZoom:.1});
-    cy.on('tap','node',e=>showBranchNode(branchTree.nodes.find(n=>n.id===e.target.id())));
-    cy.on('tap','edge',e=>showBranchPair(pairByEdge.get(e.target.id())));
-    cy.on('tap',e=>{if(e.target===cy)clearBranchPanel();});
+    // While the chain builder is open, clicking a connection adds it as the next step instead of opening its panel.
+    cy.on('tap','node',e=>{if(!builder)showBranchNode(branchTree.nodes.find(n=>n.id===e.target.id()));});
+    cy.on('tap','edge',e=>{const pair=pairByEdge.get(e.target.id());if(builder)addBuilderStep(pair);else showBranchPair(pair);});
+    cy.on('tap',e=>{if(e.target===cy&&!builder)clearBranchPanel();});
+    cy.on('select',e=>{if(redrawingTree)return;const id=e.target.id();selectionOrder=[...selectionOrder.filter(i=>i!==id),id];});
+    cy.on('unselect',e=>{if(redrawingTree)return;const id=e.target.id();selectionOrder=selectionOrder.filter(i=>i!==id);boxedIds.delete(id);});
+    cy.on('boxselect',e=>boxedIds.add(e.target.id()));
     // Selecting several items offers them as a chain. Runs after the tap handlers, so it wins over a single item's panel.
-    cy.on('select unselect',()=>{if(redrawingTree)return;clearTimeout(chainTimer);chainTimer=setTimeout(showChainSelection,0);});
+    cy.on('select unselect',()=>{if(redrawingTree||builder)return;clearTimeout(chainTimer);chainTimer=setTimeout(showChainSelection,0);});
     // Dropped nodes keep their place; a dragged selection saves in one request.
     cy.on('position','node',e=>e.target.connectedEdges('.two-way').forEach(placeTwoWay));
     cy.on('dragfree','node',e=>{
@@ -672,12 +683,13 @@ async function drawTree(tree,fit){
       for(const id of chosen)cy.getElementById(id).select();
     }finally{redrawingTree=false;}
     if(chainPlaying)cy.getElementById(chainPlaying).addClass('playing');
+    if(builder)markBuilder();
     if(!fit)cy.viewport(viewport);
   }
   cy.edges('.two-way').forEach(placeTwoWay);
   if(fit){clearBranchPanel();cy.fit(undefined,40);}
 }
-const BRANCH_HINT='Click an image or a connection. Shift-click connections, or two images, to play a chain. Drag to move, scroll to zoom, F to fit.';
+const BRANCH_HINT='Click an image or a connection. For a chain, shift-click connections in order, click two images, or shift-drag a box; Build chain does anything else. Drag to move, scroll to zoom, F to fit.';
 function clearBranchPanel(){
   stopBranchVideo();
   $('#branch-preview').replaceChildren(el('p','muted',BRANCH_HINT));
@@ -707,7 +719,7 @@ function playClips(container,clips,{captionEl,caption,onShow}){
     current.play().catch(()=>{});
     load(other,(index+1)%clips.length);
     captionEl.textContent=caption(index,pass);
-    onShow?.(clips[index]);
+    onShow?.(clips[index],index);
   };
   for(const player of players)player.onended=()=>{
     if(player!==players[active])return;
@@ -720,61 +732,82 @@ function highlightPlaying(clip){
   cy.edges().removeClass('playing');cy.getElementById(edge).addClass('playing');chainPlaying=edge;
 }
 // ---- Chains: clips that each start where the previous one ended, played back to back. ----
-// From the selection: the preferred takes of the selected connections in order, or else the one route between
-// two selected images.
-function chainFromSelection(tree,ids){
-  const pairs=ids.map(id=>pairByEdge.get(id)).filter(Boolean),nodes=tree.nodes.filter(n=>ids.includes(n.id));
+// Quick chains from a selection. A box runs forward from its leftmost image to its rightmost; two clicked images run
+// from the first clicked to the second; clicked connections run in click order. Anything a selection cannot say,
+// such as visiting an image twice, is what the chain builder is for.
+function chainFromSelection(tree,ids,reversed=false){
+  const order=selectionOrder.filter(id=>ids.includes(id)).concat(ids.filter(id=>!selectionOrder.includes(id)));
+  const pairs=order.map(id=>pairByEdge.get(id)).filter(Boolean);
+  const nodes=order.map(id=>tree.nodes.find(n=>n.id===id)).filter(Boolean);
+  if(pairs.some(p=>!p.preferred))return {error:'A selected connection has no finished take yet.'};
+  if(ids.some(id=>boxedIds.has(id))&&nodes.length>=2){
+    const at=n=>cy.getElementById(n.id).position();
+    const sorted=[...nodes].sort((a,b)=>at(a).x-at(b).x||at(a).y-at(b).y);
+    const route=routeBetween(sorted[0].id,sorted.at(-1).id,pairs.length?pairs.map(p=>p.preferred):undefined);
+    return route?{clips:route}:{error:'No route runs forward from the leftmost selected image to the rightmost along the selected connections.'};
+  }
   if(pairs.length){
-    if(pairs.some(p=>!p.preferred))return {error:'A selected connection has no finished take yet.'};
-    return orderClips(pairs.map(p=>p.preferred));
+    const clips=pairs.map(p=>p.preferred);
+    // In click order when that joins up; otherwise in the one order they can join in, if there is one.
+    if(clips.every((c,i)=>i===0||clips[i-1].target===c.source))return {clips};
+    return orderClips(clips);
   }
   if(nodes.length===2){
-    const [left,right]=[...nodes].sort((a,b)=>cy.getElementById(a.id).position('x')-cy.getElementById(b.id).position('x'));
-    return routeBetween(left.id,right.id)||routeBetween(right.id,left.id)||{error:'No finished clips lead from one of these images to the other.'};
+    const [first,second]=reversed?[nodes[1],nodes[0]]:nodes;
+    const route=routeBetween(first.id,second.id),reversible=!!routeBetween(second.id,first.id);
+    return route?{clips:route,reversible}:{error:`No finished clips lead from ${nodeName(first.id)} to ${nodeName(second.id)}.`,reversible};
   }
-  return {error:'To play a chain, select connections that follow on from each other, or two images with a route between them.'};
+  return {error:'To play a chain, click connections that follow on from each other, click two images, or drag a box over part of the tree. For anything else, use Build chain.'};
 }
+// The single order the clips can be played in so each starts where the previous one ended, if there is one.
 function orderClips(clips){
-  const broken={error:'The selected connections do not join end to start. Select ones where each starts on the image the previous one ends on.'};
+  const broken={error:'The selected connections do not join end to start. Click them in order, or use Build chain.'};
   const from=new Map();
   for(const c of clips){
-    if(from.has(c.source))return {error:'The selected connections split into more than one path from one image. Select a single route.'};
+    if(from.has(c.source))return {error:'The selected connections split into more than one path from one image. Click them in order, or use Build chain.'};
     from.set(c.source,c);
   }
   const targets=new Set(clips.map(c=>c.target)),starts=clips.filter(c=>!targets.has(c.source));
-  if(starts.length>1)return broken;
-  // A selection that loops all the way round starts from its oldest clip.
-  let clip=starts[0]||[...clips].sort((a,b)=>a.created.localeCompare(b.created))[0];
+  if(starts.length!==1)return broken;
+  let clip=starts[0];
   const order=[];
   while(clip&&!order.includes(clip)){order.push(clip);clip=from.get(clip.target);}
   return order.length===clips.length?{clips:order}:broken;
 }
-// The shortest route from one node to another, one step per connection, or null. Two equally short routes are
-// ambiguous; several takes of one connection are not, since a route uses each connection's preferred take.
-function routeBetween(start,end){
+// The shortest route from one node to another through the given steps (by default every connection's preferred
+// take), or null. Equally short routes are settled by taking the older clips first.
+function routeBetween(start,end,steps=[...branchPairs.values()].filter(p=>p.preferred).map(p=>p.preferred)){
   if(start===end)return null;
-  const steps=[...branchPairs.values()].filter(p=>p.preferred).map(p=>p.preferred);
-  const depth=new Map([[start,0]]),routes=new Map([[start,1]]),via=new Map(),queue=[start];
+  const ordered=[...steps].sort((a,b)=>a.created.localeCompare(b.created));
+  const via=new Map(),seen=new Set([start]),queue=[start];
   while(queue.length){
     const node=queue.shift();
-    for(const c of steps.filter(c=>c.source===node)){
-      if(!depth.has(c.target)){depth.set(c.target,depth.get(node)+1);routes.set(c.target,0);via.set(c.target,c);queue.push(c.target);}
-      if(depth.get(c.target)===depth.get(node)+1)routes.set(c.target,routes.get(c.target)+routes.get(node));
+    for(const c of ordered.filter(c=>c.source===node)){
+      if(seen.has(c.target))continue;
+      seen.add(c.target);via.set(c.target,c);queue.push(c.target);
     }
   }
-  if(!depth.has(end))return null;
-  if(routes.get(end)>1)return {error:'More than one route joins these images. Shift-click the connections you want instead.'};
+  if(!seen.has(end))return null;
   const order=[];
   for(let node=end;node!==start;node=via.get(node).source)order.unshift(via.get(node));
-  return {clips:order};
+  return order;
 }
+function nodeName(id){
+  const n=branchTree?.nodes.find(n=>n.id===id);
+  return n?.label||(n?.kind==='missing'?'deleted image':(n?.prompt||'image').slice(0,18));
+}
+function chainPath(start,clips){return [nodeName(start),...clips.map(c=>nodeName(c.target))].join(' → ');}
 function showChainSelection(){
-  if(!cy||!branchTree)return;
+  if(!cy||!branchTree||builder)return;
   const ids=cy.$(':selected').map(e=>e.id());
   if(ids.length<2)return;
+  renderChainSelection(ids,false);
+}
+function renderChainSelection(ids,reversed){
   stopBranchVideo();
-  const chain=chainFromSelection(branchTree,ids);
-  $('#branch-actions').replaceChildren();
+  const chain=chainFromSelection(branchTree,ids,reversed);
+  const reverse=chain.reversible?[actionButton('⇄ Reverse',()=>renderChainSelection(ids,!reversed))]:[];
+  $('#branch-actions').replaceChildren(...reverse);
   if(chain.error){
     $('#branch-preview').replaceChildren(el('p','muted',chain.error));
     $('#branch-info').replaceChildren(el('span','eyebrow',`${ids.length} SELECTED`));
@@ -785,25 +818,109 @@ function showChainSelection(){
   const poster=el('img');poster.src=chosen[0].thumbnail;poster.alt=chosen[0].prompt;
   $('#branch-preview').replaceChildren(poster);
   const heading=chainHeading(chosen);
-  $('#branch-info').replaceChildren(heading,el('p','muted','Plays the clips back to back. Each join may hitch slightly in the browser.'));
-  if(chosen.some(c=>pairByClip.get(c.id).takes.length>1)){
-    const steps=el('ol','chain-steps');
-    chosen.forEach((clip,i)=>{
-      const pair=pairByClip.get(clip.id),item=el('li','',(pairName(pair)||`Step ${i+1}`)+' ');
-      if(pair.takes.length>1){
-        const pick=el('select');
-        for(const take of pair.takes){const o=el('option','',`Take ${take.take} · ${take.seconds} s`+(take===pair.preferred?' ★':''));o.value=take.id;pick.append(o);}
-        pick.value=clip.id;
-        pick.onchange=()=>{chosen[i]=pair.takes.find(t=>t.id===pick.value);heading.replaceWith(chainHeading(chosen));};
-        item.append(pick);
-      }else item.append(el('span','muted',`Take ${clip.take}`));
-      steps.append(item);
-    });
-    $('#branch-info').append(steps);
-  }
+  $('#branch-info').replaceChildren(heading,el('p','chain-path',chainPath(chosen[0].source,chosen)),
+    el('p','muted','Plays the clips back to back. Each join may hitch slightly in the browser.'));
+  if(chosen.some(c=>pairByClip.get(c.id).takes.length>1))
+    $('#branch-info').append(stepList(chosen,()=>heading.replaceWith(chainHeading(chosen))));
   const grid=el('div','branch-grid');
-  grid.append(actionButton('▶ Play chain',()=>playChain(chosen)),exportChainButton(chosen));
+  grid.append(actionButton('▶ Play chain',()=>playChain(chosen)),exportChainButton(chosen),...reverse,
+    actionButton('Build chain…',()=>startBuilder(chosen[0].source,chosen)));
   $('#branch-actions').replaceChildren(grid);
+}
+// Each step of a chain, with a take dropdown where the step has several takes. Changing one changes `clips` in place.
+function stepList(clips,changed){
+  const steps=el('ol','chain-steps');
+  clips.forEach((clip,i)=>{
+    const pair=pairByClip.get(clip.id),item=el('li','',`${nodeName(clip.source)} → ${nodeName(clip.target)} `);
+    if(pair.takes.length>1){
+      const pick=el('select');
+      for(const take of pair.takes){const o=el('option','',`Take ${take.take} · ${take.seconds} s`+(take===pair.preferred?' ★':''));o.value=take.id;pick.append(o);}
+      pick.value=clip.id;
+      pick.onchange=()=>{clips[i]=pair.takes.find(t=>t.id===pick.value);changed(i);};
+      item.append(pick);
+    }else item.append(el('span','muted',`Take ${clip.take}`));
+    steps.append(item);
+  });
+  return steps;
+}
+// ---- Chain builder: a chain made one step at a time, in any direction, with loops and repeats. ----
+function quietUnselect(){redrawingTree=true;try{cy.elements().unselect();}finally{redrawingTree=false;}selectionOrder=[];boxedIds.clear();}
+function startBuilder(start,steps=[]){
+  stopBranchVideo();quietUnselect();
+  // Clicks build the chain, so they select nothing while the builder is open.
+  cy.autounselectify(true);
+  builder={start,steps:steps.map(c=>c.id)};
+  renderBuilder();
+}
+function builderClips(){return builder.steps.map(id=>clipById.get(id)).filter(Boolean);}
+function builderEnd(){const clips=builderClips();return clips.length?clips.at(-1).target:builder.start;}
+function markBuilder(){
+  cy?.edges().removeClass('next-step');
+  if(!builder)return;
+  const end=builderEnd();
+  for(const p of branchPairs.values())if(p.preferred&&p.source===end)cy.getElementById(p.id).addClass('next-step');
+}
+function addBuilderStep(p){
+  quietUnselect();
+  if(!p?.preferred){notice('That connection has no finished take yet.');return;}
+  if(p.source!==builderEnd()){notice('The next step has to start where the chain ends. The connections you can add next are highlighted in blue.');return;}
+  notice('');builder.steps.push(p.preferred.id);renderBuilder();
+}
+function stopBuilder(){builder=null;cy?.autounselectify(false);markBuilder();renderChainStrip();notice('');clearBranchPanel();}
+function renderBuilder(){
+  stopBranchVideo();markBuilder();
+  const clips=builderClips();
+  const start=branchTree.nodes.find(n=>n.id===builder.start);
+  if(clips.length){const poster=el('img');poster.src=clips[0].thumbnail;poster.alt='';$('#branch-preview').replaceChildren(poster);}
+  else if(start?.image){const img=el('img');img.src=start.image;img.alt='';$('#branch-preview').replaceChildren(img);}
+  else $('#branch-preview').replaceChildren();
+  const seconds=Math.round(clips.reduce((sum,c)=>sum+(c.seconds||0),0)*10)/10;
+  const caption=el('p','take-caption');
+  $('#branch-info').replaceChildren(el('span','eyebrow',`BUILDING A CHAIN · ${count(clips.length,'STEP','STEPS')} · ${seconds} S`),caption,
+    el('p','muted',clips.length?'Click a blue connection to add the next step. The same one can be added again and again. Takes are chosen in the strip below the graph.':'Click a blue connection to add the first step.'));
+  renderChainStrip();
+  const play=actionButton('▶ Play chain',()=>playClips($('#branch-preview'),clips,{captionEl:caption,
+    caption:i=>`Clip ${i+1} of ${clips.length} · ${nodeName(clips[i].source)} → ${nodeName(clips[i].target)}`,
+    onShow:(clip,i)=>{highlightPlaying(clip);markStripPlaying(i);}}));
+  const undo=actionButton('Undo last step',()=>{builder.steps.pop();renderBuilder();});
+  const clear=actionButton('Clear',()=>{builder.steps=[];renderBuilder();});
+  play.disabled=undo.disabled=clear.disabled=!clips.length;
+  const grid=el('div','branch-grid');
+  grid.append(play,clips.length?exportChainButton(clips):actionButton('Export chain ↓',()=>{}),undo,clear);
+  if(!clips.length)grid.children[1].disabled=true;
+  const done=actionButton('Done',stopBuilder);done.title='Leave the chain builder (Esc)';
+  $('#branch-actions').replaceChildren(grid,done);
+}
+// The chain being built, drawn under the graph as a straight line: every image it visits, in order, with the
+// connection between each pair. An image visited twice appears twice, as the footage does.
+function renderChainStrip(){
+  const strip=$('#chain-strip');
+  $('#tree-view').classList.toggle('building',!!builder);cy?.resize();
+  if(!builder){strip.hidden=true;strip.replaceChildren();return;}
+  const clips=builderClips();
+  const image=id=>{
+    const n=branchTree.nodes.find(x=>x.id===id),card=el('div','strip-node');
+    if(n?.thumbnail){const img=el('img');img.src=n.thumbnail;img.alt='';card.append(img);}else card.append(el('div','blank'));
+    card.append(el('span','',nodeName(id)));card.title=n?.prompt||'';return card;
+  };
+  const row=el('div','strip-row');row.append(image(builder.start));
+  clips.forEach((clip,i)=>{
+    const pair=pairByClip.get(clip.id),link=el('div','strip-link');
+    link.append(el('span','',`${clip.seconds} s`),el('div','strip-arrow'));
+    if(pair.takes.length>1){
+      const pick=el('select');pick.setAttribute('aria-label',`Take for step ${i+1}`);
+      for(const take of pair.takes){const o=el('option','',`Take ${take.take}`+(take===pair.preferred?' ★':''));o.value=take.id;pick.append(o);}
+      pick.value=clip.id;pick.onchange=()=>{builder.steps[i]=pick.value;renderBuilder();};
+      link.append(pick);
+    }else link.append(el('span','',`Take ${clip.take}`));
+    row.append(link,image(clip.target));
+  });
+  if(!clips.length)row.append(el('p','muted strip-hint','Click a blue connection in the graph to add the first step.'));
+  strip.replaceChildren(el('span','eyebrow',`CHAIN BEING BUILT · ${count(clips.length,'STEP','STEPS')}`),row);
+  strip.hidden=false;row.scrollLeft=row.scrollWidth;
+}
+function markStripPlaying(index){
+  [...$('#chain-strip').querySelectorAll('.strip-link')].forEach((link,i)=>link.classList.toggle('playing',i===index));
 }
 // Joins the chain into one video on this computer and saves it to the gallery.
 function exportChainButton(clips){
@@ -860,7 +977,7 @@ function showBranchPair(p,playing=p?.preferred){
     $('#branch-info').append(pairLabelField(p),takeList(p,playing));
     const grid=el('div','branch-grid');
     grid.append(actionButton('▶ Play all takes',()=>playAllTakes(p)),actionButton('Open take gallery',()=>openTakeGallery(p)),
-      actionButton('New take ↗',()=>newTake(p,playing||p.preferred)));
+      actionButton('New take ↗',()=>newTake(p,playing||p.preferred)),actionButton('Build chain…',()=>startBuilder(p.source,[playing||p.preferred])));
     if(playing)grid.append(actionButton('View in gallery',async()=>openAsset(await api('/assets/'+playing.id))));
     actions.push(grid);
   }
@@ -1024,6 +1141,8 @@ function showBranchNode(n){
       gallery,actionButton('Edit into new ↗',async()=>startImageTool('edit',await realNode(n))));
     actions.push(grid);
   }
+  if(n.kind!=='pending'&&[...branchPairs.values()].some(p=>p.preferred&&p.source===n.id))
+    actions.push(actionButton('Build chain from here…',()=>startBuilder(n.id)));
   if(n.added&&!branchTree.clips.some(c=>c.source===n.id||c.target===n.id))
     actions.push(actionButton('Remove from Branches',async()=>{await api('/branches/images/'+n.asset_id,'DELETE');branchOpenId=null;await showBranches();}));
   $('#branch-actions').replaceChildren(...actions);
@@ -1081,6 +1200,7 @@ $('#tidy-tree').onclick=run(async()=>{
 });
 $('#tree-name').onchange=run(async()=>{if(!branchTree)return;await api(`/branches/${encodeURIComponent(branchTree.id)}/name`,'PUT',{name:$('#tree-name').value});branchSignature='';await showBranches();});
 document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'&&builder&&!document.querySelector('dialog[open]')&&!$('#branches').hidden){stopBuilder();return;}
   if((e.key==='f'||e.key==='F')&&!e.ctrlKey&&!e.metaKey&&!e.altKey&&cy&&!$('#tree-view').hidden&&!$('#branches').hidden
      &&!e.target.closest('input,textarea,select')&&!document.querySelector('dialog[open]'))cy.fit(undefined,40);
 });
