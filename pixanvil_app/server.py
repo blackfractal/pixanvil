@@ -167,9 +167,14 @@ class ChainChoices(BaseModel):
     choices: dict[str,Literal['copy','overwrite','skip']]
 
 
+class FrameAt(BaseModel):
+    frame: int = Field(ge=0)
+
+
 class Split(BaseModel):
     clip_id: str = Field(min_length=1, max_length=200)
-    frame: int = Field(ge=1)
+    # Any frame number is accepted here, so the route can explain why the first and last cannot be split.
+    frame: int = Field(ge=0)
 
 
 class SavedChain(Chain):
@@ -779,6 +784,25 @@ def make_app(state=None, worker=True, client_factory=Comfy):
                for t in trees for c in t['clips']]
         return branches.split_users(split_id,clips,store.branch_chains())
 
+    def clip_frames(clip):
+        """A clip's frame rate and frame count, read from the file: a recipe's can differ from what the model wrote."""
+        try: info=sequence.probe(safe_path(clip['root'],clip['path']))
+        except (ValueError,OSError,subprocess.TimeoutExpired) as exc: raise HTTPException(422,'Cannot read this clip: '+str(exc))
+        return info,round(info.seconds*info.fps)
+
+    def frame_png(clip,frame):
+        """Frame number `frame` of a clip (from 0), as PNG bytes."""
+        folder=config.state/'exports'; folder.mkdir(exist_ok=True)
+        handle,temp=tempfile.mkstemp(suffix='.png',dir=folder); os.close(handle)
+        temp=Path(temp)
+        try:
+            sequence.frame_at(safe_path(clip['root'],clip['path']),frame,temp)
+            return temp.read_bytes()
+        except (RuntimeError,ValueError,OSError,subprocess.TimeoutExpired) as exc:
+            raise HTTPException(500,'Could not take the frame from the clip: '+str(exc))
+        finally:
+            temp.unlink(missing_ok=True)
+
     @app.post('/api/branches/splits',status_code=201)
     def make_split(value:Split):
         """Split a take at a frame: the frame is saved as an image, and Branches draws the take's two pieces through
@@ -788,24 +812,26 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         if not branches.find_tree(branch_graph()[1],clip['id']): raise HTTPException(404,'This clip is not in Branches')
         split_id=branches.split_asset_id(clip['id'],value.frame)
         if found:=store.asset(split_id): return found
-        try: info=sequence.probe(safe_path(clip['root'],clip['path']))
-        except (ValueError,OSError,subprocess.TimeoutExpired) as exc: raise HTTPException(422,'Cannot read this clip: '+str(exc))
-        total=round(info.seconds*info.fps)
+        info,total=clip_frames(clip)
         # The first and last frames are the clip's own ends, so a split goes between them.
         if not 1<=value.frame<=total-2: raise HTTPException(422,f'Choose a frame between 1 and {total-2}; the first and last are the clip\'s own ends')
-        folder=config.state/'exports'; folder.mkdir(exist_ok=True)
-        handle,temp=tempfile.mkstemp(suffix='.png',dir=folder); os.close(handle)
-        temp=Path(temp)
-        try:
-            sequence.frame_at(safe_path(clip['root'],clip['path']),value.frame,temp)
-            prompt=clip['recipe'].get('prompt','')
-            return import_image(store,config.data['library'],temp.read_bytes(),f'{clip["id"]}-frame{value.frame}.png',asset_id=split_id,
-                                operation='frame',frame=value.frame,clip_frames=total,fps=info.fps,
-                                prompt=prompt,resolved_prompt=prompt,parent_asset_id=clip['id'])
-        except (RuntimeError,ValueError,OSError,subprocess.TimeoutExpired) as exc:
-            raise HTTPException(500,'Could not take the frame from the clip: '+str(exc))
-        finally:
-            temp.unlink(missing_ok=True)
+        prompt=clip['recipe'].get('prompt','')
+        return import_image(store,config.data['library'],frame_png(clip,value.frame),f'{clip["id"]}-frame{value.frame}.png',asset_id=split_id,
+                            operation='frame',frame=value.frame,clip_frames=total,fps=info.fps,
+                            prompt=prompt,resolved_prompt=prompt,parent_asset_id=clip['id'])
+
+    @app.post('/api/assets/{asset_id}/frames',status_code=201)
+    def save_still(asset_id:str,value:FrameAt):
+        """Save one frame of a clip to the gallery as an image of its own. It is linked to the clip (View source) but is
+        not a split, so it changes nothing in Branches. Saving the same frame again returns the same image."""
+        clip=video_asset(asset_id)
+        still_id=f'still-{clip["id"]}-{value.frame}'
+        if found:=store.asset(still_id): return found
+        _,total=clip_frames(clip)
+        if value.frame>=total: raise HTTPException(422,f'This clip has frames 0 to {total-1}')
+        prompt=clip['recipe'].get('prompt','')
+        return import_image(store,config.data['library'],frame_png(clip,value.frame),f'{clip["id"]}-frame{value.frame}.png',asset_id=still_id,
+                            operation='still',frame_number=value.frame,prompt=prompt,resolved_prompt=prompt,parent_asset_id=clip['id'])
 
     @app.delete('/api/branches/splits/{split_id}')
     def remove_split(split_id:str):

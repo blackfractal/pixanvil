@@ -37,7 +37,9 @@ function tab(name){if(!titles[name])name='gallery';
   if(name==='live'&&latestAsset)markSeen([latestAsset]);
   // The newest clip on Activity plays only while that page is showing.
   if(name!=='live')$('#latest-preview video')?.pause();
-  if(name!=='branches')stopBranchVideo();
+  // Leaving Branches pauses its player but keeps what it was playing, so coming back finds the clip, its spark and
+  // its frame strip where they were.
+  if(name!=='branches')$('#branch-preview').querySelectorAll('video').forEach(v=>v.pause());
   document.querySelectorAll('.page').forEach(p=>p.hidden=p.id!==name);document.querySelectorAll('.nav').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));$('#section-label').textContent=name.toUpperCase();$('#page-title').replaceChildren(document.createTextNode(titles[name]),el('span','orange','.'));$('#new-image').hidden=name==='generate';location.hash=name;
   if(name==='branches')run(showBranches)();}
 document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>tab(b.dataset.tab));
@@ -387,7 +389,7 @@ function renderPending(){
 let searchTimer;$('#search').oninput=()=>{clearTimeout(searchTimer);searchTimer=setTimeout(run(()=>refreshGallery()),250);};$('#favorites').onclick=run(async()=>{favorites=true;$('#favorites').classList.add('selected');$('#all-images').classList.remove('selected');await refreshGallery();});$('#all-images').onclick=run(async()=>{favorites=false;$('#all-images').classList.add('selected');$('#favorites').classList.remove('selected');await refreshGallery();});$('#load-more').onclick=run(()=>refreshGallery(true));
 function openAsset(a){selected=a;markSeen([a]);const video=isVideo(a),file=`/api/assets/${a.id}/file`;$('#full-image').hidden=video;$('#full-video').hidden=!video;
   if(video){withSound($('#full-video'));if(!$('#full-video').src.endsWith(file)){$('#full-video').poster=`/api/assets/${a.id}/thumbnail`;$('#full-video').src=file;}}else{$('#full-video').removeAttribute('src');$('#full-image').src=file;$('#full-image').alt=a.recipe.prompt;}
-  $('#image-prompt').textContent=a.recipe.prompt;$('#image-details').replaceChildren();const details={Operation:a.recipe.operation||'txt2img',Model:a.recipe.model,Seed:a.recipe.seed,Size:`${a.width} × ${a.height}`,Steps:a.recipe.steps,Guidance:a.recipe.cfg,Workflow:a.recipe.workflow,File:a.path};if(video)details.Length=`${clipSeconds(a.recipe)} s · ${a.recipe.frames} frames at ${a.recipe.fps} fps`;if(a.recipe.operation==='variation'){details['Variation seed']=a.recipe.variation_seed;details.Strength=a.recipe.variation_strength;}if(a.recipe.operation==='refine')details.Denoise=a.recipe.denoise;if(a.recipe.refinement)details['Second model']=a.recipe.refinement.model;for(const [k,v]of Object.entries(details)){ $('#image-details').append(el('dt','',k),el('dd','',String(v)));}$('#image-recipe').textContent=JSON.stringify(a.recipe,null,2);$('#download-image').href=file;$('#download-image').download=a.id+(video?'.mp4':'.png');$('#download-image').textContent=video?'Download MP4':'Download PNG';$('#refine-image').disabled=$('#upscale-image').disabled=$('#animate-image').disabled=$('#edit-image').disabled=video;$('#frame-image').hidden=!video;$('#reuse-image').disabled=a.recipe.operation==='sequence';$('#favorite-image').textContent=a.favorite?'♥ Favorited':'♡ Favorite';$('#parent-image').hidden=!a.recipe.parent_asset_id;$('#vary-image').disabled=video||!['txt2img','variation'].includes(a.recipe.operation||'txt2img');run(updateBranchButton)(a);if(!$('#viewer').open)$('#viewer').showModal();}
+  $('#image-prompt').textContent=a.recipe.prompt;$('#image-details').replaceChildren();const details={Operation:a.recipe.operation||'txt2img',Model:a.recipe.model,Seed:a.recipe.seed,Size:`${a.width} × ${a.height}`,Steps:a.recipe.steps,Guidance:a.recipe.cfg,Workflow:a.recipe.workflow,File:a.path};if(video)details.Length=`${clipSeconds(a.recipe)} s · ${a.recipe.frames} frames at ${a.recipe.fps} fps`;if(a.recipe.operation==='variation'){details['Variation seed']=a.recipe.variation_seed;details.Strength=a.recipe.variation_strength;}if(a.recipe.operation==='refine')details.Denoise=a.recipe.denoise;if(a.recipe.refinement)details['Second model']=a.recipe.refinement.model;for(const [k,v]of Object.entries(details)){ $('#image-details').append(el('dt','',k),el('dd','',String(v)));}$('#image-recipe').textContent=JSON.stringify(a.recipe,null,2);$('#download-image').href=file;$('#download-image').download=a.id+(video?'.mp4':'.png');$('#download-image').textContent=video?'Download MP4':'Download PNG';$('#refine-image').disabled=$('#upscale-image').disabled=$('#animate-image').disabled=$('#edit-image').disabled=video;$('#frame-image').hidden=!video;showFrameButtons(a);$('#reuse-image').disabled=a.recipe.operation==='sequence';$('#favorite-image').textContent=a.favorite?'♥ Favorited':'♡ Favorite';$('#parent-image').hidden=!a.recipe.parent_asset_id;$('#vary-image').disabled=video||!['txt2img','variation'].includes(a.recipe.operation||'txt2img');run(updateBranchButton)(a);if(!$('#viewer').open)$('#viewer').showModal();}
 // Left and right arrows step through the gallery in its displayed order, loading more as needed.
 $('#viewer').addEventListener('keydown',run(async e=>{
   if(!['ArrowLeft','ArrowRight'].includes(e.key)||e.target.closest('input,textarea,select'))return;
@@ -679,8 +681,9 @@ function branchStyle(){
     {selector:'node.virtual',style:{opacity:.55,'border-style':'dashed'}},
     {selector:'node.pending',style:{'border-style':'dashed','text-valign':'center','text-margin-y':0}},
     {selector:'node.missing',style:{'border-style':'dashed','border-color':'#a5523f','text-valign':'center','text-margin-y':0}},
-    // A split image is a frame of a take, not an image of its own: outlined in the spark's gold.
-    {selector:'node.split',style:{'border-color':'#ffd27a','border-width':2}},
+    // A split image is a saved frame partway through a take, not a clip's end: a dotted muted-blue outline at full
+    // brightness (dashed and dimmed is a frame not saved yet; bright blue is selection).
+    {selector:'node.split',style:{'border-color':'#5d86ad','border-width':2,'border-style':'dotted'}},
     // Orange and green mean queued and generating here, as on the History tab, so selection is blue.
     {selector:'node:selected',style:{'border-color':SELECTED,'border-width':3,opacity:1}},
     {selector:'edge',style:{'curve-style':'bezier','control-point-step-size':40,width:3,'line-color':'#5b6450','target-arrow-shape':'triangle','target-arrow-color':'#5b6450',
@@ -928,12 +931,26 @@ function playOne(container,clip){
   container.replaceChildren(video);video.play().catch(()=>{});
   return video;
 }
+function toggleFullscreen(element){
+  if(document.fullscreenElement)document.exitFullscreen().catch(()=>{});
+  else element.requestFullscreen().catch(()=>{});
+}
 // Plays clips back to back and loops. Two players take turns: while one plays, the other loads the next clip,
 // so each join waits as little as possible. caption(i, pass) gets the pass number, so a loop can say it has looped.
 function playClips(container,clips,{captionEl,caption,onShow}){
   stopVideos(container);
-  const players=[0,1].map(()=>{const v=withSound(el('video'));v.controls=true;v.playsInline=true;v.preload='auto';v.hidden=true;return v;});
-  container.replaceChildren(...players);
+  // Full screen is the whole player area, not one video: the browser leaves full screen when the video it was given
+  // is hidden, which happens at every join. So the videos' own full-screen button is replaced with one for the area.
+  const players=[0,1].map(()=>{
+    const v=withSound(el('video'));v.controls=true;v.playsInline=true;v.preload='auto';v.hidden=true;
+    v.controlsList.add('nofullscreen');
+    v.addEventListener('dblclick',e=>{e.preventDefault();toggleFullscreen(container);});
+    return v;
+  });
+  const full=el('button','fullscreen-toggle','⛶');full.type='button';
+  full.title='Full screen, staying full screen from clip to clip (double-clicking the video does the same; Esc leaves)';
+  full.setAttribute('aria-label','Full screen');full.onclick=()=>toggleFullscreen(container);
+  container.replaceChildren(...players,full);
   let active=0,index=0,pass=1;
   const load=(player,i)=>{player.poster=clips[i].thumbnail;player.src=clips[i].file;followRange(player,clips[i],()=>advance(player));};
   const show=()=>{
@@ -1627,6 +1644,8 @@ async function updateBranchButton(a){
   }
   const found=await api('/branches/'+a.id).catch(()=>null);
   if(selected?.id!==a.id)return;
+  // A clip in Branches can be split from here too.
+  $('#split-image').hidden=!(found&&isVideo(a)&&a.recipe.fps);
   if(found){button.textContent='Show in branches';button.title='Open the Branches tree this item belongs to';button.onclick=()=>{$('#viewer').close();openInBranches(found.id);};}
   else{
     button.textContent='Add to Branches';button.title='Start a Branches tree from this item, to build clips forward and backward from it';
@@ -1986,3 +2005,33 @@ async function dropSparkDrag(){
   const {image,side}=drag.target;
   return side==='left'?generateBetween(asset.id,image,drag.clip):generateBetween(image,asset.id,drag.clip);
 }
+
+// ---- Frames from a clip in the Gallery viewer: Save frame N (an image of its own) and Split at frame N (Branches). ----
+// The buttons name the frame showing, so the frame saved is the one seen. Results show under the buttons, because the
+// page's notice is behind the viewer.
+const fullVideo=$('#full-video');
+function viewerFrame(){return Math.max(0,Math.floor(fullVideo.currentTime*(selected?.recipe.fps||0)+1e-6));}
+function showFrameButtons(a){
+  const usable=isVideo(a)&&!!a.recipe.fps;
+  $('#still-image').hidden=!usable;$('#split-image').hidden=true;$('#viewer-status').hidden=true;
+  labelFrameButtons();
+}
+function labelFrameButtons(){
+  if(!selected||!isVideo(selected))return;
+  const n=viewerFrame();
+  $('#still-image').textContent=`Save frame ${n}`;$('#split-image').textContent=`✂ Split at frame ${n}`;
+}
+for(const event of ['timeupdate','seeked','loadedmetadata','pause'])fullVideo.addEventListener(event,labelFrameButtons);
+function viewerStatus(text){$('#viewer-status').textContent=text;$('#viewer-status').hidden=!text;}
+async function frameAction(work){
+  fullVideo.pause();
+  try{viewerStatus(await work(viewerFrame()));}catch(e){viewerStatus(e.message);}
+}
+$('#still-image').onclick=()=>frameAction(async n=>{
+  await api(`/assets/${selected.id}/frames`,'POST',{frame:n});refreshGallery();
+  return `Frame ${n} saved to the gallery as an image.`;
+});
+$('#split-image').onclick=()=>frameAction(async n=>{
+  await api('/branches/splits','POST',{clip_id:selected.id,frame:n});refreshGallery();
+  return `Split at frame ${n}: Branches now shows the frame as an image with the clip's two pieces through it.`;
+});

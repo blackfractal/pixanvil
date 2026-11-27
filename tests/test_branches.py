@@ -545,3 +545,18 @@ def test_saved_chains_through_pieces_keep_the_take_and_frames(setup):
     assert saved['steps']==[
         {'clip':pieces[0],'start_key':a['id'],'end_key':split['id'],'take':take['id'],'start_frame':0,'end_frame':21},
         {'clip':pieces[1],'start_key':split['id'],'end_key':b['id'],'take':take['id'],'start_frame':20,'end_frame':48}]
+
+
+def test_save_frame_makes_a_plain_image_not_a_split(setup):
+    app,client,a,b,take=split_setup(setup)
+    response=client.post(f'/api/assets/{take["id"]}/frames',headers=HEADERS,json={'frame':47})
+    assert response.status_code==201,response.text
+    still=response.json()
+    assert still['id']==f'still-{take["id"]}-47'
+    assert (still['recipe']['operation'],still['recipe']['frame_number'],still['recipe']['parent_asset_id'])==('still',47,take['id'])
+    # Saving it again finds the same image, and Branches is unchanged: no split node, no pieces.
+    assert client.post(f'/api/assets/{take["id"]}/frames',headers=HEADERS,json={'frame':47}).json()['id']==still['id']
+    found=tree(client,a['id'])
+    assert {c['id'] for c in found['clips']}=={take['id']} and still['id'] not in {n['id'] for n in found['nodes']}
+    assert client.post(f'/api/assets/{take["id"]}/frames',headers=HEADERS,json={'frame':48}).status_code==422
+    assert client.post(f'/api/assets/{a["id"]}/frames',headers=HEADERS,json={'frame':0}).status_code==404
