@@ -7,6 +7,8 @@ let sourceAsset=null,endAsset=null,toolCapabilities={};
 let activeJobs=[],latestId='',latestAsset=null;
 // The take playing alone in the Branches panel, whose frames the arrow keys step through while it is showing.
 let frameClip=null;
+// The clip whose connection the spark rides (see moveSpark), and a press on the spark while it is held or dragged.
+let sparkClip=null,sparkDrag=null,sparkPressed=false;
 // How many results nobody has viewed yet: all of them (Gallery) and the clips between two images (Branches).
 let unseen={total:0,clips:0};
 // Sound for every player: muted at first, then however the last player was set, kept between visits.
@@ -625,7 +627,16 @@ async function placeNodes(tree){
     dagre.layout(graph);
     for(const n of tree.nodes){const {x,y}=graph.node(n.id);placed[n.id]={x,y};}
   }else{
-    let waiting=missing;
+    // A split goes where its frame falls along its take's line, a row below it (above is where the spark's ghosts go).
+    for(const n of missing.filter(n=>n.split)){
+      const whole=tree.clips.find(c=>c.id===n.split.clip),from=whole&&at(whole.source),to=whole&&at(whole.target);
+      if(!from||!to)continue;
+      const share=n.split.frame/Math.max(1,n.split.frames-1),x=from.x+(to.x-from.x)*share,y=from.y+(to.y-from.y)*share;
+      const taken=Object.values({...known,...placed});
+      const free=dy=>!taken.some(p=>Math.abs(p.x-x)<NODE_W&&Math.abs(p.y-(y+dy))<NODE_H+16);
+      placed[n.id]={x,y:y+([ROW,2*ROW,-ROW,-2*ROW,3*ROW].find(free)??4*ROW)};
+    }
+    let waiting=missing.filter(n=>!placed[n.id]);
     while(waiting.length){
       const later=[];
       for(const n of waiting){
@@ -668,6 +679,8 @@ function branchStyle(){
     {selector:'node.virtual',style:{opacity:.55,'border-style':'dashed'}},
     {selector:'node.pending',style:{'border-style':'dashed','text-valign':'center','text-margin-y':0}},
     {selector:'node.missing',style:{'border-style':'dashed','border-color':'#a5523f','text-valign':'center','text-margin-y':0}},
+    // A split image is a frame of a take, not an image of its own: outlined in the spark's gold.
+    {selector:'node.split',style:{'border-color':'#ffd27a','border-width':2}},
     // Orange and green mean queued and generating here, as on the History tab, so selection is blue.
     {selector:'node:selected',style:{'border-color':SELECTED,'border-width':3,opacity:1}},
     {selector:'edge',style:{'curve-style':'bezier','control-point-step-size':40,width:3,'line-color':'#5b6450','target-arrow-shape':'triangle','target-arrow-color':'#5b6450',
@@ -702,6 +715,13 @@ function branchStyle(){
       label:'',events:'no','z-index':11}},
     {selector:'edge.drag-line.from-right',style:{'source-endpoint':'50% 0%'}},
     {selector:'edge.drag-line.from-left',style:{'target-endpoint':'-50% 0%'}},
+    // The spark: where the playhead is in the clip playing, riding its connection. Drawn above everything; the
+    // pointer is matched to it by distance (startSparkDrag), so it lets clicks through to the line under it.
+    {selector:'node.spark',style:{shape:'ellipse',width:12,height:12,'background-color':'#ffd27a','border-width':2,'border-color':'#fff6dc',
+      'underlay-color':'#ffd27a','underlay-padding':6,'underlay-opacity':.3,'underlay-shape':'ellipse',label:'',events:'no','z-index':30}},
+    // Dragging from the spark: both sides of every image can be dropped on.
+    {selector:'node.drop-zone.both',style:{'background-opacity':.22}},
+    {selector:'node.drop-zone.both.hover',style:{'background-opacity':.7}},
   ];
 }
 // Rendering connections pulse like a headlamp: a quick fade up, then a slower fade down. A system asking for reduced
@@ -736,7 +756,7 @@ function updateBranchLabels(){
 }
 // The text under a node: its label, and its state when it has no picture.
 function nodeCaption(n){
-  const state={pending:'Rendering…',missing:'Deleted image'}[n.kind]||(n.available?'':'No saved frame');
+  const state=n.split?`✂ frame ${n.split.frame}`:{pending:'Rendering…',missing:'Deleted image'}[n.kind]||(n.available?'':'No saved frame');
   return [n.label||n.default_label,state].filter(Boolean).join(' · ');
 }
 // ---- Takes: every clip between the same two nodes is one pair, drawn as one connection however many there are. ----
@@ -791,9 +811,10 @@ function placeTwoWay(edge){
 }
 async function drawTree(tree,fit){
   if(connectDrag)endConnectDrag();
+  if(sparkDrag)endSparkDrag();
   const positions=await placeNodes(tree);
   const elements=[
-    ...tree.nodes.map(n=>({group:'nodes',classes:n.kind,position:{...positions[n.id]},
+    ...tree.nodes.map(n=>({group:'nodes',classes:n.kind+(n.split?' split':''),position:{...positions[n.id]},
       data:{id:n.id,label:nodeCaption(n),...(n.thumbnail?{thumb:n.thumbnail}:{})}})),
     ...[...branchPairs.values()].map(p=>({group:'edges',
       classes:[p.preferred?'':'pending',p.rendering?'rendering':'',p.takes.some(c=>!c.seen)?'unseen':'',p.queued?'queued':'',p.source===p.target?'self':branchPairs.has(p.target+'>'+p.source)?'two-way':''].join(' ').trim(),
@@ -806,12 +827,14 @@ async function drawTree(tree,fit){
     new ResizeObserver(()=>cy.resize()).observe($('main'));
     // While the chain builder is open, clicking a connection adds it as the next step instead of opening its panel.
     cy.on('tap','node',e=>{if(!builder)showBranchNode(branchTree.nodes.find(n=>n.id===e.target.id()));});
-    cy.on('tap','edge',e=>{const pair=pairByEdge.get(e.target.id());if(builder)addBuilderStep(pair);else showBranchPair(pair);});
-    cy.on('tap',e=>{if(e.target===cy&&!builder)clearBranchPanel();});
+    cy.on('tap','edge',e=>{if(sparkPressed)return;const pair=pairByEdge.get(e.target.id());if(builder)addBuilderStep(pair);else showBranchPair(pair);});
+    cy.on('tap',e=>{if(e.target===cy&&!builder&&!sparkPressed)clearBranchPanel();});
     // Dragging off an image's side makes a new connection (see startConnectDrag).
-    $('#branch-graph').addEventListener('mousedown',startConnectDrag,true);
-    cy.on('tapdrag',e=>{if(connectDrag)moveConnectDrag(e.position);});
-    cy.on('tapend',e=>{if(connectDrag)run(dropConnectDrag)(e.position);});
+    // Pressing the spark comes first: it pauses the clip and can be dragged to build from that frame.
+    $('#branch-graph').addEventListener('mousedown',e=>{if(!startSparkDrag(e))startConnectDrag(e);},true);
+    $('#branch-graph').addEventListener('mousemove',e=>{if(!connectDrag&&!sparkDrag&&overSpark(e))$('#branch-graph').style.cursor='grab';});
+    cy.on('tapdrag',e=>{if(connectDrag)moveConnectDrag(e.position);else if(sparkDrag)moveSparkDrag(e.position);});
+    cy.on('tapend',e=>{if(connectDrag)run(dropConnectDrag)(e.position);else if(sparkDrag)run(dropSparkDrag)();});
     cy.on('mousemove','node',e=>{
       const side=!builder&&!connectDrag&&canConnect(branchNode(e.target.id()))?sideAt(e.target,e.position):null;
       $('#branch-graph').style.cursor=side?'crosshair':'';
@@ -894,7 +917,7 @@ function followRange(video,clip,atEnd){
   watch();
 }
 function stopBranchVideo(){
-  stopVideos($('#branch-preview'));frameClip=null;
+  stopVideos($('#branch-preview'));frameClip=null;sparkClip=null;
   cy?.edges().removeClass('playing');chainPlaying=null;
 }
 function playOne(container,clip){
@@ -931,6 +954,7 @@ function playClips(container,clips,{captionEl,caption,onShow}){
   load(players[0],0);show();
 }
 function highlightPlaying(clip){
+  sparkClip=clip;
   const edge=pairByClip.get(clip.id)?.id||clip.id;
   cy.edges().removeClass('playing');cy.getElementById(edge).addClass('playing');chainPlaying=edge;
 }
@@ -1181,7 +1205,10 @@ function chainColumn(start,clips,{gaps=new Map(),onTake}){
       for(const take of pair.takes){const o=el('option','',`Take ${take.take}`+(take===pair.preferred?' ★':''));o.value=take.id;pick.append(o);}
       pick.value=clip.id;pick.onchange=()=>onTake(i,pick.value);
       link.append(pick);
-    }else link.append(el('span','',`Take ${clip.take}`));
+    }else{
+      const whole=clip.piece&&clipById.get(clip.piece.clip);
+      link.append(el('span','',`Take ${clip.take}`+(whole?` · piece of take ${whole.take}`:'')));
+    }
     column.append(link,image(clip.target));
   });
   return column;
@@ -1825,18 +1852,22 @@ document.addEventListener('keydown',e=>{
   const video=$('#branch-preview video');if(!video)return;
   e.preventDefault();e.stopPropagation();stepFrame(video,frameClip,e.key==='ArrowRight'?1:-1);
 },true);
-// Under a playing take: the frame showing, buttons to step, and what to make from that frame. Each action splits the
-// take there first (splitting at the same frame again finds the same image).
+// A playing take gets a frame strip laid over the top of its player (the frame showing, with buttons to step one
+// frame), and, under the player, what to make from that frame. Each action splits the take there first (splitting at
+// the same frame again finds the same image).
 function fromHere(take,video){
-  const box=el('div','from-here'),bar=el('div','frame-bar'),text=el('span');
+  const box=el('div','from-here'),bar=el('div','frame-steps'),text=el('span');
   const show=()=>{text.textContent=`Frame ${playerFrame(video,take)} of ${lastFrame(video,take)||'…'} · ${video.currentTime.toFixed(2)} s`;};
   for(const event of ['timeupdate','seeked','loadedmetadata','pause'])video.addEventListener(event,show);
-  const back=el('button','quiet','◀'),next=el('button','quiet','▶');
+  const back=el('button','','‹'),next=el('button','','›');
   back.type=next.type='button';
   back.title='Pause and step back one frame (left arrow key)';next.title='Pause and step forward one frame (right arrow key)';
   back.setAttribute('aria-label',back.title);next.setAttribute('aria-label',next.title);
   back.onclick=()=>stepFrame(video,take,-1);next.onclick=()=>stepFrame(video,take,1);
   bar.append(back,text,next);show();
+  const paused=()=>bar.classList.toggle('paused',video.paused);
+  for(const event of ['play','pause'])video.addEventListener(event,paused);
+  video.after(bar);
   const split=async()=>{
     video.pause();
     const asset=await api('/branches/splits','POST',{clip_id:take.piece?.clip||take.id,frame:playerFrame(video,take)});
@@ -1850,6 +1881,108 @@ function fromHere(take,video){
   const cut=actionButton('✂ Split here',async()=>{const asset=await split();showBranchNode(branchNode(asset.id));},
     'Split this take at the frame showing: the take is kept, and the frame becomes an image with the two pieces of the take through it, each a take set of its own');
   cut.classList.add('wide-button');
-  box.append(el('span','eyebrow','EXTEND FROM THE FRAME SHOWING'),bar,grid,cut);
+  box.append(el('span','eyebrow','EXTEND SHOT FROM CURRENT FRAME'),grid,cut);
   return box;
+}
+
+// ---- The spark: a dot riding the playing connection at the playhead's share of the clip (_plans/branches.md, Splits). ----
+// Pressing it pauses the clip. Dragging it builds from the frame showing: drop on an image's left side for a clip from
+// that frame to the image, on its right side for a clip from the image to that frame, on a ghost Extend image to
+// extend backward or forward, or on empty space to cancel. Anything built splits the take at that frame first.
+function visibleBranchVideo(){return [...document.querySelectorAll('#branch-preview video')].find(v=>!v.hidden);}
+// How far through a clip a player is, 0 to 1: through its range for a piece, through the file otherwise.
+function playFraction(video,clip){
+  const p=clip.piece,span=p?p.end-p.start:video.duration;
+  if(!span)return 0;
+  return Math.min(1,Math.max(0,(video.currentTime-(p?p.start:0))/span));
+}
+// A point a share t along a connection as drawn: straight, or a curve through Cytoscape's control points.
+function edgePoint(edge,t){
+  let level=[edge.sourceEndpoint(),...(edge.controlPoints()||[]),edge.targetEndpoint()].map(p=>({x:p.x,y:p.y}));
+  while(level.length>1)level=level.slice(1).map((p,i)=>({x:level[i].x+(p.x-level[i].x)*t,y:level[i].y+(p.y-level[i].y)*t}));
+  return level[0];
+}
+function moveSpark(){
+  requestAnimationFrame(moveSpark);
+  if(!cy)return;
+  const spark=cy.getElementById('spark'),edge=chainPlaying&&cy.getElementById(chainPlaying),video=visibleBranchVideo();
+  if($('#branches').hidden||!sparkClip||!edge?.nonempty()||!video){if(spark.nonempty()&&!sparkDrag)cy.remove(spark);return;}
+  if(sparkDrag)return;
+  const at=edgePoint(edge,playFraction(video,sparkClip));
+  if(spark.empty())cy.add({group:'nodes',data:{id:'spark'},classes:'spark',position:at,grabbable:false,selectable:false});
+  else spark.position(at);
+}
+requestAnimationFrame(moveSpark);
+function overSpark(event){
+  const spark=cy?.getElementById('spark');
+  if(!spark?.nonempty())return false;
+  const pos=graphPosition(event),at=spark.position();
+  return Math.hypot(pos.x-at.x,pos.y-at.y)*cy.zoom()<=12;
+}
+// Runs before Cytoscape sees the press. Returns whether the press was on the spark.
+function startSparkDrag(event){
+  if(!cy||builder||event.button!==0||!sparkClip?.fps||!overSpark(event))return false;
+  const video=visibleBranchVideo();if(!video)return false;
+  video.pause();
+  cy.userPanningEnabled(false);cy.boxSelectionEnabled(false);
+  sparkPressed=true;
+  sparkDrag={start:graphPosition(event),active:false,target:null,clip:sparkClip,frame:playerFrame(video,sparkClip)};
+  return true;
+}
+// Where the two ghost Extend images go: either side of the spark, a row above it, or below when that is taken.
+function sparkGhostPositions(at){
+  const free=(x,y)=>!cy.nodes('.image, .virtual, .pending, .missing').some(n=>{const p=n.position();return Math.abs(p.x-x)<NODE_W+10&&Math.abs(p.y-y)<NODE_H+10;});
+  const dx=NODE_W*.75;
+  for(const dy of [-ROW,ROW,-2*ROW,2*ROW,-3*ROW])if(free(at.x-dx,at.y+dy)&&free(at.x+dx,at.y+dy))return [{x:at.x-dx,y:at.y+dy},{x:at.x+dx,y:at.y+dy}];
+  return [{x:at.x-dx,y:at.y-4*ROW},{x:at.x+dx,y:at.y-4*ROW}];
+}
+function moveSparkDrag(pos){
+  const drag=sparkDrag;
+  if(!drag.active){
+    if(Math.hypot(pos.x-drag.start.x,pos.y-drag.start.y)*cy.zoom()<6)return;
+    drag.active=true;
+    cy.add({group:'nodes',data:{id:'drag-end'},classes:'drag-end',position:{...pos},grabbable:false,selectable:false});
+    cy.add({group:'edges',data:{id:'drag-line',source:'spark',target:'drag-end'},classes:'drag-line',selectable:false});
+    const offset=(NODE_W-NODE_W*SIDE)/2;
+    for(const n of branchTree.nodes.filter(canConnect)){
+      const at=cy.getElementById(n.id).position();
+      for(const side of ['left','right'])
+        cy.add({group:'nodes',data:{id:`drop:${n.id}:${side}`,label:''},classes:'drop-zone both',grabbable:false,selectable:false,
+          position:{x:at.x+offset*(side==='right'?1:-1),y:at.y}});
+    }
+    const [back,forward]=sparkGhostPositions(cy.getElementById('spark').position());
+    cy.add({group:'nodes',data:{id:'ghost-back',label:'← Extend backward'},classes:'extend-ghost',position:back,grabbable:false,selectable:false});
+    cy.add({group:'nodes',data:{id:'ghost-forward',label:'Extend forward →'},classes:'extend-ghost',position:forward,grabbable:false,selectable:false});
+    $('#branch-graph').style.cursor='grabbing';
+  }
+  cy.getElementById('drag-end').position({...pos});
+  const inside=id=>{const at=cy.getElementById(id).position();return Math.abs(pos.x-at.x)<=NODE_W/2&&Math.abs(pos.y-at.y)<=NODE_H/2;};
+  const over=imageNodeAt(pos);
+  drag.target=inside('ghost-back')?'back':inside('ghost-forward')?'forward':
+    over&&canConnect(branchNode(over.id()))?{image:over.id(),side:pos.x>over.position().x?'right':'left'}:null;
+  const zone=drag.target?.image?`drop:${drag.target.image}:${drag.target.side}`:'';
+  cy.nodes('.drop-zone').forEach(z=>z.toggleClass('hover',z.id()===zone));
+  cy.getElementById('ghost-back').toggleClass('hover',drag.target==='back');
+  cy.getElementById('ghost-forward').toggleClass('hover',drag.target==='forward');
+}
+function endSparkDrag(){
+  const drag=sparkDrag;sparkDrag=null;
+  cy.remove('.drag-line, .drag-end, .drop-zone, .extend-ghost');
+  cy.userPanningEnabled(true);cy.boxSelectionEnabled(true);
+  $('#branch-graph').style.cursor='';
+  // The tap Cytoscape sends after this release must not open the line under the spark and restart the clip.
+  setTimeout(()=>{sparkPressed=false;},0);
+  return drag;
+}
+async function dropSparkDrag(){
+  const drag=endSparkDrag();
+  // A press without a drag only pauses; released on empty space, nothing happens.
+  if(!drag.active||!drag.target)return;
+  const asset=await api('/branches/splits','POST',{clip_id:drag.clip.piece?.clip||drag.clip.id,frame:drag.frame});
+  branchSignature='';await branchTask(()=>loadTree(branchOpenId));
+  if(drag.target==='forward')return startImageTool('img2vid',asset);
+  if(drag.target==='back')return extendBackwards(asset);
+  // A left side is where a clip arrives at an image, a right side where one leaves it.
+  const {image,side}=drag.target;
+  return side==='left'?generateBetween(asset.id,image,drag.clip):generateBetween(image,asset.id,drag.clip);
 }

@@ -141,6 +141,12 @@ fieldset.plain{border:0;padding:0;margin:0;min-width:0}
 .new-badge{position:absolute;right:10px;bottom:10px;background:var(--accent);color:#24180f;padding:4px 9px;border-radius:30px;font:600 10px Consolas,monospace;letter-spacing:1px;text-transform:uppercase}
 .stack-pending progress{height:4px;margin-top:5px}
 .from-here{margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid var(--line)}
-.frame-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:8px 0;font:11px Consolas,monospace;color:var(--muted)}
-.frame-bar .quiet{padding:5px 12px;margin:0}
+#branch-preview{position:relative}
+/* The frame strip over the top of a playing take: shown while the pointer is over the player, or while it is paused. */
+.frame-steps{position:absolute;top:8px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:4px;padding:2px;
+  background:#101210cc;border-radius:20px;font:11px Consolas,monospace;color:var(--text);white-space:nowrap;opacity:0;transition:opacity .2s}
+#branch-preview:hover .frame-steps,#branch-preview:focus-within .frame-steps,.frame-steps.paused{opacity:1}
+.frame-steps span{padding:0 6px}
+.frame-steps button{width:26px;height:26px;border-radius:50%;background:#2e3529;color:var(--text);font-size:17px;line-height:1;padding:0}
+.frame-steps button:hover{background:#3b4434}
 .from-here .wide-button{width:100%;margin-top:8px}
