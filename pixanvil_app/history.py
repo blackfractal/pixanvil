@@ -5,8 +5,10 @@ A history zip holds every job, gallery item, preset and Branches record as plain
 merges: anything whose id is already present is skipped, so importing the same zip twice changes nothing."""
 import json
 import shutil
+import threading
 import uuid
 import zipfile
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -20,6 +22,8 @@ MEDIA = {'.png', '.jpg', '.jpeg', '.webp', '.mp4'}
 # A job still in one of these states is imported as cancelled, so imported work never starts rendering on its own.
 FINISHED = ('complete', 'failed', 'cancelled', 'abandoned')
 SETTINGS = ('library', 'comfy_url', 'ssh_host')
+# What to do with an incoming saved chain whose id is already here with different steps or name.
+CHAIN_CHOICES = ('copy', 'overwrite', 'skip')
 
 
 class Cancelled(Exception):
@@ -38,6 +42,10 @@ class Task:
         self.file = None
         self.finished = False
         self.cancel_requested = False
+        # An import with saved-chain conflicts waits here for a choice per chain (see choose_chains).
+        self.conflicts = None
+        self.choices = None
+        self.chosen = threading.Event()
 
     def update(self, **values):
         for key, value in values.items():
@@ -50,7 +58,8 @@ class Task:
     def public(self):
         return {'id': self.id, 'kind': self.kind, 'stage': self.stage, 'files_done': self.files_done,
                 'files_total': self.files_total, 'bytes_done': self.bytes_done, 'bytes_total': self.bytes_total,
-                'result': self.result, 'error': self.error, 'finished': self.finished, 'download': self.file is not None}
+                'result': self.result, 'error': self.error, 'finished': self.finished, 'download': self.file is not None,
+                'conflicts': self.conflicts}
 
 
 def export_history(task, store, settings, asset_files, inputs, path):
@@ -86,9 +95,12 @@ def export_history(task, store, settings, asset_files, inputs, path):
                 task.check()
                 archive.write(file, name, compress_type=zipfile.ZIP_STORED if file.suffix.lower() in MEDIA else zipfile.ZIP_DEFLATED)
                 task.update(files_done=task.files_done+1, bytes_done=task.bytes_done+size)
+        # Read back what was written, so an archive is only offered once every entry is confirmed intact.
+        with zipfile.ZipFile(path) as archive:
+            check_contents(task, archive, 'Checking the archive')
     except BaseException:
         Path(path).unlink(missing_ok=True); raise
-    task.update(stage='Ready to download', file=Path(path), result=manifest['counts'] | {'missing': missing})
+    task.update(stage='Ready to download', file=Path(path), result=manifest['counts'] | {'missing': missing, 'complete': not missing})
 
 
 def check_names(names):
@@ -122,9 +134,81 @@ def read_records(archive, names):
     return manifest, records
 
 
-def import_history(task, store, library, inputs_dir, path, lock):
+def chain_conflicts(local, incoming):
+    """Incoming saved chains whose id is already here with a different name or different steps, described for the
+    person choosing. Identical chains are not conflicts: they are skipped like any record already present."""
+    mine = {c['id']: c for c in local}
+    found = []
+    for row in incoming:
+        here = mine.get(row.get('id')) if isinstance(row, dict) else None
+        if not here:
+            continue
+        steps = json.loads(row['steps']) if isinstance(row.get('steps'), str) else row.get('steps')
+        if (row.get('name'), steps) != (here['name'], here['steps']):
+            found.append({'id': row['id'],
+                          'local': {'name': here['name'], 'steps': len(here['steps']), 'updated': here['updated']},
+                          'incoming': {'name': row.get('name'), 'steps': len(steps or []), 'updated': row.get('updated')}})
+    return found
+
+
+def choose_chains(task, conflicts, policy):
+    """A choice for each conflicting chain: everything by `policy`, or, when it is 'ask', whatever the person sends
+    to the waiting task. Waiting can be cancelled; nothing has been written yet."""
+    if policy != 'ask':
+        return {c['id']: policy for c in conflicts}
+    task.update(stage='Waiting for your choices', conflicts=conflicts)
+    while not task.chosen.wait(.25):
+        task.check()
+    task.check()
+    task.update(conflicts=None, stage='Checking the zip')
+    return task.choices
+
+
+def same_file(path, info):
+    """Whether a file on disk has exactly the contents of a zip entry: the same size and CRC-32."""
+    if path.stat().st_size != info.file_size:
+        return False
+    crc = 0
+    with path.open('rb') as handle:
+        while chunk := handle.read(1 << 20):
+            crc = zlib.crc32(chunk, crc)
+    return crc == info.CRC
+
+
+def check_contents(task, archive, stage):
+    """Read every entry to the end, which makes zipfile check its CRC-32, so a damaged archive is found before it
+    is relied on."""
+    infos = [i for i in archive.infolist() if not i.is_dir()]
+    task.update(stage=stage, files_total=len(infos), files_done=0, bytes_total=sum(i.file_size for i in infos), bytes_done=0)
+    for info in infos:
+        task.check()
+        try:
+            with archive.open(info) as entry:
+                while entry.read(1 << 20):
+                    pass
+        except (zipfile.BadZipFile, OSError, EOFError, zlib.error) as exc:
+            raise ValueError(f'{info.filename} in the zip is damaged ({exc}).') from exc
+        task.update(files_done=task.files_done+1, bytes_done=task.bytes_done+info.file_size)
+
+
+def unused(path):
+    """`path` with .before-import added, numbered if that is taken too."""
+    aside, n = path.with_name(path.name+'.before-import'), 2
+    while aside.exists():
+        aside, n = path.with_name(f'{path.name}.before-import-{n}'), n+1
+    return aside
+
+
+def import_history(task, store, library, inputs_dir, path, lock, chains='ask', verify=False):
     """Merge the history zip at `path` into this PixAnvil: new files into the `library` folder, new records in one
-    transaction. Everything is checked before anything is written; a failure or cancel removes the files written."""
+    transaction. Everything is checked before anything is written; a failure or cancel undoes the files written.
+    `chains` says what to do with saved chains that differ from the ones here: 'ask', or one of CHAIN_CHOICES for all.
+    With `verify`, nothing is written: every check runs, every file is read to confirm it is intact, and the result
+    says what an import would do.
+
+    A file already at a destination is kept when it is identical to the archived one. A different file there (left
+    over from an earlier library, or damaged) is moved aside as `<name>.before-import` and the archived file written
+    in its place; the result lists these."""
     task.update(stage='Checking the zip')
     library = Path(library).resolve()
     with zipfile.ZipFile(path) as archive:
@@ -146,25 +230,45 @@ def import_history(task, store, library, inputs_dir, path, lock):
         records['assets'] = [a for a in records['assets'] if a['id'] not in unavailable]
         known = store.record_ids()
         new_assets = [a for a in records['assets'] if a['id'] not in known['assets']]
-        writes = [('library/'+relative, safe_path(library, relative)) for a in new_assets for relative in a['files']]
-        new_inputs = [n for n in names if n.startswith('inputs/') and not (inputs_dir/n[7:]).exists()]
-        writes += [(name, safe_path(inputs_dir, name[7:])) for name in new_inputs]
-        need = sum(archive.getinfo(name).file_size for name, _ in writes)
+        incoming_chains = [r for r in records['branches'].get('branch_chains') or [] if isinstance(r, dict)]
+        conflicts = chain_conflicts(store.branch_chains(), incoming_chains)
+        # Every file the import may write, then which are already there unchanged (skipped) or different (replaced).
+        candidates = [('library/'+relative, safe_path(library, relative)) for a in new_assets for relative in a['files']]
+        candidates += [(name, safe_path(inputs_dir, name[7:])) for name in names if name.startswith('inputs/')]
+        writes, replaced = [], []
+        for name, target in candidates:
+            if not target.exists():
+                writes.append((name, target, False))
+            elif not same_file(target, archive.getinfo(name)):
+                writes.append((name, target, True)); replaced.append(name)
+        new_inputs = sum(1 for name, _, _ in writes if name.startswith('inputs/'))
+        need = sum(archive.getinfo(name).file_size for name, _, _ in writes)
+        if verify:
+            check_contents(task, archive, 'Checking files')
+            would = {'jobs': sum(j['id'] not in known['jobs'] for j in records['jobs']), 'assets': len(new_assets),
+                     'presets': sum(p['id'] not in known['presets'] for p in records['presets']), 'inputs': new_inputs}
+            task.update(stage='Done', result={'verified': True, 'counts': manifest.get('counts') or {}, 'would_add': would,
+                                              'would_replace': replaced, 'changed_chains': len(conflicts), 'bytes': need,
+                                              'unavailable': unavailable, 'exported': manifest.get('exported'),
+                                              'settings': manifest.get('settings') or {}, 'missing': manifest.get('missing') or []})
+            return
+        choices = choose_chains(task, conflicts, chains) if conflicts else {}
         library.mkdir(parents=True, exist_ok=True); inputs_dir.mkdir(parents=True, exist_ok=True)
         free = shutil.disk_usage(library).free
         if need > free:
             raise ValueError(f'The import needs {need/1e9:.1f} GB but the library drive has {free/1e9:.1f} GB free.')
-        task.update(stage='Writing files', files_total=len(writes), bytes_total=need)
-        written = []
+        task.update(stage='Writing files', files_total=len(writes), files_done=0, bytes_total=need, bytes_done=0)
+        written, moved = [], []
         try:
-            for name, target in writes:
+            for name, target, replace in writes:
                 task.check()
-                if not target.exists():
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    part = target.with_name(target.name+'.part')
-                    with archive.open(name) as source, part.open('wb') as out:
-                        shutil.copyfileobj(source, out, 1 << 20)
-                    part.replace(target); written.append(target)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                part = target.with_name(target.name+'.part')
+                with archive.open(name) as source, part.open('wb') as out:
+                    shutil.copyfileobj(source, out, 1 << 20)
+                if replace:
+                    aside = unused(target); target.replace(aside); moved.append((target, aside))
+                part.replace(target); written.append(target)
                 task.update(files_done=task.files_done+1, bytes_done=task.bytes_done+archive.getinfo(name).file_size)
             task.check()
             task.update(stage='Adding records')
@@ -172,15 +276,24 @@ def import_history(task, store, library, inputs_dir, path, lock):
             assets = [{k: v for k, v in a.items() if k != 'files'} | {'root': str(library), 'recipe': with_library(a.get('recipe'), library)}
                       for a in records['assets']]
             branches = {t: rows for t, rows in records['branches'].items() if t in BRANCH_TABLES and isinstance(rows, list)}
+            # A copy is added under a new id and a marked name; an overwrite replaces the chain here.
+            copies = {i for i, c in choices.items() if c == 'copy'}
+            branches['branch_chains'] = [r | {'id': 'chain-'+uuid.uuid4().hex, 'name': f'{r.get("name")} (imported)'} if r['id'] in copies else r
+                                         for r in incoming_chains if choices.get(r['id']) != 'skip']
             with lock:
-                added = store.import_records(jobs, assets, records['presets'], branches)
+                added = store.import_records(jobs, assets, records['presets'], branches,
+                                             replace={'branch_chains': {i for i, c in choices.items() if c == 'overwrite'}})
         except BaseException:
             for file in written:
                 file.unlink(missing_ok=True)
+            for target, aside in moved:
+                aside.replace(target)
             raise
     counts = {'jobs': len(jobs), 'assets': len(assets), 'presets': len(records['presets'])}
-    result = {'added': added | {'inputs': len(new_inputs)},
-              'skipped': {k: counts[k]-added[k] for k in counts} | {'inputs': sum(n.startswith('inputs/') for n in names)-len(new_inputs)},
+    result = {'added': added | {'inputs': new_inputs},
+              'skipped': {k: counts[k]-added[k] for k in counts} | {'inputs': sum(n.startswith('inputs/') for n in names)-new_inputs},
+              'chains': {c: sum(1 for v in choices.values() if v == c) for c in CHAIN_CHOICES},
+              'replaced': [{'file': name, 'kept_as': aside.name} for name, (_, aside) in zip(replaced, moved)],
               'unavailable': unavailable, 'exported': manifest.get('exported'), 'settings': manifest.get('settings') or {},
               'missing': manifest.get('missing') or []}
     task.update(stage='Done', result=result)

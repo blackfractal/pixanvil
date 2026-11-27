@@ -129,3 +129,11 @@ fieldset.plain{border:0;padding:0;margin:0;min-width:0}
 .history-progress div{display:flex;justify-content:space-between;align-items:center;gap:10px}
 #history-result{padding:35px;max-width:620px}
 #history-result .field-note{overflow-wrap:anywhere}
+#chain-conflicts{padding:35px;max-width:680px}
+.conflict-all{display:flex;align-items:center;gap:12px;margin:14px 0 6px;font-size:12px}
+.conflict-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 0;border-top:1px solid var(--line)}
+.conflict-row strong{display:block;margin-bottom:4px}
+.conflict-row small{display:block;color:var(--muted);font-size:11px}
+.conflict-row select{width:auto;margin:0;flex:none}
+.history-buttons a.quiet{display:inline-flex;align-items:center}
+.history-buttons{flex-wrap:wrap}

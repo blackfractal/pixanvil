@@ -89,18 +89,35 @@ def export_history(base,path):
     return 0
 
 
-def import_history(base,path):
+def import_history(base,path,chains):
     path=Path(path)
     print('Uploading',flush=True)
     with path.open('rb') as handle, httpx.Client(timeout=None,trust_env=False) as client:
-        response=client.post(base+'/api/library/import',headers={'X-PixAnvil':'local'},files={'file':(path.name,handle,'application/zip')})
+        response=client.post(base+'/api/library/import',params={'chains':chains},headers={'X-PixAnvil':'local'},files={'file':(path.name,handle,'application/zip')})
         if response.is_error: raise RuntimeError(response.json().get('detail',response.text))
     result=follow_task(base,response.json())['result']
     added,skipped=result['added'],result['skipped']
     print(f'Added {added["jobs"]} jobs, {added["assets"]} gallery items, {added["presets"]} presets, {added["inputs"]} source images.')
     print(f'Already here, skipped: {skipped["jobs"]} jobs, {skipped["assets"]} gallery items, {skipped["presets"]} presets.')
+    chosen=result['chains']
+    if any(chosen.values()): print(f'Saved chains that differed from yours: {chosen["copy"]} kept as copies, {chosen["overwrite"]} overwritten, {chosen["skip"]} skipped.')
     if result['unavailable']: print(f'{len(result["unavailable"])} gallery items were missing from the export and were not added.')
     return 0
+
+
+
+def verify_history(base,path):
+    path=Path(path)
+    print('Uploading',flush=True)
+    with path.open('rb') as handle, httpx.Client(timeout=None,trust_env=False) as client:
+        response=client.post(base+'/api/library/verify',headers={'X-PixAnvil':'local'},files={'file':(path.name,handle,'application/zip')})
+        if response.is_error: raise RuntimeError(response.json().get('detail',response.text))
+    result=follow_task(base,response.json())['result']
+    counts,would=result['counts'],result['would_add']
+    print(f'Intact: every file was read. {counts.get("jobs",0)} jobs, {counts.get("assets",0)} gallery items, {counts.get("presets",0)} presets.')
+    if result['missing']: print('Incomplete: missing from disk when it was made: '+', '.join(result['missing']))
+    print(f'Importing here would add {would["jobs"]} jobs, {would["assets"]} gallery items, {would["presets"]} presets, {would["inputs"]} source images.')
+    return 1 if result['missing'] else 0
 
 
 def main():
@@ -135,6 +152,9 @@ def main():
     exp.add_argument('file'); exp.add_argument('--port',type=int,default=8790)
     imh=sub.add_parser('import-history',help='Merge a history zip into this library; anything already present is skipped')
     imh.add_argument('file'); imh.add_argument('--port',type=int,default=8790)
+    ver=sub.add_parser('verify-history',help='Check a history zip without importing it: every file is read to confirm it is intact')
+    ver.add_argument('file'); ver.add_argument('--port',type=int,default=8790)
+    imh.add_argument('--chains',choices=['copy','overwrite','skip'],default='copy',help='A saved chain that is here with different steps or name: keep both (copy, the default), replace yours (overwrite), or keep yours (skip)')
     for name,description in (('open',None),('status',None),('start-comfy',None),('stop','Stop the running PixAnvil server')):
         cmd=sub.add_parser(name,help=description)
         cmd.add_argument('--port',type=int,default=8790)
@@ -159,7 +179,8 @@ def main():
     if args.command=='status': print(json.dumps(request(base,'/api/connection'),indent=2)); return 0
     if args.command=='start-comfy': print(request(base,'/api/connection/start','POST')); return 0
     if args.command=='export': return export_history(base,args.file)
-    if args.command=='import-history': return import_history(base,args.file)
+    if args.command=='import-history': return import_history(base,args.file,args.chains)
+    if args.command=='verify-history': return verify_history(base,args.file)
     if args.command=='import':
         asset=import_file(base,args.file)
         print(json.dumps(asset,indent=2) if args.json else f'Imported: {asset["id"]}\nSaved: {Path(asset["root"])/asset["path"]}')

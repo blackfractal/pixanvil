@@ -325,13 +325,16 @@ class Store:
         with self.connect() as db:
             return {t: {r[0] for r in db.execute(f'SELECT id FROM {t}')} for t in ('jobs', 'assets', 'presets')}
 
-    def import_records(self, jobs, assets, presets, branches):
+    def import_records(self, jobs, assets, presets, branches, replace=None):
         """Insert imported records in one transaction, keeping their created times. A record whose id (or a Branches
-        row whose key) is already present is skipped, so local values win. Returns how many of each were added."""
+        row whose key) is already present is skipped, so local values win, except rows of a table whose `id` is in
+        `replace` ({table: ids}), which replace the local row. Returns how many of each were added."""
+        replace = replace or {}
         def insert(db, table, columns, row):
             names = [c for c in columns if c in row]
             values = [json.dumps(row[c]) if isinstance(row[c], (dict, list)) else row[c] for c in names]
-            return db.execute(f'INSERT OR IGNORE INTO {table}({",".join(names)}) VALUES({",".join("?"*len(names))})', values).rowcount
+            verb = 'INSERT OR REPLACE' if row.get('id') in replace.get(table, ()) else 'INSERT OR IGNORE'
+            return db.execute(f'{verb} INTO {table}({",".join(names)}) VALUES({",".join("?"*len(names))})', values).rowcount
         added = {'jobs': 0, 'assets': 0, 'presets': 0, 'branch_rows': 0}
         with self.connect() as db:
             for job in jobs:

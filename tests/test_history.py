@@ -38,8 +38,8 @@ def export(client):
     assert task['files_done']==task['files_total']
     response=client.get(f'/api/library/tasks/{task["id"]}/file')
     assert response.status_code==200 and response.headers['content-type']=='application/zip'
-    # Sent once: the temporary zip is gone after the download.
-    assert client.get(f'/api/library/tasks/{task["id"]}/file').status_code==404
+    # It can be downloaded again, in case the browser's download failed.
+    assert client.get(f'/api/library/tasks/{task["id"]}/file').content==response.content
     return response.content
 
 
@@ -196,3 +196,140 @@ def test_a_cancelled_import_leaves_nothing_behind(two,tmp_path):
         history.import_history(CancelAfterOne('import'),store,library,config.state/'inputs',path,other.state.engine.lock)
     assert [f for f in library.rglob('*') if f.is_file()]==[]
     assert store.all_assets()==[]
+
+
+def chain_setup(app,client):
+    """A saved chain, exported, then edited here: re-importing the export now conflicts with it."""
+    start,end=add_image(client,(20,60,120),'start'),add_image(client,(90,30,10),'end')
+    there,back=clip(app,client,start,end=end),clip(app,client,end,end=start)
+    chain=client.post('/api/branches/chains',headers=HEADERS,json={'name':'Run','clips':[there['id'],back['id']]}).json()
+    data=export(client)
+    client.put('/api/branches/chains/'+chain['id'],headers=HEADERS,json={'name':'Run, edited','clips':[there['id']]})
+    return chain,start,data
+
+
+def saved_chains(client,item_id):
+    return sorted((c['name'],len(c['steps'])) for c in tree(client,item_id)['chains'])
+
+
+def start_import(client,data,**params):
+    response=client.post('/api/library/import',headers=HEADERS,params=params,files={'file':('h.zip',data,'application/zip')})
+    assert response.status_code==202,response.text
+    return response.json()['id']
+
+
+def wait_for(client,task_id,stage):
+    for _ in range(500):
+        task=client.get('/api/library/tasks/'+task_id).json()
+        if task['stage']==stage or task['finished']: return task
+        time.sleep(.01)
+    raise AssertionError('The task never reached '+stage)
+
+
+@pytest.mark.parametrize('choice,expected',[
+    ('copy',[('Run (imported)',2),('Run, edited',1)]),
+    ('overwrite',[('Run',2)]),
+    ('skip',[('Run, edited',1)]),
+])
+def test_an_import_asks_what_to_do_with_a_changed_chain(two,choice,expected):
+    (app,a),_=two
+    chain,start,data=chain_setup(app,a)
+    task_id=start_import(a,data)
+    waiting=wait_for(a,task_id,'Waiting for your choices')
+    assert waiting['stage']=='Waiting for your choices' and not waiting['finished']
+    [conflict]=waiting['conflicts']
+    assert (conflict['id'],conflict['local']['name'],conflict['local']['steps'],conflict['incoming']['name'],conflict['incoming']['steps'])==(chain['id'],'Run, edited',1,'Run',2)
+    # Every conflicting chain needs a choice.
+    assert a.post(f'/api/library/tasks/{task_id}/choices',headers=HEADERS,json={'choices':{}}).status_code==422
+    assert a.post(f'/api/library/tasks/{task_id}/choices',headers=HEADERS,json={'choices':{chain['id']:choice}}).status_code==200
+    done=wait_for(a,task_id,'Done')
+    assert done['stage']=='Done' and done['result']['chains'][choice]==1,done
+    assert saved_chains(a,start['id'])==expected
+
+
+def test_a_chain_choice_can_be_made_for_all_up_front(two):
+    (app,a),_=two
+    chain,start,data=chain_setup(app,a)
+    done=finish(a,a.post('/api/library/import',headers=HEADERS,params={'chains':'copy'},files={'file':('h.zip',data,'application/zip')}))
+    assert done['stage']=='Done' and saved_chains(a,start['id'])==[('Run (imported)',2),('Run, edited',1)]
+
+
+def test_cancelling_while_choosing_adds_nothing(two):
+    (app,a),_=two
+    chain,start,data=chain_setup(app,a)
+    task_id=start_import(a,data)
+    wait_for(a,task_id,'Waiting for your choices')
+    a.post(f'/api/library/tasks/{task_id}/cancel',headers=HEADERS)
+    assert wait_for(a,task_id,'Cancelled')['stage']=='Cancelled'
+    assert saved_chains(a,start['id'])==[('Run, edited',1)]
+
+
+def test_an_unchanged_chain_is_not_a_conflict(two):
+    (app,a),(other,b)=two
+    chain,start,data=chain_setup(app,a)
+    assert import_zip(b,data)['stage']=='Done'
+    # Importing into B again: B's chain is identical to the export's, so nothing is asked.
+    again=import_zip(b,data)
+    assert again['stage']=='Done' and set(again['result']['chains'].values())=={0}
+
+
+def test_deleting_waits_while_an_export_runs(two,monkeypatch):
+    import threading
+    (app,a),_=two
+    asset=add_image(a,(20,60,120),'kept')
+    release=threading.Event()
+    real=history.export_history
+    def slow(task,*args):
+        release.wait(10); real(task,*args)
+    monkeypatch.setattr(history,'export_history',slow)
+    started=a.post('/api/library/export',headers=HEADERS)
+    try:
+        assert a.delete('/api/library',headers=HEADERS).status_code==409
+        assert a.delete('/api/assets/'+asset['id'],headers=HEADERS).status_code==409
+    finally:
+        release.set()
+    task=finish(a,started)
+    assert task['stage']=='Ready to download' and task['result']['complete'] is True
+    assert a.delete('/api/assets/'+asset['id'],headers=HEADERS).status_code==200
+
+
+def test_a_different_file_at_the_destination_is_set_aside(two):
+    (app,a),(other,b)=two
+    asset=add_image(a,(20,60,120),'picture')
+    data=export(a)
+    original=(Path(asset['root'])/asset['path']).read_bytes()
+    library=Path(other.state.config.data['library'])
+    target=library/asset['path']; target.parent.mkdir(parents=True,exist_ok=True); target.write_bytes(b'half a file')
+    thumb=library/asset['thumbnail']; thumb.parent.mkdir(parents=True,exist_ok=True)
+    thumb.write_bytes(zipfile.ZipFile(io.BytesIO(data)).read('library/'+asset['thumbnail'].replace('\\','/')))
+    result=import_zip(b,data)['result']
+    assert target.read_bytes()==original
+    assert (target.parent/(target.name+'.before-import')).read_bytes()==b'half a file'
+    # The identical thumbnail was left alone; only the different file is reported.
+    assert [r['file'] for r in result['replaced']]==['library/'+asset['path'].replace('\\','/')]
+
+
+def test_verify_checks_a_backup_without_importing_it(two):
+    (app,a),(other,b)=two
+    asset=add_image(a,(20,60,120),'picture')
+    data=export(a)
+    verified=finish(b,b.post('/api/library/verify',headers=HEADERS,files={'file':('h.zip',data,'application/zip')}))
+    assert verified['stage']=='Done' and verified['result']['verified'] is True,verified
+    assert verified['result']['would_add']['assets']==1
+    assert b.get('/api/assets').json()['items']==[]
+    # A damaged archive is found: flip a byte inside the stored image.
+    name='library/'+asset['path'].replace('\\','/')
+    info=zipfile.ZipFile(io.BytesIO(data)).getinfo(name)
+    offset=info.header_offset+30+len(info.filename.encode())+len(info.extra)+10
+    damaged=bytearray(data); damaged[offset]^=0xFF
+    task=finish(b,b.post('/api/library/verify',headers=HEADERS,files={'file':('h.zip',bytes(damaged),'application/zip')}))
+    assert task['stage']=='Failed' and 'damaged' in task['error'],task
+
+
+def test_a_new_export_replaces_the_previous_zip(two):
+    (app,a),_=two
+    add_image(a,(20,60,120),'picture')
+    first=finish(a,a.post('/api/library/export',headers=HEADERS))
+    second=finish(a,a.post('/api/library/export',headers=HEADERS))
+    assert a.get(f'/api/library/tasks/{first["id"]}/file').status_code==404
+    assert a.get(f'/api/library/tasks/{second["id"]}/file').status_code==200

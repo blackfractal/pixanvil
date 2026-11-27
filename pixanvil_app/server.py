@@ -158,6 +158,10 @@ class Chain(BaseModel):
     clips: list[str] = Field(min_length=1, max_length=200)
 
 
+class ChainChoices(BaseModel):
+    choices: dict[str,Literal['copy','overwrite','skip']]
+
+
 class SavedChain(Chain):
     name: str = Field(default='', max_length=80)
 
@@ -478,8 +482,15 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         folder=config.state/'inputs'
         return [f for f in folder.iterdir() if f.is_file()] if folder.is_dir() else []
 
+    def refuse_during_history_task():
+        """Deleting while an export or import reads or writes the library could leave it with records whose files
+        are gone, so deletions wait until it finishes."""
+        if any(not t.finished for t in library_tasks.values()):
+            raise HTTPException(409,'A history export or import is running. Wait for it to finish, or cancel it, before deleting.')
+
     def remove_job(job):
         """Delete a job, every output it produced, and source snapshots no other job needs."""
+        refuse_during_history_task()
         if job['state'] in busy_states:
             raise HTTPException(409,'This job may still be running on ComfyUI. Wait for it to finish, or abandon it first.')
         removed=store.delete_job(job['id'])
@@ -501,6 +512,7 @@ def make_app(state=None, worker=True, client_factory=Comfy):
             # A generated output and its job are one record: deleting either removes both.
             job=store.job(asset['job_id']) if asset['job_id'] else None
             if job: return remove_job(job)
+            refuse_during_history_task()
             store.delete_asset(asset_id)
             return {'deleted_job':None,'deleted_assets':[asset_id],'leftover_files':remove_asset_files(asset)}
 
@@ -521,6 +533,7 @@ def make_app(state=None, worker=True, client_factory=Comfy):
     def clear_library():
         """Delete every job, gallery entry, library file and source snapshot. Presets and settings stay."""
         with engine.lock:
+            refuse_during_history_task()
             if any(j['state'] in busy_states for j in store.active()):
                 raise HTTPException(409,'Some jobs may still be running on ComfyUI. Wait for them to finish, or abandon them first.')
             jobs=store.job_count()
@@ -557,17 +570,40 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         """Start building a zip of the whole history; download it from the task once it is ready."""
         task=history.Task('export')
         path=exports/f'history-{task.id}.zip'
-        return start_library_task(task,lambda:history.export_history(task,store,config.data,asset_files,saved_inputs(),path))
+        def work():
+            # The previous export's zip is kept for downloading again only until a new one is made.
+            for old in library_tasks.values():
+                if old is not task and old.file: old.file.unlink(missing_ok=True); old.file=None
+            history.export_history(task,store,config.data,asset_files,saved_inputs(),path)
+        return start_library_task(task,work)
 
-    @app.post('/api/library/import',status_code=202)
-    async def import_library(file:UploadFile):
-        """Merge an uploaded history zip into this library. Anything already present is skipped."""
-        task=history.Task('import')
+    async def receive_zip(file,task):
         path=exports/f'import-{task.id}.zip'
         with path.open('wb') as out:
             while chunk:=await file.read(1<<20): out.write(chunk)
+        return path
+
+    @app.post('/api/library/verify',status_code=202)
+    async def verify_library(file:UploadFile):
+        """Check a history zip without importing it: every check an import makes, plus reading every file to confirm
+        it is intact. The result says what importing it here would add."""
+        task=history.Task('verify')
+        path=await receive_zip(file,task)
         def work():
-            try: history.import_history(task,store,config.data['library'],config.state/'inputs',path,engine.lock)
+            try: history.import_history(task,store,config.data['library'],config.state/'inputs',path,engine.lock,verify=True)
+            finally: path.unlink(missing_ok=True)
+        try: return start_library_task(task,work)
+        except HTTPException:
+            path.unlink(missing_ok=True); raise
+
+    @app.post('/api/library/import',status_code=202)
+    async def import_library(file:UploadFile,chains:Literal['ask','copy','overwrite','skip']='ask'):
+        """Merge an uploaded history zip into this library. Anything already present is skipped. A saved chain that
+        is here with different steps or name is decided by `chains`; with 'ask' the task waits for choices."""
+        task=history.Task('import')
+        path=await receive_zip(file,task)
+        def work():
+            try: history.import_history(task,store,config.data['library'],config.state/'inputs',path,engine.lock,chains)
             finally: path.unlink(missing_ok=True)
         try: return start_library_task(task,work)
         except HTTPException:
@@ -576,6 +612,16 @@ def make_app(state=None, worker=True, client_factory=Comfy):
     @app.get('/api/library/tasks/{task_id}')
     def library_task_status(task_id:str): return library_task(task_id).public()
 
+    @app.post('/api/library/tasks/{task_id}/choices')
+    def choose_chains(task_id:str,value:ChainChoices):
+        """The person's choice for each conflicting saved chain, for an import waiting on them."""
+        task=library_task(task_id)
+        if not task.conflicts: raise HTTPException(409,'This import is not waiting for choices')
+        if set(value.choices)!={c['id'] for c in task.conflicts}: raise HTTPException(422,'Choose for every conflicting chain')
+        # Cleared here, not only by the import, so the reply never asks again.
+        task.choices=dict(value.choices); task.update(conflicts=None,stage='Checking the zip'); task.chosen.set()
+        return task.public()
+
     @app.post('/api/library/tasks/{task_id}/cancel')
     def cancel_library_task(task_id:str):
         task=library_task(task_id); task.cancel_requested=True
@@ -583,12 +629,10 @@ def make_app(state=None, worker=True, client_factory=Comfy):
 
     @app.get('/api/library/tasks/{task_id}/file')
     def library_task_file(task_id:str):
-        """The finished export, sent once; the temporary zip is deleted after it is sent."""
+        """The finished export. It can be downloaded again until the next export, or until PixAnvil restarts."""
         task=library_task(task_id)
-        if not task.file or not task.file.is_file(): raise HTTPException(404,'This export is not ready, or was already downloaded')
-        file=task.file; task.file=None
-        return FileResponse(file,media_type='application/zip',filename=f'pixanvil-history-{datetime.now().date().isoformat()}.zip',
-                            background=BackgroundTask(file.unlink,missing_ok=True))
+        if not task.file or not task.file.is_file(): raise HTTPException(404,'This export is no longer available; export again')
+        return FileResponse(task.file,media_type='application/zip',filename=f'pixanvil-history-{datetime.now().date().isoformat()}.zip')
 
     @app.get('/api/assets')
     def assets(q:str='',model:str='',offset:int=0,limit:int=60,favorites:bool=False,media:Literal['','image','video']='',

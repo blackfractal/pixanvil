@@ -1536,7 +1536,7 @@ function showHistoryProgress(stage,done,total,detail=''){
   $('#history-bar').max=total||1;$('#history-bar').value=total?done:0;
   $('#history-stage').textContent=stage+(detail?` · ${detail}`:'');
 }
-function historyBusy(busy){$('#export-history').disabled=$('#import-history').disabled=busy;if(!busy)$('#history-progress').hidden=true;}
+function historyBusy(busy){$('#export-history').disabled=$('#import-history').disabled=$('#verify-history').disabled=busy;if(!busy)$('#history-progress').hidden=true;}
 async function followHistoryTask(task){
   historyTask=task;
   try{
@@ -1544,6 +1544,12 @@ async function followHistoryTask(task){
       const total=task.bytes_total||task.files_total;
       showHistoryProgress(task.stage,task.bytes_total?task.bytes_done:task.files_done,total,task.files_total?`${task.files_done} of ${task.files_total} files`:'');
       if(task.finished)break;
+      // An import pauses when saved chains here and in the zip differ, until a choice is sent for each.
+      if(task.conflicts){
+        const choices=await askChainChoices(task.conflicts);
+        task=await api(`/library/tasks/${task.id}/${choices?'choices':'cancel'}`,'POST',choices?{choices}:undefined);
+        continue;
+      }
       await new Promise(resolve=>setTimeout(resolve,500));
       task=await api('/library/tasks/'+task.id);
     }
@@ -1555,18 +1561,22 @@ $('#export-history').onclick=run(async()=>{
   historyBusy(true);
   try{
     const task=await followHistoryTask(await api('/library/export','POST'));
-    const link=el('a');link.href=`/api/library/tasks/${task.id}/file`;link.download='';document.body.append(link);link.click();link.remove();
+    const href=`/api/library/tasks/${task.id}/file`;
+    const link=el('a');link.href=href;link.download='';document.body.append(link);link.click();link.remove();
+    $('#history-download').href=href;$('#history-download').download='';$('#history-download').hidden=false;
     const c=task.result;
-    notice(`History exported: ${count(c.jobs,'job','jobs')}, ${count(c.assets,'gallery item','gallery items')}, ${count(c.presets,'preset','presets')}. Your browser saves the zip.`+
-      (c.missing.length?` Missing from disk, not included: ${c.missing.join(', ')}`:''));
+    const what=`${count(c.jobs,'job','jobs')}, ${count(c.assets,'gallery item','gallery items')}, ${count(c.presets,'preset','presets')}`;
+    notice(c.complete
+      ?`Archive ready and checked (${what}); download started. Make sure your browser finished saving it, then use Verify a backup… on the saved file before relying on it.`
+      :`Archive ready but INCOMPLETE (${what}): these files were already missing from disk and are not in it: ${c.missing.join(', ')}. Download started.`);
   }finally{historyBusy(false);}
 });
 $('#import-history').onclick=()=>$('#import-history-file').click();
 // The upload uses XMLHttpRequest, the one browser API that reports upload progress.
-function uploadHistory(file){
+function uploadHistory(file,path='/api/library/import'){
   return new Promise((resolve,reject)=>{
     const xhr=new XMLHttpRequest();historyUpload=xhr;
-    xhr.open('POST','/api/library/import');xhr.setRequestHeader('X-PixAnvil','local');
+    xhr.open('POST',path);xhr.setRequestHeader('X-PixAnvil','local');
     xhr.upload.onprogress=e=>showHistoryProgress('Uploading',e.loaded,e.total,`${(e.loaded/1e6).toFixed(0)} of ${(e.total/1e6).toFixed(0)} MB`);
     xhr.onload=()=>{
       historyUpload=null;
@@ -1586,9 +1596,13 @@ $('#import-history-file').onchange=run(async()=>{
     const r=(await followHistoryTask(await uploadHistory(file))).result;
     const line=(label,c)=>`${label}: ${count(c.jobs,'job','jobs')}, ${count(c.assets,'gallery item','gallery items')}, ${count(c.presets,'preset','presets')}, ${count(c.inputs,'source image','source images')}`;
     const body=[el('p','',line('Added',r.added)),el('p','muted',line('Already here, skipped',r.skipped))];
+    const ch=r.chains;
+    if(ch.copy+ch.overwrite+ch.skip)body.push(el('p','',`Saved chains that differed from yours: ${ch.copy} kept as copies, ${ch.overwrite} replaced, ${ch.skip} left out.`));
+    if(r.replaced.length)body.push(el('p','',`${count(r.replaced.length,'file was','files were')} already in the library with different contents; ${r.replaced.length===1?'it was':'they were'} moved aside (${r.replaced.map(x=>x.kept_as).join(', ')}) and the archived ${r.replaced.length===1?'copy':'copies'} written.`));
     if(r.unavailable.length)body.push(el('p','',`${count(r.unavailable.length,'gallery item was','gallery items were')} missing from the export, so ${r.unavailable.length===1?'it was':'they were'} not added.`));
     const from=r.settings||{};
     body.push(el('p','field-note',`Exported ${r.exported?new Date(r.exported).toLocaleString():'at an unknown time'}${from.library?` from the library ${from.library}`:''}${from.comfy_url?`, rendering on ${from.comfy_url}`:''}. Your own settings are unchanged.`));
+    $('#history-result-eyebrow').textContent='HISTORY IMPORTED';$('#history-result-title').textContent='Merged into your library.';
     $('#history-result-body').replaceChildren(...body);$('#history-result').showModal();
     await Promise.all([refreshGallery(),refreshJobs(),refreshPresets()]);
   }finally{historyBusy(false);}
@@ -1598,3 +1612,56 @@ $('#cancel-history').onclick=run(async()=>{
   if(historyTask)await api(`/library/tasks/${historyTask.id}/cancel`,'POST');
 });
 $('#close-history-result').onclick=()=>$('#history-result').close();
+
+// The choice for each saved chain that is both here and in an imported zip, with different steps or names.
+// Resolves to {chain id: 'copy' | 'overwrite' | 'skip'}, or null when the import is cancelled.
+function askChainChoices(conflicts){
+  const when=t=>t?new Date(t).toLocaleString():'at an unknown time';
+  const picks=conflicts.map(c=>{
+    const pick=el('select');pick.setAttribute('aria-label',`What to do with ${c.local.name}`);
+    for(const [value,text] of [['copy','Keep both (the export\'s as a copy)'],['overwrite','Use the export\'s (replaces mine)'],['skip','Keep mine (leave the export\'s out)']]){
+      const o=el('option','',text);o.value=value;pick.append(o);
+    }
+    const row=el('div','conflict-row'),about=el('div');
+    about.append(el('strong','',c.local.name===c.incoming.name?c.local.name:`${c.local.name} / ${c.incoming.name}`),
+      el('small','',`Mine: ${c.local.name}, ${count(c.local.steps,'step','steps')}, saved ${when(c.local.updated)}`),
+      el('small','',`In the export: ${c.incoming.name}, ${count(c.incoming.steps,'step','steps')}, saved ${when(c.incoming.updated)}`));
+    row.append(about,pick);return {id:c.id,pick,row};
+  });
+  $('#chain-conflict-list').replaceChildren(...picks.map(p=>p.row));
+  document.querySelectorAll('#chain-conflicts [data-all]').forEach(b=>b.onclick=()=>picks.forEach(p=>p.pick.value=b.dataset.all));
+  return new Promise(resolve=>{
+    const dialog=$('#chain-conflicts');
+    const finish=value=>{dialog.onclose=null;if(dialog.open)dialog.close();resolve(value);};
+    $('#confirm-conflicts').onclick=()=>finish(Object.fromEntries(picks.map(p=>[p.id,p.pick.value])));
+    $('#cancel-conflicts').onclick=()=>finish(null);
+    dialog.onclose=()=>finish(null);
+    dialog.showModal();
+  });
+}
+
+// Verify a backup: the import's checks plus reading every file, without writing anything.
+$('#verify-history').onclick=()=>$('#verify-history-file').click();
+$('#verify-history-file').onchange=run(async()=>{
+  const file=$('#verify-history-file').files[0];$('#verify-history-file').value='';
+  if(!file)return;
+  historyBusy(true);
+  try{
+    let task;
+    try{task=await followHistoryTask(await uploadHistory(file,'/api/library/verify'));}
+    catch(error){
+      $('#history-result-eyebrow').textContent='BACKUP CHECKED';$('#history-result-title').textContent='This backup has a problem.';
+      $('#history-result-body').replaceChildren(el('p','',error.message),el('p','field-note','Do not rely on this zip. Export again and verify the new one.'));
+      $('#history-result').showModal();return;
+    }
+    const r=task.result,c=r.counts,w=r.would_add;
+    const body=[el('p','',`Every file in ${file.name} was read and is intact: ${count(c.jobs||0,'job','jobs')}, ${count(c.assets||0,'gallery item','gallery items')}, ${count(c.presets||0,'preset','presets')}.`)];
+    if(r.missing.length)body.push(el('p','',`It is incomplete: ${count(r.missing.length,'file was','files were')} already missing from disk when it was made (${r.missing.join(', ')}).`));
+    body.push(el('p','muted',`Importing it here would add ${count(w.jobs,'job','jobs')}, ${count(w.assets,'gallery item','gallery items')}, ${count(w.presets,'preset','presets')} and ${count(w.inputs,'source image','source images')}`+
+      (r.would_replace.length?`, and set aside ${count(r.would_replace.length,'different file','different files')} already in the library`:'')+
+      (r.changed_chains?`; ${count(r.changed_chains,'saved chain differs','saved chains differ')} from yours and would be asked about`:'')+'.'));
+    body.push(el('p','field-note',`Exported ${r.exported?new Date(r.exported).toLocaleString():'at an unknown time'}${r.settings?.library?` from the library ${r.settings.library}`:''}. Nothing was imported or changed.`));
+    $('#history-result-eyebrow').textContent='BACKUP CHECKED';$('#history-result-title').textContent=r.missing.length?'Readable, but incomplete.':'This backup is complete and intact.';
+    $('#history-result-body').replaceChildren(...body);$('#history-result').showModal();
+  }finally{historyBusy(false);}
+});
