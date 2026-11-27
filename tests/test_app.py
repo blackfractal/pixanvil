@@ -367,3 +367,41 @@ def test_restart_runs_docker_restart_and_is_refused_while_a_job_renders(app,monk
         app.state.store.update_job(job['id'],state='running')
         refused=client.post('/api/connection/restart',headers=HEADERS)
         assert refused.status_code==409 and 'rendering' in refused.json()['detail']
+
+
+def test_new_results_start_unseen_until_viewed(app):
+    """A job's result counts as new until it is viewed; something imported by hand starts viewed."""
+    submit(app,count=2)
+    for _ in range(4): app.state.engine.tick()
+    with TestClient(app) as client:
+        made=client.get('/api/assets').json()['items']
+        assert len(made)==2 and all(a['seen'] is None for a in made)
+        assert client.get('/api/assets/unseen').json()=={'total':2,'clips':0}
+        batch=client.get('/api/assets?group=batch').json()['items'][0]['group']
+        assert batch['count']==2 and batch['unseen']==2
+        imported=client.post('/api/assets/import',files={'file':('mine.png',png(),'image/png')},headers=HEADERS)
+        assert imported.status_code==201 and imported.json()['seen']
+        assert client.post('/api/assets/seen',json={'ids':[made[0]['id']]},headers=HEADERS).json()['total']==1
+        first=client.get('/api/assets/'+made[0]['id']).json()['seen']
+        assert client.post('/api/assets/seen',json={'all':True},headers=HEADERS).json()['total']==0
+        # Viewing again keeps the time it was first viewed.
+        assert client.get('/api/assets/'+made[0]['id']).json()['seen']==first
+
+
+def test_seen_column_added_to_an_older_library(tmp_path):
+    """A library made before results were tracked as seen gets the column, with everything already there seen."""
+    import sqlite3
+    from pixanvil_app.store import Store
+    path=tmp_path/'old.db'
+    db=sqlite3.connect(path)
+    db.execute('''CREATE TABLE assets (id TEXT PRIMARY KEY, job_id TEXT, created TEXT NOT NULL, root TEXT NOT NULL,
+        path TEXT NOT NULL, thumbnail TEXT NOT NULL, recipe TEXT NOT NULL, width INTEGER, height INTEGER,
+        favorite INTEGER NOT NULL DEFAULT 0, rating INTEGER NOT NULL DEFAULT 0, UNIQUE(job_id,path))''')
+    db.execute("INSERT INTO assets(id,job_id,created,root,path,thumbnail,recipe) VALUES('a','j','2026-01-01','r','p','t','{}')")
+    db.commit(); db.close()
+    store=Store(path)
+    assert store.asset('a')['seen']=='2026-01-01'
+    assert store.unseen_counts()=={'total':0,'clips':0}
+    # Imported records arrive seen too.
+    store.import_records([],[{'id':'b','job_id':'k','created':'2026-02-02','root':'r','path':'q','thumbnail':'t','recipe':{}}],[],{})
+    assert store.asset('b')['seen']=='2026-02-02'

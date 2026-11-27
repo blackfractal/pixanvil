@@ -115,6 +115,11 @@ class Preset(BaseModel):
     id: str | None = None
 
 
+class Seen(BaseModel):
+    ids: list[str] = Field(default_factory=list,max_length=1000)
+    all: bool = False
+
+
 class Mark(BaseModel):
     favorite: bool = False
     rating: int = Field(default=0,ge=0,le=5)
@@ -638,6 +643,15 @@ def make_app(state=None, worker=True, client_factory=Comfy):
     def assets(q:str='',model:str='',offset:int=0,limit:int=60,favorites:bool=False,media:Literal['','image','video']='',
                group:Literal['','batch','takes']=''):
         return store.assets(q,model,max(0,offset),max(1,min(limit,100)),favorites,media,group)
+
+    @app.get('/api/assets/unseen')
+    def unseen(): return store.unseen_counts()
+
+    @app.post('/api/assets/seen')
+    def seen(value:Seen):
+        """Mark results as viewed: the ones listed, or all of them."""
+        store.mark_seen(None if value.all else value.ids)
+        return store.unseen_counts()
 
     @app.get('/api/assets/group')
     def asset_group(kind:Literal['batch','takes'],key:str):

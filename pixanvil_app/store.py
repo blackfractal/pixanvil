@@ -52,6 +52,11 @@ class Store:
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, steps TEXT NOT NULL,
                     created TEXT NOT NULL, updated TEXT NOT NULL);
             ''')
+            # When each item was first looked at; NULL marks a new result nobody has viewed yet. Items from before
+            # this column existed count as seen.
+            if 'seen' not in {r[1] for r in db.execute('PRAGMA table_info(assets)')}:
+                db.execute('ALTER TABLE assets ADD COLUMN seen TEXT')
+                db.execute('UPDATE assets SET seen=created')
 
     @contextmanager
     def connect(self):
@@ -103,11 +108,29 @@ class Store:
             db.execute('UPDATE jobs SET ' + ','.join(k+'=?' for k in values) + ' WHERE id=?', (*values.values(), job_id))
 
     def add_asset(self, asset):
+        """A job's result starts unseen. Anything made by hand (an import, a saved frame, a joined chain) was just
+        looked at, so it starts seen."""
+        created = now()
         with self.connect() as db:
             db.execute('''INSERT OR IGNORE INTO assets
-                (id,job_id,created,root,path,thumbnail,recipe,width,height) VALUES(?,?,?,?,?,?,?,?,?)''',
-                (asset['id'],asset['job_id'],now(),asset['root'],asset['path'],asset['thumbnail'],
-                 json.dumps(asset['recipe']),asset['width'],asset['height']))
+                (id,job_id,created,root,path,thumbnail,recipe,width,height,seen) VALUES(?,?,?,?,?,?,?,?,?,?)''',
+                (asset['id'],asset['job_id'],created,asset['root'],asset['path'],asset['thumbnail'],
+                 json.dumps(asset['recipe']),asset['width'],asset['height'],None if asset['job_id'] else created))
+
+    def mark_seen(self, ids=None):
+        """Mark the items `ids`, or every item when None, as seen. Items already seen keep their first time."""
+        with self.connect() as db:
+            if ids is None:
+                db.execute('UPDATE assets SET seen=? WHERE seen IS NULL', (now(),))
+            elif ids:
+                db.execute(f'UPDATE assets SET seen=? WHERE seen IS NULL AND id IN ({",".join("?"*len(ids))})', (now(), *ids))
+
+    def unseen_counts(self):
+        """How many results nobody has viewed yet: all of them, and the clips between two images (Branches)."""
+        with self.connect() as db:
+            total, clips = db.execute("SELECT COUNT(*), COALESCE(SUM(json_extract(recipe,'$.operation')='img2vid'),0) "
+                                      'FROM assets WHERE seen IS NULL').fetchone()
+        return {'total': total, 'clips': clips}
 
     # How the gallery groups items. A batch is everything one submission made; items made before batches were
     # recorded, or made alone, are their own group. A take set is the clips with the same start and end image,
@@ -161,7 +184,8 @@ class Store:
                 # The take Branches plays for this pair: the chosen one, else the lowest-numbered.
                 chosen = pairs.get(tuple(gkey.split('>', 1)), {}).get('preferred_clip')
                 cover = next((a for a in found if a['id'] == chosen), None) or min(found, key=lambda a: (numbers.get(a['id'], 1e9), a['created']))
-            items.append(cover | {'group': {'kind': group, 'key': gkey, 'count': len(found)}})
+            items.append(cover | {'group': {'kind': group, 'key': gkey, 'count': len(found),
+                                            'unseen': sum(a['seen'] is None for a in found)}})
         return {'items': items, 'total': total}
 
     def group_members(self, group, gkey):
@@ -340,7 +364,8 @@ class Store:
             for job in jobs:
                 added['jobs'] += insert(db, 'jobs', self.JOB_COLUMNS, job)
             for asset in assets:
-                added['assets'] += insert(db, 'assets', self.ASSET_COLUMNS, asset)
+                # Imported items are history, not new results, so they arrive seen.
+                added['assets'] += insert(db, 'assets', self.ASSET_COLUMNS+('seen',), asset | {'seen': asset.get('seen') or asset.get('created') or now()})
             for preset in presets:
                 added['presets'] += insert(db, 'presets', ('id', 'name', 'data'), preset)
             for table, rows in branches.items():

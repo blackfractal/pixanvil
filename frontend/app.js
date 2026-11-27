@@ -4,7 +4,24 @@ const $=s=>document.querySelector(s);
 const el=(tag,cls,text)=>{const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=text;return n;};
 let workflows=[],presets=[],assets=[],selected=null,metadata=null,favorites=false,offset=0,total=0,lastSignature='',busy=false;
 let sourceAsset=null,endAsset=null,toolCapabilities={};
-let activeJobs=[],latestId='';
+let activeJobs=[],latestId='',latestAsset=null;
+// How many results nobody has viewed yet: all of them (Gallery) and the clips between two images (Branches).
+let unseen={total:0,clips:0};
+// Sound for every player: muted at first, then however the last player was set, kept between visits.
+const sound={muted:true,volume:1};
+try{
+  const kept=JSON.parse(localStorage.getItem('pixanvil.sound')||'null');
+  if(typeof kept?.muted==='boolean')sound.muted=kept.muted;
+  if(Number.isFinite(kept?.volume)&&kept.volume>=0&&kept.volume<=1)sound.volume=kept.volume;
+}catch{}
+function withSound(video){video.muted=sound.muted;video.volume=sound.volume;return video;}
+// volumechange and play do not bubble, so these listen on the way down.
+document.addEventListener('volumechange',e=>{
+  if(!(e.target instanceof HTMLVideoElement))return;
+  sound.muted=e.target.muted;sound.volume=e.target.volume;
+  try{localStorage.setItem('pixanvil.sound',JSON.stringify(sound));}catch{}
+},true);
+document.addEventListener('play',e=>{if(e.target instanceof HTMLVideoElement)withSound(e.target);},true);
 // The queued job the Generate form is editing, if any; the user's own draft waits in stashedDraft meanwhile.
 let editingJob=null,editLocked=false,stashedDraft=null;
 const profiles=['fast','balanced','quality','maximum'];
@@ -13,6 +30,7 @@ async function api(path,method='GET',body){const options={method,headers:{'X-Pix
 function notice(message){$('#notice').hidden=!message;$('#notice').textContent=message;}
 function run(fn){return async(...args)=>{try{await fn(...args);}catch(e){notice(e.message);}};}
 function tab(name){if(!titles[name])name='gallery';
+  if(name==='live'&&latestAsset)markSeen([latestAsset]);
   // The newest clip on Activity plays only while that page is showing.
   if(name!=='live')$('#latest-preview video')?.pause();
   if(name!=='branches')stopBranchVideo();
@@ -271,7 +289,7 @@ $('#gallery-group').onchange=run(async()=>{
 async function openGalleryGroup(group){
   const takes=group.kind==='takes';
   const load=async()=>(await api(`/assets/group?kind=${group.kind}&key=${encodeURIComponent(group.key)}`)).items;
-  const toItem=a=>({id:a.id,take:a.take,video:isVideo(a),seconds:isVideo(a)?clipSeconds(a.recipe):null,prompt:a.recipe.prompt,
+  const toItem=a=>({id:a.id,seen:a.seen,take:a.take,video:isVideo(a),seconds:isVideo(a)?clipSeconds(a.recipe):null,prompt:a.recipe.prompt,
     thumbnail:`/api/assets/${a.id}/thumbnail`,file:`/api/assets/${a.id}/file`});
   const view=found=>{
     const items=found.map(toItem);
@@ -285,13 +303,14 @@ async function openGalleryGroup(group){
   const found=await load();
   if(found.length)openSetViewer(view(found));
 }
-async function refreshGallery(append=false){if(!append)offset=0;const response=await api(`/assets?limit=48&offset=${offset}&favorites=${favorites}&group=${galleryGroup}&q=${encodeURIComponent($('#search').value)}`);total=response.total;assets=append?[...assets,...response.items]:response.items;offset=assets.length;$('#image-count').textContent=`${total} ${galleryGroup?'card':'image'}${total===1?'':'s'}`;$('#empty-gallery').hidden=total>0;$('#load-more').hidden=offset>=total;const grid=$('#gallery-grid');grid.replaceChildren();for(const a of assets){const card=el('button','card');card.setAttribute('aria-label',a.recipe.prompt);const imgWrap=el('div','card-image');const img=el('img');img.src=`/api/assets/${a.id}/thumbnail`;img.alt=a.recipe.prompt;img.loading='lazy';imgWrap.append(img);if(a.favorite)imgWrap.append(el('span','heart','♥'));if(isVideo(a))imgWrap.append(el('span','play',`▶ ${clipSeconds(a.recipe)}s`));const stack=a.group?.count>1;if(a.group)card.dataset.groupKey=a.group.key;if(stack){card.classList.add('stack');imgWrap.append(el('span','stack-count',`×${a.group.count}`));card.setAttribute('aria-label',`${a.group.kind==='batch'?'Batch':'Take set'} of ${a.group.count}: ${a.recipe.prompt}`);}const text=el('div','card-text');text.append(el('strong','',a.recipe.prompt),el('span','',`${a.width} × ${a.height}`));card.append(imgWrap,text,el('small','',`${a.recipe.workflow} / ${new Date(a.created).toLocaleDateString()}`));card.onclick=stack?run(()=>openGalleryGroup(a.group)):()=>openAsset(a);grid.append(card);}renderPending();if(!favorites&&!$('#search').value){if(assets.length)showLatest(assets[0]);else if(latestId===''){$('#latest-preview').replaceChildren(...latestPlaceholder.map(n=>n.cloneNode(true)));$('#latest-caption').textContent='';}}}
+async function refreshGallery(append=false){if(!append)offset=0;const response=await api(`/assets?limit=48&offset=${offset}&favorites=${favorites}&group=${galleryGroup}&q=${encodeURIComponent($('#search').value)}`);total=response.total;assets=append?[...assets,...response.items]:response.items;offset=assets.length;$('#image-count').textContent=`${total} ${galleryGroup?'card':'image'}${total===1?'':'s'}`;$('#empty-gallery').hidden=total>0;$('#load-more').hidden=offset>=total;const grid=$('#gallery-grid');grid.replaceChildren();for(const a of assets){const card=el('button','card');card.setAttribute('aria-label',a.recipe.prompt);const imgWrap=el('div','card-image');const img=el('img');img.src=`/api/assets/${a.id}/thumbnail`;img.alt=a.recipe.prompt;img.loading='lazy';imgWrap.append(img);if(a.favorite)imgWrap.append(el('span','heart','♥'));if(isVideo(a))imgWrap.append(el('span','play',`▶ ${clipSeconds(a.recipe)}s`));const stack=a.group?.count>1;card.dataset.assetId=a.id;const fresh=a.group?a.group.unseen:a.seen?0:1;if(fresh){card.classList.add('unseen');imgWrap.append(el('span','new-badge',stack?`${fresh} new`:'New'));}if(a.group)card.dataset.groupKey=a.group.key;if(stack){card.classList.add('stack');imgWrap.append(el('span','stack-count',`×${a.group.count}`));card.setAttribute('aria-label',`${a.group.kind==='batch'?'Batch':'Take set'} of ${a.group.count}: ${a.recipe.prompt}`);}const text=el('div','card-text');text.append(el('strong','',a.recipe.prompt),el('span','',`${a.width} × ${a.height}`));card.append(imgWrap,text,el('small','',`${a.recipe.workflow} / ${new Date(a.created).toLocaleDateString()}`));card.onclick=stack?run(()=>openGalleryGroup(a.group)):()=>openAsset(a);grid.append(card);}renderPending();run(refreshUnseen)();if(!favorites&&!$('#search').value){if(assets.length)showLatest(assets[0]);else if(latestId===''){$('#latest-preview').replaceChildren(...latestPlaceholder.map(n=>n.cloneNode(true)));$('#latest-caption').textContent='';}}}
 // The Live tab's empty state, restored when its last result is deleted.
 const latestPlaceholder=[...$('#latest-preview').childNodes].map(n=>n.cloneNode(true));
 // The Activity tab shows the newest result: a clip plays in place, an image opens in the viewer.
 function showLatest(a){
-  if(a.id===latestId)return;latestId=a.id;let node;
-  if(isVideo(a)){node=el('video');node.controls=true;node.loop=true;node.playsInline=true;node.poster=`/api/assets/${a.id}/thumbnail`;node.src=`/api/assets/${a.id}/file`;}
+  if(a.id===latestId)return;latestId=a.id;latestAsset=a;let node;
+  if(!$('#live').hidden)markSeen([a]);
+  if(isVideo(a)){node=withSound(el('video'));node.controls=true;node.loop=true;node.playsInline=true;node.poster=`/api/assets/${a.id}/thumbnail`;node.src=`/api/assets/${a.id}/file`;}
   else{node=el('img');node.src=`/api/assets/${a.id}/image`;node.alt=a.recipe.prompt;node.onclick=()=>openAsset(a);}
   $('#latest-preview').replaceChildren(node);$('#latest-caption').textContent=`Latest · ${a.recipe.workflow} · ${a.recipe.prompt.slice(0,160)}`;
 }
@@ -314,9 +333,23 @@ function pendingGroupKey(j){
   if(galleryGroup==='takes'&&r.media==='video'&&r.source_asset_id&&r.end_asset_id)return `${r.source_asset_id}>${r.end_asset_id}`;
   return j.id;
 }
+// A job's progress in a few words, such as "Sampling 6/8".
+function progressWords(j){
+  const p=j.progress;
+  if(j.state==='queued')return 'Queued';
+  if(j.state==='unknown')return 'Needs attention';
+  if(!p?.connected||!p.stage)return 'Rendering';
+  return Number.isFinite(p.max)&&p.max>0?`${p.stage} ${p.value}/${p.max}`:p.stage;
+}
+// Under a gallery stack with more on the way: how far the running job has got, with its bar, and how many wait behind it.
 function onTheWay(jobs){
-  const rendering=jobs.filter(j=>j.state!=='queued').length,queued=jobs.length-rendering;
-  return 'On the way: '+[rendering?`${rendering} rendering`:'',queued?`${queued} queued`:''].filter(Boolean).join(' · ');
+  const running=jobs.filter(j=>j.state!=='queued'),queued=jobs.length-running.length;
+  const parts=running.map(progressWords);
+  if(queued)parts.push(running.length?`${queued} queued behind it`:`${queued} queued`);
+  const box=el('div','stack-pending',`On the way: ${parts.join(' · ')}`);
+  const p=running.map(j=>j.progress).find(p=>p?.connected&&Number.isFinite(p.max)&&p.max>0);
+  if(p){const bar=el('progress');bar.max=p.max;bar.value=p.value;bar.setAttribute('aria-label',p.stage+' progress');box.append(bar);}
+  return box;
 }
 // Jobs that have not produced a result yet appear at the front of the gallery as placeholders. In the Batches and
 // Take sets views they group like finished items: a group that already has a card in the gallery gets an
@@ -329,7 +362,7 @@ function renderPending(){
   const cards=[];
   for(const [key,jobs] of groups){
     const shown=galleryGroup&&grid.querySelector(`.card[data-group-key="${CSS.escape(key)}"]`);
-    if(shown){shown.append(el('small','stack-pending',onTheWay(jobs)));continue;}
+    if(shown){shown.append(onTheWay(jobs));continue;}
     const j=jobs.find(job=>job.state!=='queued')||jobs[0];
     const card=el('div','card pending'),frame=el('div','card-image'),source=j.recipe.source_asset_id||j.recipe.end_asset_id;
     card.tabIndex=0;card.setAttribute('role','button');card.setAttribute('aria-label','Show job details: '+j.recipe.prompt);
@@ -341,15 +374,15 @@ function renderPending(){
     if(jobs.length>1){
       card.classList.add('stack');frame.append(el('span','stack-count',`×${jobs.length}`));
       const more=jobs.length-1,group=galleryGroup==='batch'?'this batch':'this take set';
-      card.append(el('small','stack-pending',`${more} more on the way in ${group}`));
+      card.append(el('small','stack-pending',j.state==='queued'?`${more} more queued in ${group}`:`${more} more in ${group} queued behind it`));
     }
     cards.push(card);
   }
   grid.prepend(...cards);$('#empty-gallery').hidden=total>0||cards.length>0;
 }
 let searchTimer;$('#search').oninput=()=>{clearTimeout(searchTimer);searchTimer=setTimeout(run(()=>refreshGallery()),250);};$('#favorites').onclick=run(async()=>{favorites=true;$('#favorites').classList.add('selected');$('#all-images').classList.remove('selected');await refreshGallery();});$('#all-images').onclick=run(async()=>{favorites=false;$('#all-images').classList.add('selected');$('#favorites').classList.remove('selected');await refreshGallery();});$('#load-more').onclick=run(()=>refreshGallery(true));
-function openAsset(a){selected=a;const video=isVideo(a),file=`/api/assets/${a.id}/file`;$('#full-image').hidden=video;$('#full-video').hidden=!video;
-  if(video){if(!$('#full-video').src.endsWith(file)){$('#full-video').poster=`/api/assets/${a.id}/thumbnail`;$('#full-video').src=file;}}else{$('#full-video').removeAttribute('src');$('#full-image').src=file;$('#full-image').alt=a.recipe.prompt;}
+function openAsset(a){selected=a;markSeen([a]);const video=isVideo(a),file=`/api/assets/${a.id}/file`;$('#full-image').hidden=video;$('#full-video').hidden=!video;
+  if(video){withSound($('#full-video'));if(!$('#full-video').src.endsWith(file)){$('#full-video').poster=`/api/assets/${a.id}/thumbnail`;$('#full-video').src=file;}}else{$('#full-video').removeAttribute('src');$('#full-image').src=file;$('#full-image').alt=a.recipe.prompt;}
   $('#image-prompt').textContent=a.recipe.prompt;$('#image-details').replaceChildren();const details={Operation:a.recipe.operation||'txt2img',Model:a.recipe.model,Seed:a.recipe.seed,Size:`${a.width} × ${a.height}`,Steps:a.recipe.steps,Guidance:a.recipe.cfg,Workflow:a.recipe.workflow,File:a.path};if(video)details.Length=`${clipSeconds(a.recipe)} s · ${a.recipe.frames} frames at ${a.recipe.fps} fps`;if(a.recipe.operation==='variation'){details['Variation seed']=a.recipe.variation_seed;details.Strength=a.recipe.variation_strength;}if(a.recipe.operation==='refine')details.Denoise=a.recipe.denoise;if(a.recipe.refinement)details['Second model']=a.recipe.refinement.model;for(const [k,v]of Object.entries(details)){ $('#image-details').append(el('dt','',k),el('dd','',String(v)));}$('#image-recipe').textContent=JSON.stringify(a.recipe,null,2);$('#download-image').href=file;$('#download-image').download=a.id+(video?'.mp4':'.png');$('#download-image').textContent=video?'Download MP4':'Download PNG';$('#refine-image').disabled=$('#upscale-image').disabled=$('#animate-image').disabled=$('#edit-image').disabled=video;$('#frame-image').hidden=!video;$('#reuse-image').disabled=a.recipe.operation==='sequence';$('#favorite-image').textContent=a.favorite?'♥ Favorited':'♡ Favorite';$('#parent-image').hidden=!a.recipe.parent_asset_id;$('#vary-image').disabled=video||!['txt2img','variation'].includes(a.recipe.operation||'txt2img');run(updateBranchButton)(a);if(!$('#viewer').open)$('#viewer').showModal();}
 // Left and right arrows step through the gallery in its displayed order, loading more as needed.
 $('#viewer').addEventListener('keydown',run(async e=>{
@@ -509,7 +542,7 @@ async function refreshJobs(){
   }
   $('#footer-status').textContent=active.length?`${active.length} active job(s) · progress updates every 2 seconds`:'Your library stays on this machine.';
   // Newest first, matching the gallery's order.
-  activeJobs=active;renderPending();
+  activeJobs=active;renderPending();updateBranchLabels();
   // An open job details dialog follows the job until it finishes.
   const shown=$('#job-dialog').open&&jobs.find(j=>j.id===openJobId);
   if(shown)showJob(shown,active);
@@ -545,6 +578,7 @@ async function loadTrees(){
     const frame=el('div','card-image');
     if(t.thumbnail){const img=el('img');img.src=t.thumbnail;img.alt='';img.loading='lazy';frame.append(img);}
     if(t.pending)frame.append(el('span','play',`${t.pending} rendering`));
+    if(t.unseen)frame.append(el('span','new-badge',`${t.unseen} new`));
     const text=el('div','card-text');text.append(el('strong','',t.name),el('span','',`${count(t.clips,'clip','clips')} · ${t.seconds} s of footage`));
     card.append(frame,text,el('small','',`${count(t.nodes,'image','images')} / ${new Date(t.updated).toLocaleDateString()}`));
     card.onclick=()=>{branchOpenId=t.id;run(showBranches)();};
@@ -634,9 +668,9 @@ function branchStyle(){
     // Orange and green mean queued and generating here, as on the History tab, so selection is blue.
     {selector:'node:selected',style:{'border-color':SELECTED,'border-width':3,opacity:1}},
     {selector:'edge',style:{'curve-style':'bezier','control-point-step-size':40,width:3,'line-color':'#5b6450','target-arrow-shape':'triangle','target-arrow-color':'#5b6450',
-      label:'data(label)',color:'#cbd0c3','font-size':10,'text-background-color':'#101210','text-background-opacity':1,'text-background-padding':3}},
-    // Dotted: no finished take yet. Orange: takes queued. Blinking: a take generating now, green when nothing is
-    // queued after it. Together the orange lines show the whole queue and the blinking one shows what runs now.
+      label:'data(label)','text-wrap':'wrap',color:'#cbd0c3','font-size':10,'text-background-color':'#101210','text-background-opacity':1,'text-background-padding':3}},
+    // Dotted: no finished take yet. Orange: takes queued. Pulsing: a take generating now, green when nothing is
+    // queued after it. Together the orange lines show the whole queue and the pulsing one shows what runs now.
     {selector:'edge.pending',style:{'line-style':'dashed'}},
     // Both ways between two images: straight, with endpoints set by placeTwoWay so the pair runs side by side.
     {selector:'edge.two-way',style:{'curve-style':'straight'}},
@@ -644,7 +678,8 @@ function branchStyle(){
     {selector:'edge.self',style:{'loop-direction':'0deg','loop-sweep':'-100deg','control-point-step-size':110,'source-endpoint':'50% -25%','target-endpoint':'-50% -25%'}},
     {selector:'edge.rendering',style:{'line-color':GENERATING,'target-arrow-color':GENERATING}},
     {selector:'edge.queued',style:{'line-color':accent,'target-arrow-color':accent}},
-    {selector:'edge.rendering.blink',style:{'line-opacity':.3}},
+    // A take nobody has played yet: its label is bright and starts with "new".
+    {selector:'edge.unseen',style:{color:'#f4f1e8','font-weight':'bold'}},
     // In the chain builder, the connections that can be added next.
     {selector:'edge.next-step',style:{'line-color':SELECTED,'target-arrow-color':SELECTED,width:5,'line-opacity':1}},
     {selector:'edge:selected',style:{'line-color':SELECTED,'target-arrow-color':SELECTED,width:4}},
@@ -666,9 +701,36 @@ function branchStyle(){
     {selector:'edge.drag-line.from-left',style:{'target-endpoint':'-50% 0%'}},
   ];
 }
-// The blink of rendering connections. A system asking for reduced motion gets a steady line; the label still says rendering.
+// Rendering connections pulse like a headlamp: a quick fade up, then a slower fade down. A system asking for reduced
+// motion gets a steady line; the label still says how far the take has got.
 const calmMotion=matchMedia('(prefers-reduced-motion: reduce)');
-setInterval(()=>{if(cy&&!calmMotion.matches&&!$('#branches').hidden)cy.edges('.rendering').toggleClass('blink');},700);
+const PULSE_UP=300,PULSE_DOWN=900,PULSE_LOW=.2;
+let pulsing=null;
+setInterval(()=>{
+  if(!cy||$('#branches').hidden)return;
+  const edges=cy.edges('.rendering');
+  // A connection that stopped rendering loses the opacity the pulse gave it.
+  pulsing?.difference(edges).removeStyle('line-opacity');pulsing=edges;
+  if(calmMotion.matches){edges.removeStyle('line-opacity');return;}
+  const t=performance.now()%(PULSE_UP+PULSE_DOWN);
+  const level=t<PULSE_UP?Math.sin(t/PULSE_UP*Math.PI/2):(1+Math.cos((t-PULSE_UP)/PULSE_DOWN*Math.PI))/2;
+  edges.style('line-opacity',PULSE_LOW+(1-PULSE_LOW)*level);
+},40);
+// How far a connection's running take has got, such as "sampling video 6/8", from the live job list.
+function renderingWords(p){
+  const clip=p.pending.find(c=>c.state!=='queued'),job=clip&&activeJobs.find(j=>j.id===clip.job_id);
+  // "Sampling video 6/8" becomes "sampling 6/8": the connection is already a clip, and its label has little room.
+  const words=(job?progressWords(job):'Rendering').replace(/ (video|image)\b/i,'');
+  return words[0].toLowerCase()+words.slice(1);
+}
+// Connection labels change with progress and as takes are viewed, without redrawing the graph.
+function updateBranchLabels(){
+  if(!cy)return;
+  for(const p of branchPairs.values()){
+    const edge=cy.getElementById(p.id);if(!edge.length)continue;
+    edge.data('label',pairCaption(p));edge.toggleClass('unseen',p.takes.some(c=>!c.seen));
+  }
+}
 // The text under a node: its label, and its state when it has no picture.
 function nodeCaption(n){
   const state={pending:'Rendering…',missing:'Deleted image'}[n.kind]||(n.available?'':'No saved frame');
@@ -696,15 +758,16 @@ function setPairs(tree){
     for(const c of [...pair.takes,...pair.pending])pairByClip.set(c.id,pair);
   }
 }
-// The stats label: the preferred take's length and its number among the takes, then what is still on the way.
-// A custom label replaces all of it.
+// The stats label: the preferred take's length and its number among the takes, then, on a second line, what is
+// still on the way. A custom label replaces the first line.
 function pairCaption(p){
-  if(p.labelMode==='custom'&&p.label)return p.label;
-  const parts=[];
-  if(p.preferred)parts.push(`${p.preferred.seconds} s`+(p.takes.length>1?` · take ${p.preferred.take} · ${p.takes.length} takes`:''));
-  if(p.rendering)parts.push('rendering');
-  if(p.queued)parts.push(p.preferred||p.rendering?`+${p.queued} queued`:p.queued>1?`${p.queued} queued`:'queued');
-  return parts.join(' · ');
+  const fresh=p.takes.filter(c=>!c.seen).length,isNew=fresh>1?`${fresh} new`:fresh?'new':'';
+  const parts=isNew?[isNew]:[],coming=[];
+  if(p.labelMode==='custom'&&p.label)parts.push(p.label);
+  else if(p.preferred)parts.push(`${p.preferred.seconds} s`+(p.takes.length>1?` · take ${p.preferred.take} · ${p.takes.length} takes`:''));
+  if(p.rendering)coming.push(renderingWords(p));
+  if(p.queued)coming.push(p.preferred||p.rendering?`+${p.queued} queued`:p.queued>1?`${p.queued} queued`:'queued');
+  return [parts.join(' · '),coming.join(' · ')].filter(Boolean).join('\n');
 }
 function pairName(p){return `${nodeName(p.source)} → ${nodeName(p.target)}`;}
 // Connections both ways between two images are two straight parallel lines, each shifted to the left of its own
@@ -730,7 +793,7 @@ async function drawTree(tree,fit){
     ...tree.nodes.map(n=>({group:'nodes',classes:n.kind,position:{...positions[n.id]},
       data:{id:n.id,label:nodeCaption(n),...(n.thumbnail?{thumb:n.thumbnail}:{})}})),
     ...[...branchPairs.values()].map(p=>({group:'edges',
-      classes:[p.preferred?'':'pending',p.rendering?'rendering':'',p.queued?'queued':'',p.source===p.target?'self':branchPairs.has(p.target+'>'+p.source)?'two-way':''].join(' ').trim(),
+      classes:[p.preferred?'':'pending',p.rendering?'rendering':'',p.takes.some(c=>!c.seen)?'unseen':'',p.queued?'queued':'',p.source===p.target?'self':branchPairs.has(p.target+'>'+p.source)?'two-way':''].join(' ').trim(),
       data:{id:p.id,source:p.source,target:p.target,label:pairCaption(p)}})),
   ];
   if(!cy){
@@ -813,22 +876,22 @@ function stopBranchVideo(){
   cy?.edges().removeClass('playing');chainPlaying=null;
 }
 function playOne(container,clip){
-  stopVideos(container);
-  const video=el('video');video.controls=true;video.loop=true;video.playsInline=true;video.poster=clip.thumbnail;video.src=clip.file;
+  stopVideos(container);markSeen([clip]);
+  const video=withSound(el('video'));video.controls=true;video.loop=true;video.playsInline=true;video.poster=clip.thumbnail;video.src=clip.file;
   container.replaceChildren(video);video.play().catch(()=>{});
 }
 // Plays clips back to back and loops. Two players take turns: while one plays, the other loads the next clip,
 // so each join waits as little as possible. caption(i, pass) gets the pass number, so a loop can say it has looped.
 function playClips(container,clips,{captionEl,caption,onShow}){
   stopVideos(container);
-  const players=[0,1].map(()=>{const v=el('video');v.controls=true;v.playsInline=true;v.preload='auto';v.hidden=true;return v;});
+  const players=[0,1].map(()=>{const v=withSound(el('video'));v.controls=true;v.playsInline=true;v.preload='auto';v.hidden=true;return v;});
   container.replaceChildren(...players);
   let active=0,index=0,pass=1;
   const load=(player,i)=>{player.poster=clips[i].thumbnail;player.src=clips[i].file;};
   const show=()=>{
     const current=players[active],other=players[1-active];
     other.pause();other.hidden=true;current.hidden=false;
-    current.play().catch(()=>{});
+    markSeen([clips[index]]);withSound(current).play().catch(()=>{});
     load(other,(index+1)%clips.length);
     captionEl.textContent=caption(index,pass);
     onShow?.(clips[index],index);
@@ -1177,7 +1240,7 @@ function takeList(p,playing){
   const list=el('div','take-list');
   for(const take of p.takes){
     const row=el('div','take-row'+(take===playing?' playing':''));
-    const play=el('button','take-play',`Take ${take.take} · ${take.seconds} s · ${take.prompt}`);play.type='button';play.title=take.prompt;
+    const play=el('button','take-play',`Take ${take.take} · ${take.seconds} s${take.seen===false?' · new':''} · ${take.prompt}`);play.type='button';play.title=take.prompt;
     play.onclick=()=>showBranchPair(p,take);
     const star=el('button','take-icon',take.preferred?'★':'☆');star.type='button';star.disabled=take.preferred;
     star.title=take.preferred?'The preferred take':'Make this the preferred take';star.setAttribute('aria-label',star.title);
@@ -1403,7 +1466,7 @@ function renderSetActions(){
   $('#set-actions').replaceChildren(...actions);
 }
 function playSetItem(item){
-  setView.playing=item;setView.playingAll=false;
+  setView.playing=item;setView.playingAll=false;markSeen([item]);
   if(item.video===false){stopVideos($('#set-player'));const img=el('img');img.src=item.file;img.alt=item.prompt;$('#set-player').replaceChildren(img);}
   else playOne($('#set-player'),item);
   $('#set-caption').textContent=`${setView.label(item)} · ${item.prompt}`;
@@ -1664,4 +1727,36 @@ $('#verify-history-file').onchange=run(async()=>{
     $('#history-result-eyebrow').textContent='BACKUP CHECKED';$('#history-result-title').textContent=r.missing.length?'Readable, but incomplete.':'This backup is complete and intact.';
     $('#history-result-body').replaceChildren(...body);$('#history-result').showModal();
   }finally{historyBusy(false);}
+});
+
+// ---- Unviewed results: a job's results start unseen, and count as seen once opened, played or shown on Activity. ----
+async function refreshUnseen(){unseen=await api('/assets/unseen');showUnseen();}
+function showUnseen(){
+  for(const [name,n,what] of [['gallery',unseen.total,'result'],['branches',unseen.clips,'clip']]){
+    const nav=document.querySelector(`.nav[data-tab="${name}"]`);
+    let badge=nav.querySelector('.new-count');
+    if(!badge){badge=el('b','new-count');nav.querySelector('kbd').before(badge);}
+    badge.hidden=!n;badge.textContent=n;badge.title=`${count(n,'new '+what,'new '+what+'s')} not viewed yet`;
+  }
+  $('#mark-all-seen').hidden=!unseen.total;
+}
+// Marks items (gallery items or Branches clips) as viewed. Items already seen are skipped, so this costs nothing
+// when it is called on every play.
+function markSeen(items){
+  const fresh=items.filter(item=>item&&!item.seen);
+  if(!fresh.length)return;
+  for(const item of fresh){
+    item.seen=true;
+    const clip=clipById.get(item.id);if(clip)clip.seen=true;
+    const card=document.querySelector(`#gallery-grid .card:not(.stack)[data-asset-id="${CSS.escape(item.id)}"]`);
+    if(card){card.classList.remove('unseen');card.querySelector('.new-badge')?.remove();}
+  }
+  updateBranchLabels();
+  run(async()=>{unseen=await api('/assets/seen','POST',{ids:fresh.map(item=>item.id)});showUnseen();})();
+}
+$('#mark-all-seen').onclick=run(async()=>{
+  unseen=await api('/assets/seen','POST',{all:true});showUnseen();
+  for(const clip of clipById.values())clip.seen=true;
+  updateBranchLabels();
+  await refreshGallery();
 });

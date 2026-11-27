@@ -122,7 +122,7 @@ def build(assets, active_jobs, added, has_last_frame):
             target_id = virtual(clip, 'last')
         clips.append({'id': clip['id'], 'source': start_id, 'target': target_id, 'pending': False,
                       'seconds': clip_seconds(recipe), 'prompt': recipe.get('prompt', ''),
-                      'workflow': recipe.get('workflow'), 'created': clip['created'],
+                      'workflow': recipe.get('workflow'), 'created': clip['created'], 'seen': clip.get('seen') is not None,
                       'thumbnail': f'/api/assets/{clip["id"]}/thumbnail', 'file': f'/api/assets/{clip["id"]}/file'})
 
     # Clips still on their way are drawn dashed, ending at a placeholder until they finish.
@@ -235,6 +235,7 @@ def summary(tree, nodes, names):
     return {'id': tree['id'], 'name': names.get(name_key(tree, nodes, names)) or tree['root']['prompt'][:80] or 'Untitled tree',
             'thumbnail': tree['root']['thumbnail'], 'nodes': sum(1 for n in tree['nodes'] if nodes[n]['kind'] != 'pending'),
             'clips': len(finished), 'pending': len(tree['clips'])-len(finished),
+            'unseen': sum(1 for c in finished if not c['seen']),
             'connections': len({(c['source'], c['target']) for c in finished}),
             'seconds': round(sum(c['seconds'] or 0 for c in finished), 1),
             'updated': max([nodes[n]['created'] for n in tree['nodes']]+[c['created'] for c in tree['clips']])}
