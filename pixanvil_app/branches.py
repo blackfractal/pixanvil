@@ -19,8 +19,13 @@ def parse_frame_asset_id(asset_id):
     return (clip_id, which) if clip_id and which in ('first', 'last') else None
 
 
+def split_asset_id(clip_id, frame):
+    """The id of the image a split is: the frame's number in its clip, so splitting there again finds it."""
+    return f'frame-{clip_id}-at{int(frame)}'
+
+
 def frame_of(asset):
-    """'first' or 'last' for an image saved from a clip's frame, otherwise None.
+    """'first' or 'last' for an image saved from a clip's frame, the frame's number for a split, otherwise None.
 
     Frames saved before last frames existed carry no `frame` field; they are all first frames."""
     recipe = asset['recipe']
@@ -67,10 +72,12 @@ def build(assets, active_jobs, added, has_last_frame):
 
     `has_last_frame(clip)` reports whether a clip's last frame was saved beside it."""
     by_id = {a['id']: a for a in assets}
-    frames = {}
+    frames, splits = {}, {}
     for asset in assets:
         which = frame_of(asset)
-        if which:
+        if isinstance(which, int):
+            splits.setdefault(asset['recipe']['parent_asset_id'], []).append(asset)
+        elif which:
             frames.setdefault((asset['recipe']['parent_asset_id'], which), asset)
     added = set(added)
     nodes, clips = {}, []
@@ -120,10 +127,24 @@ def build(assets, active_jobs, added, has_last_frame):
             target_id = real(last)
         else:
             target_id = virtual(clip, 'last')
-        clips.append({'id': clip['id'], 'source': start_id, 'target': target_id, 'pending': False,
-                      'seconds': clip_seconds(recipe), 'prompt': recipe.get('prompt', ''),
-                      'workflow': recipe.get('workflow'), 'created': clip['created'], 'seen': clip.get('seen') is not None,
-                      'thumbnail': f'/api/assets/{clip["id"]}/thumbnail', 'file': f'/api/assets/{clip["id"]}/file'})
+        made = {'pending': False, 'prompt': recipe.get('prompt', ''), 'workflow': recipe.get('workflow'), 'fps': recipe.get('fps'),
+                'seen': clip.get('seen') is not None, 'file': f'/api/assets/{clip["id"]}/file'}
+        clips.append(made | {'id': clip['id'], 'source': start_id, 'target': target_id, 'seconds': clip_seconds(recipe),
+                             'created': clip['created'], 'thumbnail': f'/api/assets/{clip["id"]}/thumbnail'})
+        # Each split adds two pieces of the whole take, through the split's image: start to F, and F to the end.
+        # A piece is the take's file played over a frame range; F is the last frame of one and the first of the other.
+        for split in sorted(splits.get(clip['id'], []), key=lambda s: s['recipe']['frame']):
+            r = split['recipe']
+            frame, fps, total = r['frame'], r['fps'], r['clip_frames']
+            middle = real(split)
+            nodes[middle]['split'] = {'clip': clip['id'], 'frame': frame, 'frames': total, 'fps': fps}
+            for side, source, target, low, high in (('before', start_id, middle, 0, frame+1), ('after', middle, target_id, frame, total)):
+                clips.append(made | {
+                    'id': f'piece:{split["id"]}:{side}', 'source': source, 'target': target, 'created': split['created'],
+                    'seconds': round((high-low)/fps, 1),
+                    'thumbnail': f'/api/assets/{clip["id"] if side == "before" else split["id"]}/thumbnail',
+                    'piece': {'clip': clip['id'], 'split': split['id'], 'start_frame': low, 'end_frame': high,
+                              'start': low/fps, 'end': high/fps}})
 
     # Clips still on their way are drawn dashed, ending at a placeholder until they finish.
     for job in active_jobs:
@@ -231,12 +252,13 @@ def name_key(tree, nodes, names):
 
 
 def summary(tree, nodes, names):
-    finished = [c for c in tree['clips'] if not c['pending']]
+    # Pieces are parts of takes already counted, so clips and footage count whole takes only.
+    finished = [c for c in tree['clips'] if not c['pending'] and not c.get('piece')]
     return {'id': tree['id'], 'name': names.get(name_key(tree, nodes, names)) or tree['root']['prompt'][:80] or 'Untitled tree',
             'thumbnail': tree['root']['thumbnail'], 'nodes': sum(1 for n in tree['nodes'] if nodes[n]['kind'] != 'pending'),
-            'clips': len(finished), 'pending': len(tree['clips'])-len(finished),
+            'clips': len(finished), 'pending': sum(1 for c in tree['clips'] if c['pending']),
             'unseen': sum(1 for c in finished if not c['seen']),
-            'connections': len({(c['source'], c['target']) for c in finished}),
+            'connections': len({(c['source'], c['target']) for c in tree['clips'] if not c['pending']}),
             'seconds': round(sum(c['seconds'] or 0 for c in finished), 1),
             'updated': max([nodes[n]['created'] for n in tree['nodes']]+[c['created'] for c in tree['clips']])}
 
@@ -272,8 +294,14 @@ def chain_steps(tree, nodes, clip_ids):
     """A chain as saved: each step's clip and the image keys it joins, so a step whose take is deleted later can
     use another take between the same two images. The clips must be in the tree (see chain_errors)."""
     clips = {c['id']: c for c in tree['clips']}
-    return [{'clip': i, 'start_key': label_key(nodes[clips[i]['source']]), 'end_key': label_key(nodes[clips[i]['target']])}
-            for i in clip_ids]
+    def step(i):
+        found = {'clip': i, 'start_key': label_key(nodes[clips[i]['source']]), 'end_key': label_key(nodes[clips[i]['target']])}
+        # A piece also records its take and exact frames, which say what played even if the split is removed later.
+        piece = clips[i].get('piece')
+        if piece:
+            found |= {'take': piece['clip'], 'start_frame': piece['start_frame'], 'end_frame': piece['end_frame']}
+        return found
+    return [step(i) for i in clip_ids]
 
 
 def tree_chains(tree, nodes, chains):
@@ -344,3 +372,21 @@ def plan_export(tree, nodes, selected, labels):
         'skipped': skipped,
     }
     return images, clips, graph
+
+
+def split_users(split_id, clips, chains):
+    """What keeps a split from being removed: clips and jobs that start or end on its image, other than its own two
+    pieces, and saved chains through it. Returns readable reasons; none means it can be removed."""
+    users = [c for c in clips if split_id in (c.get('source_key'), c.get('target_key'))
+             and (c.get('piece') or {}).get('split') != split_id]
+    reasons = []
+    finished = sum(1 for c in users if not c['pending'])
+    if finished:
+        reasons.append('1 clip starts or ends on it' if finished == 1 else f'{finished} clips start or end on it')
+    if len(users) > finished:
+        waiting = len(users)-finished
+        reasons.append('1 clip on the way uses it' if waiting == 1 else f'{waiting} clips on the way use it')
+    named = [c['name'] for c in chains if any(split_id in (s.get('start_key'), s.get('end_key')) for s in c['steps'])]
+    if named:
+        reasons.append('saved chains go through it: '+', '.join(named))
+    return reasons

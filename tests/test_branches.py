@@ -453,3 +453,95 @@ def test_gallery_groups_batches_and_take_sets(setup):
     assert next(i for i in grouped('takes')['items'] if i['group']['count']==2)['id']==second['id']
     members=client.get('/api/assets/group',params={'kind':'takes','key':takes['group']['key']}).json()['items']
     assert [(m['id'],m['take'],m['preferred']) for m in members]==[(first['id'],1,False),(second['id'],2,True)]
+
+
+def split_setup(setup):
+    """Images a and b, and a real 2 s, 48-frame take from a to b."""
+    app,client=setup
+    a,b=add_image(client,(20,60,120),'a'),add_image(client,(90,30,10),'b')
+    take=clip(app,client,a,end=b)
+    real_video(Path(take['root'])/take['path'],seconds=2)
+    return app,client,a,b,take
+
+
+def test_split_keeps_the_take_and_adds_two_piece_take_sets(setup):
+    app,client,a,b,take=split_setup(setup)
+    response=client.post('/api/branches/splits',headers=HEADERS,json={'clip_id':take['id'],'frame':20})
+    assert response.status_code==201,response.text
+    split=response.json()
+    assert split['id']==f'frame-{take["id"]}-at20'
+    assert (split['recipe']['frame'],split['recipe']['clip_frames'],split['recipe']['parent_asset_id'])==(20,48,take['id'])
+    # Splitting there again finds the same image.
+    assert client.post('/api/branches/splits',headers=HEADERS,json={'clip_id':take['id'],'frame':20}).json()['id']==split['id']
+    found=tree(client,a['id'])
+    clips={c['id']:c for c in found['clips']}
+    before,after=clips[f'piece:{split["id"]}:before'],clips[f'piece:{split["id"]}:after']
+    assert clips[take['id']]['source']==a['id'] and clips[take['id']]['target']==b['id']
+    assert (before['source'],before['target'],after['source'],after['target'])==(a['id'],split['id'],split['id'],b['id'])
+    assert (before['piece']['start_frame'],before['piece']['end_frame'],after['piece']['start_frame'],after['piece']['end_frame'])==(0,21,20,48)
+    assert before['file']==after['file']==clips[take['id']]['file']
+    # Each piece is take 1, preferred, of its own pair.
+    assert (before['take'],before['preferred'],after['take'],after['preferred'])==(1,True,1,True)
+    node=next(n for n in found['nodes'] if n['id']==split['id'])
+    assert node['split']['clip']==take['id'] and node['split']['frame']==20 and node['split']['in_use']==[]
+    # Pieces are parts of the take: the tree counts one clip of footage, but draws three connections.
+    listed=client.get('/api/branches').json()['items'][0]
+    assert (listed['clips'],listed['pending'],listed['connections'])==(1,0,3)
+    # The first and last frames are the take's own ends.
+    for frame in (0,47):
+        assert client.post('/api/branches/splits',headers=HEADERS,json={'clip_id':take['id'],'frame':frame}).status_code==422
+
+
+def test_pieces_join_and_export_as_frame_ranges(setup):
+    from pixanvil_app import sequence
+    import zipfile
+    app,client,a,b,take=split_setup(setup)
+    split=client.post('/api/branches/splits',headers=HEADERS,json={'clip_id':take['id'],'frame':20}).json()
+    pieces=[f'piece:{split["id"]}:before',f'piece:{split["id"]}:after']
+    joined=client.post('/api/branches/sequence',headers=HEADERS,json={'clips':pieces})
+    assert joined.status_code==201,joined.text
+    made=sequence.probe(Path(joined.json()['root'])/joined.json()['path'])
+    # 21 frames, then 28 less the repeated frame 20: the whole take again.
+    assert abs(made.seconds-48/24)<0.1
+    response=client.post('/api/branches/export',headers=HEADERS,json={'items':[pieces[0]]})
+    assert response.status_code==200,response.text
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        name=next(n for n in archive.namelist() if n.startswith('clips/'))
+        out=Path(setup[0].state.config.state)/'piece.mp4'; out.write_bytes(archive.read(name))
+    assert abs(sequence.probe(out).seconds-21/24)<0.1
+
+
+def test_remove_split_only_when_nothing_else_uses_it(setup):
+    app,client,a,b,take=split_setup(setup)
+    split=client.post('/api/branches/splits',headers=HEADERS,json={'clip_id':take['id'],'frame':20}).json()
+    onward=clip(app,client,split)
+    node=next(n for n in tree(client,a['id'])['nodes'] if n['id']==split['id'])
+    assert node['split']['in_use']==['1 clip starts or ends on it']
+    refused=client.delete('/api/branches/splits/'+split['id'],headers=HEADERS)
+    assert refused.status_code==409 and 'in use' in refused.json()['detail']
+    # Deleting what came off it keeps the split.
+    client.delete('/api/assets/'+onward['id'],headers=HEADERS)
+    assert any(n['id']==split['id'] for n in tree(client,a['id'])['nodes'])
+    assert client.delete('/api/branches/splits/'+split['id'],headers=HEADERS).status_code==200
+    clips={c['id'] for c in tree(client,a['id'])['clips']}
+    assert clips=={take['id']}
+
+
+def test_a_split_in_use_cannot_be_deleted_from_the_gallery_either(setup):
+    app,client,a,b,take=split_setup(setup)
+    split=client.post('/api/branches/splits',headers=HEADERS,json={'clip_id':take['id'],'frame':20}).json()
+    onward=clip(app,client,split)
+    refused=client.delete('/api/assets/'+split['id'],headers=HEADERS)
+    assert refused.status_code==409 and '1 clip starts or ends on it' in refused.json()['detail']
+    client.delete('/api/assets/'+onward['id'],headers=HEADERS)
+    assert client.delete('/api/assets/'+split['id'],headers=HEADERS).status_code==200
+
+
+def test_saved_chains_through_pieces_keep_the_take_and_frames(setup):
+    app,client,a,b,take=split_setup(setup)
+    split=client.post('/api/branches/splits',headers=HEADERS,json={'clip_id':take['id'],'frame':20}).json()
+    pieces=[f'piece:{split["id"]}:before',f'piece:{split["id"]}:after']
+    saved=client.post('/api/branches/chains',headers=HEADERS,json={'name':'Rejoined','clips':pieces}).json()
+    assert saved['steps']==[
+        {'clip':pieces[0],'start_key':a['id'],'end_key':split['id'],'take':take['id'],'start_frame':0,'end_frame':21},
+        {'clip':pieces[1],'start_key':split['id'],'end_key':b['id'],'take':take['id'],'start_frame':20,'end_frame':48}]

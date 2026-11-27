@@ -5,6 +5,8 @@ const el=(tag,cls,text)=>{const n=document.createElement(tag);if(cls)n.className
 let workflows=[],presets=[],assets=[],selected=null,metadata=null,favorites=false,offset=0,total=0,lastSignature='',busy=false;
 let sourceAsset=null,endAsset=null,toolCapabilities={};
 let activeJobs=[],latestId='',latestAsset=null;
+// The take playing alone in the Branches panel, whose frames the arrow keys step through while it is showing.
+let frameClip=null;
 // How many results nobody has viewed yet: all of them (Gallery) and the clips between two images (Branches).
 let unseen={total:0,clips:0};
 // Sound for every player: muted at first, then however the last player was set, kept between visits.
@@ -592,7 +594,8 @@ async function loadTree(id){
   $('#tree-picker').hidden=true;$('#tree-view').hidden=false;
   if(document.activeElement!==$('#tree-name'))$('#tree-name').value=tree.name;
   setPairs(tree);
-  const finished=tree.clips.filter(c=>!c.pending).length;
+  // Pieces are parts of takes already counted.
+  const finished=tree.clips.filter(c=>!c.pending&&!c.piece).length;
   $('#tree-summary').textContent=`${count(tree.connections,'connection','connections')} · ${count(finished,'clip','clips')} · ${tree.seconds} s of footage`+(tree.pending?` · ${tree.pending} on the way`:'');
   const signature=JSON.stringify([tree.nodes,tree.clips]);
   if(fresh||signature!==branchSignature){branchSignature=signature;await drawTree(tree,fresh);}
@@ -870,15 +873,37 @@ function clearBranchPanel(){
   }
   $('#branch-info').append(el('span','eyebrow',`SAVED CHAINS · ${chains.length}`),list);
 }
-function stopVideos(container){container.querySelectorAll('video').forEach(v=>{v.onended=null;v.pause();});}
+function stopVideos(container){container.querySelectorAll('video').forEach(v=>{v.onended=null;v.pause();ranges.delete(v);});}
+// A piece of a take plays only its frame range of the take's file: it starts on its first frame, and atEnd runs as it
+// reaches its last. Checked on every frame the browser shows (requestVideoFrameCallback), so the end lands on its frame.
+const ranges=new WeakMap();
+function followRange(video,clip,atEnd){
+  const p=clip.piece;
+  if(!p){ranges.delete(video);return;}
+  ranges.set(video,p);
+  // Half a frame: aiming at the middle of a frame shows that frame, where its exact start can round to the one before.
+  const half=(p.end-p.start)/(p.end_frame-p.start_frame)/2;
+  video.addEventListener('loadedmetadata',()=>{if(ranges.get(video)===p)video.currentTime=p.start+half;},{once:true});
+  const check=()=>{
+    if(ranges.get(video)!==p||!video.isConnected)return;
+    if(!video.paused&&video.currentTime>=p.end-half)atEnd();
+    else if(video.currentTime<p.start-half)video.currentTime=p.start+half;
+    watch();
+  };
+  const watch=()=>video.requestVideoFrameCallback?video.requestVideoFrameCallback(check):setTimeout(check,30);
+  watch();
+}
 function stopBranchVideo(){
-  stopVideos($('#branch-preview'));
+  stopVideos($('#branch-preview'));frameClip=null;
   cy?.edges().removeClass('playing');chainPlaying=null;
 }
 function playOne(container,clip){
   stopVideos(container);markSeen([clip]);
   const video=withSound(el('video'));video.controls=true;video.loop=true;video.playsInline=true;video.poster=clip.thumbnail;video.src=clip.file;
+  // A piece loops over its own range.
+  if(clip.piece){video.loop=false;followRange(video,clip,()=>{video.currentTime=clip.piece.start;video.play().catch(()=>{});});}
   container.replaceChildren(video);video.play().catch(()=>{});
+  return video;
 }
 // Plays clips back to back and loops. Two players take turns: while one plays, the other loads the next clip,
 // so each join waits as little as possible. caption(i, pass) gets the pass number, so a loop can say it has looped.
@@ -887,7 +912,7 @@ function playClips(container,clips,{captionEl,caption,onShow}){
   const players=[0,1].map(()=>{const v=withSound(el('video'));v.controls=true;v.playsInline=true;v.preload='auto';v.hidden=true;return v;});
   container.replaceChildren(...players);
   let active=0,index=0,pass=1;
-  const load=(player,i)=>{player.poster=clips[i].thumbnail;player.src=clips[i].file;};
+  const load=(player,i)=>{player.poster=clips[i].thumbnail;player.src=clips[i].file;followRange(player,clips[i],()=>advance(player));};
   const show=()=>{
     const current=players[active],other=players[1-active];
     other.pause();other.hidden=true;current.hidden=false;
@@ -896,10 +921,13 @@ function playClips(container,clips,{captionEl,caption,onShow}){
     captionEl.textContent=caption(index,pass);
     onShow?.(clips[index],index);
   };
-  for(const player of players)player.onended=()=>{
+  // The next clip starts when this one ends, or when a piece reaches the end of its range.
+  const advance=player=>{
     if(player!==players[active])return;
+    player.pause();
     active=1-active;index=(index+1)%clips.length;if(index===0)pass++;show();
   };
+  for(const player of players)player.onended=()=>advance(player);
   load(players[0],0);show();
 }
 function highlightPlaying(clip){
@@ -1204,12 +1232,14 @@ function chainHeading(clips){
 function showBranchPair(p,playing=p?.preferred){
   if(!p)return;
   stopBranchVideo();
-  if(playing){playOne($('#branch-preview'),playing);highlightPlaying(playing);}
+  let video=null;
+  if(playing){video=playOne($('#branch-preview'),playing);highlightPlaying(playing);}
   else $('#branch-preview').replaceChildren(el('p','muted',p.rendering?'The first take is rendering.':'The first take is queued.'));
   const onTheWay=[p.rendering?`${p.rendering} rendering`:'',p.queued?`${p.queued} queued`:''].filter(Boolean).join(' · ');
   $('#branch-info').replaceChildren(el('span','eyebrow',[count(p.takes.length,'take','takes'),pairName(p),onTheWay].filter(Boolean).join(' · ').toUpperCase()));
   if(playing)$('#branch-info').append(el('p','',playing.prompt));
   const actions=[];
+  if(video&&playing.fps){frameClip=playing;actions.push(fromHere(playing,video));}
   if(p.takes.length){
     $('#branch-info').append(pairLabelField(p),takeList(p,playing));
     const grid=el('div','branch-grid');
@@ -1217,7 +1247,8 @@ function showBranchPair(p,playing=p?.preferred){
       actionButton('Open take gallery',()=>openTakeGallery(p),'Show every take in a grid to compare them, choose the preferred one, or delete several'),
       actionButton('New take ↗',()=>newTake(p,playing||p.preferred),'Open Generate to make another version between these two images, with this take\'s settings and a new seed'),
       actionButton('Build chain…',()=>startBuilder(p.source,[playing||p.preferred]),'Change to picking connections one at a time to build a chain: any direction, loops and repeats, with a take for each step'));
-    if(playing)grid.append(actionButton('View in gallery',async()=>openAsset(await api('/assets/'+playing.id)),'Open this take in the Gallery viewer'));
+    if(playing)grid.append(actionButton('View in gallery',async()=>openAsset(await api('/assets/'+(playing.piece?.clip||playing.id))),
+      playing.piece?'Open the whole take this piece is part of in the Gallery viewer':'Open this take in the Gallery viewer'));
     actions.push(grid);
   }
   $('#branch-actions').replaceChildren(...actions);
@@ -1240,13 +1271,15 @@ function takeList(p,playing){
   const list=el('div','take-list');
   for(const take of p.takes){
     const row=el('div','take-row'+(take===playing?' playing':''));
-    const play=el('button','take-play',`Take ${take.take} · ${take.seconds} s${take.seen===false?' · new':''} · ${take.prompt}`);play.type='button';play.title=take.prompt;
+    const whole=take.piece&&clipById.get(take.piece.clip);
+    const play=el('button','take-play',`Take ${take.take} · ${take.seconds} s${whole?` · piece of take ${whole.take}`:''}${take.seen===false?' · new':''} · ${take.prompt}`);play.type='button';play.title=take.prompt;
     play.onclick=()=>showBranchPair(p,take);
     const star=el('button','take-icon',take.preferred?'★':'☆');star.type='button';star.disabled=take.preferred;
     star.title=take.preferred?'The preferred take':'Make this the preferred take';star.setAttribute('aria-label',star.title);
     star.onclick=run(async()=>{await api('/branches/pairs','PUT',{clip_id:take.id,preferred:true});await reloadPair(p.key,take.id);});
     const remove=el('button','take-icon','🗑');remove.type='button';remove.title='Delete this take';remove.setAttribute('aria-label',`Delete take ${take.take}`);
     remove.onclick=run(async()=>{if(await deleteTakes([take]))await reloadPair(p.key,playing?.id);});
+    if(take.piece){remove.disabled=true;remove.title='A piece of a longer take has no delete of its own: remove its split (on the split image) or delete the whole take';}
     row.append(play,star,remove);list.append(row);
   }
   return list;
@@ -1273,7 +1306,7 @@ async function generateBetween(startId,endId,base){
   const fallback=workflows.find(w=>both(w)&&w.available)||workflows.find(both);
   let recipe;
   if(base){
-    recipe=(await api('/assets/'+base.id)).recipe;
+    recipe=(await api('/assets/'+(base.piece?.clip||base.id))).recipe;
     recipe={...recipe,workflow:workflows.find(w=>w.id===recipe.workflow&&both(w))?recipe.workflow:fallback?.id||recipe.workflow};
   }else recipe={...start.recipe,workflow:fallback?.id||start.recipe.workflow,model:'',steps:null,cfg:null,width:null,height:null,frames:null,
     refinement:null,negative:'',emphasis:[],prompt:start.recipe.operation==='import'?'':start.recipe.prompt};
@@ -1394,8 +1427,12 @@ async function dropConnectDrag(){
 function deleteTakes(takes){return deleteItems(takes,`take ${takes[0].take}`,'takes');}
 // Deletes gallery items after asking; `one` names a single item ("take 2"), `many` the plural noun.
 async function deleteItems(items,one,many){
+  if(items.some(item=>item.piece))throw new Error('A piece of a longer take has no delete of its own: remove its split (on the split image) or delete the whole take.');
   const what=items.length===1?one:`${items.length} ${many}`;
-  if(!confirm(`Delete ${what}? This removes ${items.length===1?'it and the job that made it':'them and the jobs that made them'} permanently.`))return false;
+  // Splits of a take are drawn as pieces of it, so they go with it; the split images stay in the gallery.
+  const split=branchTree?.clips.some(c=>c.piece&&items.some(item=>item.id===c.piece.clip));
+  if(!confirm(`Delete ${what}? This removes ${items.length===1?'it and the job that made it':'them and the jobs that made them'} permanently.`+
+    (split?' Its split pieces in Branches go with it; the split images stay in the gallery.':'')))return false;
   for(const item of items)await api('/assets/'+item.id,'DELETE');
   refreshGallery();return true;
 }
@@ -1457,7 +1494,7 @@ function renderSetActions(){
   if(v.prefer&&item&&item.id!==v.preferredId)actions.push(actionButton('★ Make preferred',async()=>{await v.prefer(item);await reloadSet(item.id);},'Make this the take used for this connection in Branches chains and exports'));
   if(v.newTake&&item)actions.push(actionButton('New take ↗',async()=>{closeSetViewer();await v.newTake(item);},'Open Generate to make another version between the same two images, with this take\'s settings and a new seed'));
   if(item)actions.push(actionButton('Delete',async()=>{if(await deleteItems([item],v.label(item).toLowerCase(),v.noun+'s'))await reloadSet();},`Delete this ${v.noun} and its files from this PC`),
-    actionButton(v.viewLabel||'View in gallery',async()=>{closeSetViewer();openAsset(await api('/assets/'+item.id));},'Open it in the normal viewer, with its settings and all its actions'));
+    actionButton(v.viewLabel||'View in gallery',async()=>{closeSetViewer();openAsset(await api('/assets/'+(item.piece?.clip||item.id)));},'Open it in the normal viewer, with its settings and all its actions'));
   if(v.selected.size){
     const chosen=v.items.filter(i=>v.selected.has(i.id));
     const remove=actionButton(`Delete selected (${chosen.length})`,async()=>{if(await deleteItems(chosen,v.label(chosen[0]).toLowerCase(),v.noun+'s'))await reloadSet(item?.id);});
@@ -1493,7 +1530,7 @@ function showBranchNode(n){
   stopBranchVideo();
   if(n.image){const img=el('img');img.src=n.image;img.alt=n.prompt;$('#branch-preview').replaceChildren(img);}
   else $('#branch-preview').replaceChildren(el('p','muted',{pending:'This clip is still rendering.',missing:'This image was deleted. The clips made from it are kept.'}[n.kind]||'This clip was made before last frames were saved, so its end cannot be extended from.'));
-  const label=n.kind==='missing'?'DELETED IMAGE':n.kind==='pending'?'ON ITS WAY':n.kind==='virtual'?(n.frame==='last'?'LAST FRAME · NOT SAVED YET':'FIRST FRAME · NOT SAVED YET'):'IMAGE';
+  const label=n.split?`SPLIT · FRAME ${n.split.frame} OF ${n.split.frames-1}`:n.kind==='missing'?'DELETED IMAGE':n.kind==='pending'?'ON ITS WAY':n.kind==='virtual'?(n.frame==='last'?'LAST FRAME · NOT SAVED YET':'FIRST FRAME · NOT SAVED YET'):'IMAGE';
   $('#branch-info').replaceChildren(el('span','eyebrow',label),el('p','',n.prompt));
   if(n.label_key)$('#branch-info').append(labelField(n));
   const actions=[];
@@ -1512,6 +1549,15 @@ function showBranchNode(n){
   }
   if(n.kind!=='pending'&&[...branchPairs.values()].some(p=>p.preferred&&p.source===n.id))
     actions.push(actionButton('Build chain from here…',()=>startBuilder(n.id),'Change to picking connections one at a time to build a chain: any direction, loops and repeats, with a take for each step, starting at this image'));
+  if(n.split){
+    const remove=actionButton('Remove split',async()=>{
+      if(!confirm('Remove this split? Its image and the two pieces through it are removed; the take itself is kept.'))return;
+      await api('/branches/splits/'+encodeURIComponent(n.id),'DELETE');
+      branchSignature='';await branchTask(()=>loadTree(branchOpenId).catch(()=>loadTrees()));clearBranchPanel();
+    },'Remove this split: its image and the two pieces through it. The take itself is kept');
+    if(n.split.in_use.length){remove.disabled=true;remove.title=`Cannot remove this split while it is in use: ${n.split.in_use.join('; ')}. Delete those first.`;}
+    actions.push(remove);
+  }
   if(n.added&&!branchTree.clips.some(c=>c.source===n.id||c.target===n.id))
     actions.push(actionButton('Remove from Branches',async()=>{await api('/branches/images/'+n.asset_id,'DELETE');branchOpenId=null;await showBranches();},'Take this image out of Branches. It stays in the gallery'));
   $('#branch-actions').replaceChildren(...actions);
@@ -1747,12 +1793,14 @@ function markSeen(items){
   if(!fresh.length)return;
   for(const item of fresh){
     item.seen=true;
-    const clip=clipById.get(item.id);if(clip)clip.seen=true;
+    // A take and its pieces are one result: viewing any of them views all.
+    const whole=item.piece?.clip||item.id;
+    for(const p of branchPairs.values())for(const c of p.takes)if(c.id===whole||c.piece?.clip===whole)c.seen=true;
     const card=document.querySelector(`#gallery-grid .card:not(.stack)[data-asset-id="${CSS.escape(item.id)}"]`);
     if(card){card.classList.remove('unseen');card.querySelector('.new-badge')?.remove();}
   }
   updateBranchLabels();
-  run(async()=>{unseen=await api('/assets/seen','POST',{ids:fresh.map(item=>item.id)});showUnseen();})();
+  run(async()=>{unseen=await api('/assets/seen','POST',{ids:fresh.map(item=>item.piece?.clip||item.id)});showUnseen();})();
 }
 $('#mark-all-seen').onclick=run(async()=>{
   unseen=await api('/assets/seen','POST',{all:true});showUnseen();
@@ -1760,3 +1808,48 @@ $('#mark-all-seen').onclick=run(async()=>{
   updateBranchLabels();
   await refreshGallery();
 });
+
+// ---- Splits: a take split at a frame keeps the take and adds two pieces through the frame's image (_plans/branches.md). ----
+// The frame a player shows, counted in its take's file from 0: what Split here and the from-here buttons use.
+function playerFrame(video,clip){return Math.max(0,Math.floor(video.currentTime*clip.fps+1e-6));}
+function lastFrame(video,clip){return Math.max(0,Math.round((video.duration||0)*clip.fps)-1);}
+// Steps one frame, pausing first. Aims at the middle of the frame so the browser shows that frame and no other.
+function stepFrame(video,clip,by){
+  video.pause();
+  const n=Math.min(Math.max(playerFrame(video,clip)+by,0),lastFrame(video,clip));
+  video.currentTime=(n+.5)/clip.fps;
+}
+document.addEventListener('keydown',e=>{
+  if(!['ArrowLeft','ArrowRight'].includes(e.key)||!frameClip||$('#branches').hidden||document.querySelector('dialog[open]'))return;
+  if(e.target.closest?.('input,textarea,select')||e.ctrlKey||e.metaKey||e.altKey)return;
+  const video=$('#branch-preview video');if(!video)return;
+  e.preventDefault();e.stopPropagation();stepFrame(video,frameClip,e.key==='ArrowRight'?1:-1);
+},true);
+// Under a playing take: the frame showing, buttons to step, and what to make from that frame. Each action splits the
+// take there first (splitting at the same frame again finds the same image).
+function fromHere(take,video){
+  const box=el('div','from-here'),bar=el('div','frame-bar'),text=el('span');
+  const show=()=>{text.textContent=`Frame ${playerFrame(video,take)} of ${lastFrame(video,take)||'…'} · ${video.currentTime.toFixed(2)} s`;};
+  for(const event of ['timeupdate','seeked','loadedmetadata','pause'])video.addEventListener(event,show);
+  const back=el('button','quiet','◀'),next=el('button','quiet','▶');
+  back.type=next.type='button';
+  back.title='Pause and step back one frame (left arrow key)';next.title='Pause and step forward one frame (right arrow key)';
+  back.setAttribute('aria-label',back.title);next.setAttribute('aria-label',next.title);
+  back.onclick=()=>stepFrame(video,take,-1);next.onclick=()=>stepFrame(video,take,1);
+  bar.append(back,text,next);show();
+  const split=async()=>{
+    video.pause();
+    const asset=await api('/branches/splits','POST',{clip_id:take.piece?.clip||take.id,frame:playerFrame(video,take)});
+    branchSignature='';await branchTask(()=>loadTree(branchOpenId));
+    return asset;
+  };
+  const grid=el('div','branch-grid three');
+  grid.append(actionButton('← Backward',async()=>extendBackwards(await split()),'Split this take at the frame showing and make a clip that ends on that frame: Generate opens with it as the end image'),
+    actionButton('↻ Loop',async()=>{const asset=await split();await generateBetween(asset.id,asset.id,take);},'Split this take at the frame showing and make a clip that starts and ends on that frame: Generate opens with it as both images'),
+    actionButton('Forward →',async()=>startImageTool('img2vid',await split()),'Split this take at the frame showing and make a clip that starts from that frame: Generate opens with it as the start image'));
+  const cut=actionButton('✂ Split here',async()=>{const asset=await split();showBranchNode(branchNode(asset.id));},
+    'Split this take at the frame showing: the take is kept, and the frame becomes an image with the two pieces of the take through it, each a take set of its own');
+  cut.classList.add('wide-button');
+  box.append(el('span','eyebrow','EXTEND FROM THE FRAME SHOWING'),bar,grid,cut);
+  return box;
+}

@@ -120,17 +120,29 @@ def read_records(archive, names):
         raise ValueError('This is not a PixAnvil history export: it has no manifest.json.')
     try:
         manifest = json.loads(archive.read('manifest.json'))
-        records = {name: json.loads(archive.read(name+'.json')) if name+'.json' in names else default
-                   for name, default in (('jobs', []), ('assets', []), ('presets', []), ('branches', {}))}
     except ValueError as exc:
-        raise ValueError(f'The zip\'s records could not be read: {exc}') from exc
+        raise ValueError(f'The zip\'s manifest could not be read: {exc}') from exc
     if not isinstance(manifest, dict) or manifest.get('format') != FORMAT:
         raise ValueError(f'This export is format {manifest.get("format") if isinstance(manifest, dict) else "?"}; this PixAnvil reads format {FORMAT}.')
+    # Every export writes all of these, so one missing means the zip is incomplete, not an empty library.
+    absent = [name for name in RECORDS if name not in names]
+    if absent:
+        raise ValueError(f'The zip is missing {", ".join(absent)}, so its records are incomplete. Nothing was imported.')
+    try:
+        records = {name: json.loads(archive.read(name+'.json')) for name in ('jobs', 'assets', 'presets', 'branches')}
+    except ValueError as exc:
+        raise ValueError(f'The zip\'s records could not be read: {exc}') from exc
     for name in ('jobs', 'assets', 'presets'):
         if not isinstance(records[name], list) or not all(isinstance(r, dict) and isinstance(r.get('id'), str) for r in records[name]):
             raise ValueError(f'The zip\'s {name}.json is not a list of records with ids.')
     if not isinstance(records['branches'], dict):
         raise ValueError('The zip\'s branches.json is not a set of tables.')
+    # The manifest's counts were written from the same records, so a difference means records were lost or damaged.
+    counts = manifest.get('counts') if isinstance(manifest.get('counts'), dict) else {}
+    for name in ('jobs', 'assets', 'presets'):
+        if name in counts and counts[name] != len(records[name]):
+            raise ValueError(f'The manifest lists {counts[name]} {name} but {name}.json holds {len(records[name])}, '
+                             'so the zip is incomplete or damaged. Nothing was imported.')
     return manifest, records
 
 

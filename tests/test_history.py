@@ -154,7 +154,8 @@ ASSET={'id':'import-x','job_id':None,'created':'2026-01-01T00:00:00+00:00','path
     ({'manifest.json':MANIFEST,'/abs.png':b'x'},'unsafe entry'),
     ({'jobs.json':[]},'no manifest'),
     ({'manifest.json':{'format':99}},'format 99'),
-    ({'manifest.json':MANIFEST,'assets.json':[ASSET],'library/Imports/import-x.png':image((1,2,3))},'missing from it'),
+    ({'manifest.json':MANIFEST,'jobs.json':[],'assets.json':[ASSET],'presets.json':[],'branches.json':{},
+      'library/Imports/import-x.png':image((1,2,3))},'missing from it'),
     ({'manifest.json':MANIFEST,'stray.txt':'x'},'does not know'),
 ])
 def test_bad_zips_are_refused_before_anything_is_written(two,entries,message):
@@ -333,3 +334,44 @@ def test_a_new_export_replaces_the_previous_zip(two):
     second=finish(a,a.post('/api/library/export',headers=HEADERS))
     assert a.get(f'/api/library/tasks/{first["id"]}/file').status_code==404
     assert a.get(f'/api/library/tasks/{second["id"]}/file').status_code==200
+
+
+def rewritten(data,drop=(),change=None):
+    """The export `data` with record files left out (`drop`) or replaced (`change`: {name: bytes})."""
+    out=io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data)) as source, zipfile.ZipFile(out,'w') as target:
+        for info in source.infolist():
+            if info.filename in drop: continue
+            target.writestr(info,(change or {}).get(info.filename,source.read(info)))
+    return out.getvalue()
+
+
+def test_verify_refuses_an_archive_with_records_missing(two):
+    """Found by review: an archive without assets.json, or whose records disagree with its manifest, must not pass."""
+    import json
+    (app,a),(other,b)=two
+    add_image(a,(20,60,120),'picture')
+    data=export(a)
+    verify=lambda d:finish(b,b.post('/api/library/verify',headers=HEADERS,files={'file':('h.zip',d,'application/zip')}))
+    task=verify(rewritten(data,drop=('assets.json',)))
+    assert task['stage']=='Failed' and 'missing assets.json' in task['error'],task
+    task=verify(rewritten(data,change={'assets.json':b'[]'}))
+    assert task['stage']=='Failed' and 'lists 1 assets but assets.json holds 0' in task['error'],task
+    # Import makes the same checks before writing anything.
+    task=finish(b,b.post('/api/library/import',headers=HEADERS,files={'file':('h.zip',rewritten(data,drop=('assets.json',)),'application/zip')}))
+    assert task['stage']=='Failed' and b.get('/api/assets').json()['items']==[]
+
+
+def test_splits_pieces_and_their_chains_round_trip(two):
+    (app,a),(other,b)=two
+    from test_branches import real_video
+    start,end=add_image(a,(20,60,120),'start'),add_image(a,(90,30,10),'end')
+    take=clip(app,a,start,end=end)
+    real_video(Path(take['root'])/take['path'],seconds=2)
+    split=a.post('/api/branches/splits',headers=HEADERS,json={'clip_id':take['id'],'frame':20}).json()
+    second=clip(app,a,start,end=split)
+    a.put('/api/branches/pairs',headers=HEADERS,json={'clip_id':second['id'],'preferred':True})
+    a.post('/api/branches/chains',headers=HEADERS,json={'name':'Rejoined','clips':[f'piece:{split["id"]}:before',f'piece:{split["id"]}:after']})
+    done=import_zip(b,export(a))
+    assert done['stage']=='Done',done
+    assert drawn(b,start['id'])==drawn(a,start['id'])

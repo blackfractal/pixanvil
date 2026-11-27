@@ -167,6 +167,11 @@ class ChainChoices(BaseModel):
     choices: dict[str,Literal['copy','overwrite','skip']]
 
 
+class Split(BaseModel):
+    clip_id: str = Field(min_length=1, max_length=200)
+    frame: int = Field(ge=1)
+
+
 class SavedChain(Chain):
     name: str = Field(default='', max_length=80)
 
@@ -518,6 +523,11 @@ def make_app(state=None, worker=True, client_factory=Comfy):
             job=store.job(asset['job_id']) if asset['job_id'] else None
             if job: return remove_job(job)
             refuse_during_history_task()
+            # A split's image is the split: while its take exists, it is deleted only as Remove split is, when nothing
+            # else uses it, whichever button asks.
+            if isinstance(branches.frame_of(asset),int) and store.asset(asset['recipe'].get('parent_asset_id') or ''):
+                reasons=split_reasons(asset_id)
+                if reasons: raise HTTPException(409,'This image is a split in Branches and is in use: '+'; '.join(reasons)+'. Delete those first.')
             store.delete_asset(asset_id)
             return {'deleted_job':None,'deleted_assets':[asset_id],'leftover_files':remove_asset_files(asset)}
 
@@ -762,6 +772,50 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         store.move_branch_position(node_id,asset['id'])
         return asset
 
+    def split_reasons(split_id):
+        """Why a split cannot be removed yet (see branches.split_users); empty when it can."""
+        nodes,trees=branch_graph()
+        clips=[c|{'source_key':branches.label_key(nodes[c['source']]),'target_key':branches.label_key(nodes[c['target']])}
+               for t in trees for c in t['clips']]
+        return branches.split_users(split_id,clips,store.branch_chains())
+
+    @app.post('/api/branches/splits',status_code=201)
+    def make_split(value:Split):
+        """Split a take at a frame: the frame is saved as an image, and Branches draws the take's two pieces through
+        it as well as the whole take. Splitting at the same frame again returns the same image."""
+        clip=video_asset(value.clip_id)
+        if clip['recipe'].get('operation')=='sequence': raise HTTPException(422,'A joined chain is not part of a tree; split one of its clips')
+        if not branches.find_tree(branch_graph()[1],clip['id']): raise HTTPException(404,'This clip is not in Branches')
+        split_id=branches.split_asset_id(clip['id'],value.frame)
+        if found:=store.asset(split_id): return found
+        try: info=sequence.probe(safe_path(clip['root'],clip['path']))
+        except (ValueError,OSError,subprocess.TimeoutExpired) as exc: raise HTTPException(422,'Cannot read this clip: '+str(exc))
+        total=round(info.seconds*info.fps)
+        # The first and last frames are the clip's own ends, so a split goes between them.
+        if not 1<=value.frame<=total-2: raise HTTPException(422,f'Choose a frame between 1 and {total-2}; the first and last are the clip\'s own ends')
+        folder=config.state/'exports'; folder.mkdir(exist_ok=True)
+        handle,temp=tempfile.mkstemp(suffix='.png',dir=folder); os.close(handle)
+        temp=Path(temp)
+        try:
+            sequence.frame_at(safe_path(clip['root'],clip['path']),value.frame,temp)
+            prompt=clip['recipe'].get('prompt','')
+            return import_image(store,config.data['library'],temp.read_bytes(),f'{clip["id"]}-frame{value.frame}.png',asset_id=split_id,
+                                operation='frame',frame=value.frame,clip_frames=total,fps=info.fps,
+                                prompt=prompt,resolved_prompt=prompt,parent_asset_id=clip['id'])
+        except (RuntimeError,ValueError,OSError,subprocess.TimeoutExpired) as exc:
+            raise HTTPException(500,'Could not take the frame from the clip: '+str(exc))
+        finally:
+            temp.unlink(missing_ok=True)
+
+    @app.delete('/api/branches/splits/{split_id}')
+    def remove_split(split_id:str):
+        """Remove split: delete the split's image, which removes its two pieces. Refused while anything else uses it."""
+        asset=store.asset(split_id)
+        if not asset or not isinstance(branches.frame_of(asset),int): raise HTTPException(404,'Split not found')
+        reasons=split_reasons(split_id)
+        if reasons: raise HTTPException(409,'This split is in use: '+'; '.join(reasons)+'.')
+        return delete_asset(split_id)
+
     @app.get('/api/branches/frames/{clip_id}/{which}')
     def clip_frame(clip_id:str,which:Literal['first','last'],thumbnail:bool=False):
         image,thumb=clip_frame_files(video_asset(clip_id),which)
@@ -808,6 +862,12 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         asset=store.asset(asset_id)
         return safe_path(asset['root'],asset['path'])
 
+    def clip_piece(clip):
+        """What a Branches clip plays, for sequence.render: its whole file, or a piece's frame range of its take's."""
+        piece=clip.get('piece')
+        if not piece: return sequence.Piece(asset_path(clip['id']))
+        return sequence.Piece(asset_path(piece['clip']),piece['start_frame'],piece['end_frame'])
+
     def tree_title(tree,nodes):
         names=store.branch_names()
         return names.get(branches.name_key(tree,nodes,names)) or tree['root']['prompt'][:80] or 'Untitled tree'
@@ -831,7 +891,15 @@ def make_app(state=None, worker=True, client_factory=Comfy):
                 for node,file in images:
                     archive.write(node_picture(node),f'images/{file}.png')
                 for clip,file in clips:
-                    archive.write(asset_path(clip['id']),f'clips/{file}.mp4')
+                    if not clip.get('piece'):
+                        archive.write(asset_path(clip['id']),f'clips/{file}.mp4'); continue
+                    # A piece is cut from its take into a file of its own.
+                    cut=temp.with_name(temp.stem+'-piece.mp4')
+                    try:
+                        sequence.render([clip_piece(clip)],cut)
+                        archive.write(cut,f'clips/{file}.mp4')
+                    finally:
+                        cut.unlink(missing_ok=True)
                 archive.writestr('graph.json',json.dumps(graph,indent=2),compress_type=zipfile.ZIP_DEFLATED)
         except Exception:
             temp.unlink(missing_ok=True); raise
@@ -876,7 +944,8 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         path=folder/(asset_id+'.mp4')
         thumb=root/'.thumbnails'/(asset_id+'.jpg'); thumb.parent.mkdir(parents=True,exist_ok=True)
         try:
-            width,height,fps,seconds=sequence.render([asset_path(c) for c in value.clips],path)
+            in_tree={c['id']:c for c in tree['clips']}
+            width,height,fps,seconds=sequence.render([clip_piece(in_tree[c]) for c in value.clips],path)
             sequence.first_frame(path,path.with_suffix('.png'))
             with Image.open(path.with_suffix('.png')) as poster:
                 poster.load(); save_thumbnail(poster,thumb)
@@ -900,9 +969,13 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         if not tree: raise HTTPException(404,'Not in Branches')
         positions,labels=store.branch_positions(),store.branch_labels()
         defaults=branches.keyframe_names(tree,nodes)
+        # Anything using a split is in its tree, so the tree's clips are enough to say why it cannot be removed.
+        keyed=[c|{'source_key':branches.label_key(nodes[c['source']]),'target_key':branches.label_key(nodes[c['target']])} for c in tree['clips']]
+        chains=store.branch_chains()
         def drawn(node):
             key=branches.label_key(node)
-            return node|{'label_key':key,'label':labels.get(key,''),'default_label':defaults[node['id']]}
+            extra={'split':node['split']|{'in_use':branches.split_users(key,keyed,chains)}} if node.get('split') else {}
+            return node|{'label_key':key,'label':labels.get(key,''),'default_label':defaults[node['id']]}|extra
         return branches.summary(tree,nodes,store.branch_names())|{
             'nodes':[drawn(nodes[n]) for n in tree['nodes']],'clips':tree['clips'],
             'chains':branches.tree_chains(tree,nodes,store.branch_chains()),

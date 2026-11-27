@@ -140,3 +140,7 @@ fieldset.plain{border:0;padding:0;margin:0;min-width:0}
 .nav .new-count{background:var(--accent);color:#24180f;font:600 10px Consolas,monospace;padding:2px 7px;border-radius:20px}
 .new-badge{position:absolute;right:10px;bottom:10px;background:var(--accent);color:#24180f;padding:4px 9px;border-radius:30px;font:600 10px Consolas,monospace;letter-spacing:1px;text-transform:uppercase}
 .stack-pending progress{height:4px;margin-top:5px}
+.from-here{margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid var(--line)}
+.frame-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:8px 0;font:11px Consolas,monospace;color:var(--muted)}
+.frame-bar .quiet{padding:5px 12px;margin:0}
+.from-here .wide-button{width:100%;margin-top:8px}
