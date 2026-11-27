@@ -671,7 +671,7 @@ function freeSpot(x,y,taken){
     if(!spots.some(p=>Math.abs(p.x-x)<NODE_W&&Math.abs(p.y-candidate.y)<NODE_H+16))return candidate;
   }
 }
-const SELECTED='#8ec5f0',GENERATING='#b8d68e';
+const SELECTED='#8ec5f0',GENERATING='#b8d68e',IN_CHAIN='#b48ee0';
 function branchStyle(){
   const accent=getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
   return [
@@ -699,7 +699,9 @@ function branchStyle(){
     {selector:'edge.queued',style:{'line-color':accent,'target-arrow-color':accent}},
     // A take nobody has played yet: its label is bright and starts with "new".
     {selector:'edge.unseen',style:{color:'#f4f1e8','font-weight':'bold'}},
-    // In the chain builder, the connections that can be added next.
+    // In the chain builder, the connections already in the chain (violet), then those that can be added next (blue),
+    // which win where a connection is both.
+    {selector:'edge.in-chain',style:{'line-color':IN_CHAIN,'target-arrow-color':IN_CHAIN,width:4,'line-opacity':1}},
     {selector:'edge.next-step',style:{'line-color':SELECTED,'target-arrow-color':SELECTED,width:5,'line-opacity':1}},
     {selector:'edge:selected',style:{'line-color':SELECTED,'target-arrow-color':SELECTED,width:4}},
     {selector:'edge.playing',style:{'line-color':'#f4f1e8','target-arrow-color':'#f4f1e8',width:6}},
@@ -1126,8 +1128,9 @@ function builderEnd(){
   return last<0?builder.start:clipById.get(builder.steps[last])?.target||builder.gaps.get(last)?.target;
 }
 function markBuilder(){
-  cy?.edges().removeClass('next-step');
+  cy?.edges().removeClass('next-step in-chain');
   if(!builder)return;
+  for(const id of builder.steps){const pair=id&&pairByClip.get(id);if(pair)cy.getElementById(pair.id).addClass('in-chain');}
   const end=builderEnd();
   for(const p of branchPairs.values())if(p.preferred&&p.source===end)cy.getElementById(p.id).addClass('next-step');
 }
