@@ -109,7 +109,20 @@ class Store:
                 (asset['id'],asset['job_id'],now(),asset['root'],asset['path'],asset['thumbnail'],
                  json.dumps(asset['recipe']),asset['width'],asset['height']))
 
-    def assets(self, q='', model='', offset=0, limit=60, favorites=False, media=''):
+    # How the gallery groups items. A batch is everything one submission made; items made before batches were
+    # recorded, or made alone, are their own group. A take set is the clips with the same start and end image,
+    # the same pairs as Branches; anything else is its own group.
+    GROUP_KEYS = {
+        'batch': "COALESCE(json_extract(recipe,'$.batch'),id)",
+        'takes': "CASE WHEN json_extract(recipe,'$.media')='video' AND json_extract(recipe,'$.source_asset_id') IS NOT NULL "
+                 "AND json_extract(recipe,'$.end_asset_id') IS NOT NULL "
+                 "THEN json_extract(recipe,'$.source_asset_id')||'>'||json_extract(recipe,'$.end_asset_id') ELSE id END",
+    }
+
+    def assets(self, q='', model='', offset=0, limit=60, favorites=False, media='', group=''):
+        """A page of gallery items, newest first. With `group`, a page of groups instead: each item is the group's
+        cover with a `group` field ({kind, key, count}). Filters pick the matching items, and a group is listed
+        when any of its items match; its count is all of its items."""
         clauses, args = [], []
         if media:
             # Older and upscaled images carry no media field; only clips say 'video'.
@@ -121,10 +134,41 @@ class Store:
         if favorites:
             clauses.append('favorite=1')
         where = (' WHERE '+' AND '.join(clauses)) if clauses else ''
+        if group:
+            return self.grouped_assets(group, where, args, offset, limit)
         with self.connect() as db:
             total = db.execute('SELECT COUNT(*) FROM assets'+where,args).fetchone()[0]
             rows = db.execute('SELECT * FROM assets'+where+' ORDER BY created DESC LIMIT ? OFFSET ?', (*args,limit,offset))
             return {'items':[self.decode(r) for r in rows], 'total':total}
+
+    def grouped_assets(self, group, where, args, offset, limit):
+        key = self.GROUP_KEYS[group]
+        with self.connect() as db:
+            total = db.execute(f'SELECT COUNT(DISTINCT {key}) FROM assets'+where, args).fetchone()[0]
+            keys = [r[0] for r in db.execute(f'SELECT {key} AS gkey, MAX(created) AS latest FROM assets'+where+
+                                              ' GROUP BY gkey ORDER BY latest DESC LIMIT ? OFFSET ?', (*args,limit,offset))]
+            members = {}
+            if keys:
+                marks = ','.join('?'*len(keys))
+                for r in db.execute(f'SELECT *, {key} AS gkey FROM assets WHERE {key} IN ({marks}) ORDER BY created', keys):
+                    row = self.decode(r); members.setdefault(row.pop('gkey'), []).append(row)
+        numbers, pairs = (self.take_numbers()[0], self.branch_pairs()) if group == 'takes' else ({}, {})
+        items = []
+        for gkey in keys:
+            found = members[gkey]
+            cover = found[0]
+            if group == 'takes' and len(found) > 1:
+                # The take Branches plays for this pair: the chosen one, else the lowest-numbered.
+                chosen = pairs.get(tuple(gkey.split('>', 1)), {}).get('preferred_clip')
+                cover = next((a for a in found if a['id'] == chosen), None) or min(found, key=lambda a: (numbers.get(a['id'], 1e9), a['created']))
+            items.append(cover | {'group': {'kind': group, 'key': gkey, 'count': len(found)}})
+        return {'items': items, 'total': total}
+
+    def group_members(self, group, gkey):
+        """Every item in one gallery group, oldest first."""
+        key = self.GROUP_KEYS[group]
+        with self.connect() as db:
+            return [self.decode(r) for r in db.execute(f'SELECT * FROM assets WHERE {key}=? ORDER BY created', (gkey,))]
 
     def asset(self, asset_id):
         with self.connect() as db:

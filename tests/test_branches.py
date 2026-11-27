@@ -422,3 +422,34 @@ def test_saved_chains_keep_their_steps_and_images(setup):
     assert client.delete('/api/branches/chains/'+saved['id'],headers=HEADERS).status_code==200
     assert tree(client,a['id'])['chains']==[]
     assert client.delete('/api/branches/chains/'+saved['id'],headers=HEADERS).status_code==404
+
+
+def test_gallery_groups_batches_and_take_sets(setup):
+    app,client=setup
+    a,b=add_image(client,(20,60,120),'a'),add_image(client,(90,30,10),'b')
+    submit=lambda **values:client.post('/api/jobs',headers=HEADERS,json={'prompt':'three knights','workflow':'sdxl',**values}).json()['jobs']
+    batch,alone=submit(count=3),submit(prompt='one knight')
+    assert len({j['recipe']['batch'] for j in batch})==1 and 'batch' not in alone[0]['recipe']
+    # Editing a queued job keeps it in its batch.
+    edited=client.put('/api/jobs/'+batch[1]['id'],headers=HEADERS,json={'prompt':'three knights, edited','workflow':'sdxl'}).json()
+    assert edited['recipe']['batch']==batch[0]['recipe']['batch']
+    for _ in range(12):
+        app.state.engine.tick()
+    first,second=clip(app,client,a,end=b),clip(app,client,a,end=b)
+    clip(app,client,a)
+    grouped=lambda group,**q:client.get('/api/assets',params={'group':group,**q}).json()
+    # Batches: the three from one submission are one stack; everything else, imports included, stands alone.
+    found=grouped('batch')
+    assert sorted(i['group']['count'] for i in found['items'])==[1]*6+[3] and found['total']==7
+    stack=next(i for i in found['items'] if i['group']['count']==3)
+    members=client.get('/api/assets/group',params={'kind':'batch','key':stack['group']['key']}).json()['items']
+    assert {m['job_id'] for m in members}=={j['id'] for j in batch}
+    # A filter lists a stack when any of its items match, with all of its items counted.
+    assert [i['group']['count'] for i in grouped('batch',q='edited')['items']]==[3]
+    # Take sets: clips between the same two images are one stack, covered by the preferred take.
+    takes=next(i for i in grouped('takes')['items'] if i['group']['count']==2)
+    assert takes['group']['key']==f"{a['id']}>{b['id']}" and takes['id']==first['id']
+    client.put('/api/branches/pairs',headers=HEADERS,json={'clip_id':second['id'],'preferred':True})
+    assert next(i for i in grouped('takes')['items'] if i['group']['count']==2)['id']==second['id']
+    members=client.get('/api/assets/group',params={'kind':'takes','key':takes['group']['key']}).json()['items']
+    assert [(m['id'],m['take'],m['preferred']) for m in members]==[(first['id'],1,False),(second['id'],2,True)]

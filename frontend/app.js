@@ -24,7 +24,8 @@ window.addEventListener('hashchange',()=>{const name=location.hash.slice(1);if(d
 const imageCanvases=[{width:1024,height:1024,label:'Square · 1024 × 1024'},{width:832,height:1216,label:'Portrait · 832 × 1216'},{width:1216,height:832,label:'Landscape · 1216 × 832'},{width:768,height:768,label:'Draft · 768 × 768'},{width:512,height:512,label:'Small · 512 × 512'}];
 let optionsWorkflow='';
 const isVideo=a=>a.recipe.media==='video';
-const clipSeconds=r=>Math.round(r.frames/r.fps);
+// A clip's length to one decimal, as Branches and the length slider show it.
+const clipSeconds=r=>Math.round(r.frames/r.fps*10)/10;
 // The "What to make" menu holds a mode. Each mode lists only the workflows that can run it, and the mode
 // never changes unless the user changes it. The API operation is derived from the mode and the attached images.
 const mode=()=>$('#operation').value;
@@ -255,7 +256,36 @@ function checkEditing(jobs){
 $('#stop-editing').onclick=run(()=>endEditing());
 $('#example-prompt').onclick=()=>{$('#prompt').value='Create a high quality image of a young, handsome teenage water knight casting a powerful water spell. Sleeveless armor, cinematic lighting';saveDraft();};
 $('#generation-form').onsubmit=run(async e=>{e.preventDefault();if(editingJob)return saveJobEdit();busy=true;$('#generate-button').disabled=true;try{const response=await api('/jobs','POST',data());notice(`Queued ${response.jobs.length} ${response.jobs[0].recipe.media==='video'?'video':'image'}(s). You can keep browsing; results save automatically.`);await refreshJobs();}finally{busy=false;setModelOptions($('#workflow').value,$('#model').value);}});
-async function refreshGallery(append=false){if(!append)offset=0;const response=await api(`/assets?limit=48&offset=${offset}&favorites=${favorites}&q=${encodeURIComponent($('#search').value)}`);total=response.total;assets=append?[...assets,...response.items]:response.items;offset=assets.length;$('#image-count').textContent=`${total} image${total===1?'':'s'}`;$('#empty-gallery').hidden=total>0;$('#load-more').hidden=offset>=total;const grid=$('#gallery-grid');grid.replaceChildren();for(const a of assets){const card=el('button','card');card.setAttribute('aria-label',a.recipe.prompt);const imgWrap=el('div','card-image');const img=el('img');img.src=`/api/assets/${a.id}/thumbnail`;img.alt=a.recipe.prompt;img.loading='lazy';imgWrap.append(img);if(a.favorite)imgWrap.append(el('span','heart','♥'));if(isVideo(a))imgWrap.append(el('span','play',`▶ ${clipSeconds(a.recipe)}s`));const text=el('div','card-text');text.append(el('strong','',a.recipe.prompt),el('span','',`${a.width} × ${a.height}`));card.append(imgWrap,text,el('small','',`${a.recipe.workflow} / ${new Date(a.created).toLocaleDateString()}`));card.onclick=()=>openAsset(a);grid.append(card);}renderPending();if(!favorites&&!$('#search').value){if(assets.length)showLatest(assets[0]);else if(latestId===''){$('#latest-preview').replaceChildren(...latestPlaceholder.map(n=>n.cloneNode(true)));$('#latest-caption').textContent='';}}}
+// How the gallery is shown: '' one card per item, 'batch' or 'takes' stacked. Remembered in this browser only.
+let galleryGroup='';
+try{galleryGroup=localStorage.getItem('pixanvil.galleryGroup')||'';}catch{}
+if(!['','batch','takes'].includes(galleryGroup))galleryGroup='';
+$('#gallery-group').value=galleryGroup;
+$('#gallery-group').onchange=run(async()=>{
+  galleryGroup=$('#gallery-group').value;
+  try{localStorage.setItem('pixanvil.galleryGroup',galleryGroup);}catch{}
+  await refreshGallery();
+});
+// A stack opens in the set viewer: a batch shows what one submission made, a take set every clip between the same
+// two images, in take order, with the preferred take marked and Make preferred available, as in Branches.
+async function openGalleryGroup(group){
+  const takes=group.kind==='takes';
+  const load=async()=>(await api(`/assets/group?kind=${group.kind}&key=${encodeURIComponent(group.key)}`)).items;
+  const toItem=a=>({id:a.id,take:a.take,video:isVideo(a),seconds:isVideo(a)?clipSeconds(a.recipe):null,prompt:a.recipe.prompt,
+    thumbnail:`/api/assets/${a.id}/thumbnail`,file:`/api/assets/${a.id}/file`});
+  const view=found=>{
+    const items=found.map(toItem);
+    return {title:takes?'TAKE SET':'BATCH',noun:takes?'take':'item',items,preferredId:found.find(a=>a.preferred)?.id,
+      label:takes?setNumber:item=>`${item.video?'Clip':'Image'} ${items.indexOf(item)+1}`,
+      hint:takes?null:'Click an item to show it. Shift-click or Ctrl-click to select several.',
+      prefer:takes?item=>api('/branches/pairs','PUT',{clip_id:item.id,preferred:true}):null,viewLabel:'Open in viewer',
+      reload:async()=>{const next=await load();return next.length?view(next):null;},
+      closed:()=>refreshGallery()};
+  };
+  const found=await load();
+  if(found.length)openSetViewer(view(found));
+}
+async function refreshGallery(append=false){if(!append)offset=0;const response=await api(`/assets?limit=48&offset=${offset}&favorites=${favorites}&group=${galleryGroup}&q=${encodeURIComponent($('#search').value)}`);total=response.total;assets=append?[...assets,...response.items]:response.items;offset=assets.length;$('#image-count').textContent=`${total} ${galleryGroup?'card':'image'}${total===1?'':'s'}`;$('#empty-gallery').hidden=total>0;$('#load-more').hidden=offset>=total;const grid=$('#gallery-grid');grid.replaceChildren();for(const a of assets){const card=el('button','card');card.setAttribute('aria-label',a.recipe.prompt);const imgWrap=el('div','card-image');const img=el('img');img.src=`/api/assets/${a.id}/thumbnail`;img.alt=a.recipe.prompt;img.loading='lazy';imgWrap.append(img);if(a.favorite)imgWrap.append(el('span','heart','♥'));if(isVideo(a))imgWrap.append(el('span','play',`▶ ${clipSeconds(a.recipe)}s`));const stack=a.group?.count>1;if(a.group)card.dataset.groupKey=a.group.key;if(stack){card.classList.add('stack');imgWrap.append(el('span','stack-count',`×${a.group.count}`));card.setAttribute('aria-label',`${a.group.kind==='batch'?'Batch':'Take set'} of ${a.group.count}: ${a.recipe.prompt}`);}const text=el('div','card-text');text.append(el('strong','',a.recipe.prompt),el('span','',`${a.width} × ${a.height}`));card.append(imgWrap,text,el('small','',`${a.recipe.workflow} / ${new Date(a.created).toLocaleDateString()}`));card.onclick=stack?run(()=>openGalleryGroup(a.group)):()=>openAsset(a);grid.append(card);}renderPending();if(!favorites&&!$('#search').value){if(assets.length)showLatest(assets[0]);else if(latestId===''){$('#latest-preview').replaceChildren(...latestPlaceholder.map(n=>n.cloneNode(true)));$('#latest-caption').textContent='';}}}
 // The Live tab's empty state, restored when its last result is deleted.
 const latestPlaceholder=[...$('#latest-preview').childNodes].map(n=>n.cloneNode(true));
 // The Activity tab shows the newest result: a clip plays in place, an image opens in the viewer.
@@ -277,19 +307,44 @@ function inputThumbs(r){
   }
   return box;
 }
-// Jobs that have not produced a result yet appear at the front of the gallery as placeholders.
+// The gallery group a job's result will join, as Store.GROUP_KEYS works it out; in the Individual view, its own.
+function pendingGroupKey(j){
+  const r=j.recipe;
+  if(galleryGroup==='batch')return r.batch||j.id;
+  if(galleryGroup==='takes'&&r.media==='video'&&r.source_asset_id&&r.end_asset_id)return `${r.source_asset_id}>${r.end_asset_id}`;
+  return j.id;
+}
+function onTheWay(jobs){
+  const rendering=jobs.filter(j=>j.state!=='queued').length,queued=jobs.length-rendering;
+  return 'On the way: '+[rendering?`${rendering} rendering`:'',queued?`${queued} queued`:''].filter(Boolean).join(' · ');
+}
+// Jobs that have not produced a result yet appear at the front of the gallery as placeholders. In the Batches and
+// Take sets views they group like finished items: a group that already has a card in the gallery gets an
+// "On the way" line on it; otherwise one placeholder stands for the group, showing its furthest-along job.
 function renderPending(){
-  const grid=$('#gallery-grid');grid.querySelectorAll('.card.pending').forEach(n=>n.remove());
+  const grid=$('#gallery-grid');grid.querySelectorAll('.card.pending, .stack-pending').forEach(n=>n.remove());
   if(favorites||$('#search').value)return;
-  const cards=activeJobs.map(j=>{
+  const groups=new Map();
+  for(const j of activeJobs){const key=pendingGroupKey(j);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(j);}
+  const cards=[];
+  for(const [key,jobs] of groups){
+    const shown=galleryGroup&&grid.querySelector(`.card[data-group-key="${CSS.escape(key)}"]`);
+    if(shown){shown.append(el('small','stack-pending',onTheWay(jobs)));continue;}
+    const j=jobs.find(job=>job.state!=='queued')||jobs[0];
     const card=el('div','card pending'),frame=el('div','card-image'),source=j.recipe.source_asset_id||j.recipe.end_asset_id;
     card.tabIndex=0;card.setAttribute('role','button');card.setAttribute('aria-label','Show job details: '+j.recipe.prompt);
     card.onclick=()=>openJob(j);card.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();openJob(j);}};
     if(source){const img=el('img');img.src=`/api/assets/${source}/thumbnail`;img.alt='';img.onerror=()=>img.remove();frame.append(img);}
     frame.append(el('span','state',j.state==='queued'?'Queued':j.state==='unknown'?'Needs attention':'Rendering'),progressView(j));
     const text=el('div','card-text');text.append(el('strong','',j.recipe.prompt),el('span','',j.recipe.media==='video'?'video':'image'));
-    card.append(frame,text,el('small','',`${j.recipe.workflow} / on its way`));return card;
-  });
+    card.append(frame,text,el('small','',`${j.recipe.workflow} / on its way`));
+    if(jobs.length>1){
+      card.classList.add('stack');frame.append(el('span','stack-count',`×${jobs.length}`));
+      const more=jobs.length-1,group=galleryGroup==='batch'?'this batch':'this take set';
+      card.append(el('small','stack-pending',`${more} more on the way in ${group}`));
+    }
+    cards.push(card);
+  }
   grid.prepend(...cards);$('#empty-gallery').hidden=total>0||cards.length>0;
 }
 let searchTimer;$('#search').oninput=()=>{clearTimeout(searchTimer);searchTimer=setTimeout(run(()=>refreshGallery()),250);};$('#favorites').onclick=run(async()=>{favorites=true;$('#favorites').classList.add('selected');$('#all-images').classList.remove('selected');await refreshGallery();});$('#all-images').onclick=run(async()=>{favorites=false;$('#all-images').classList.add('selected');$('#favorites').classList.remove('selected');await refreshGallery();});$('#load-more').onclick=run(()=>refreshGallery(true));
@@ -1261,10 +1316,12 @@ async function dropConnectDrag(){
   const node=await realNode(branchNode(drag.from));
   if(fromRight)startImageTool('img2vid',node);else extendBackwards(node);
 }
-async function deleteTakes(takes){
-  const what=takes.length===1?`take ${takes[0].take}`:`${takes.length} takes`;
-  if(!confirm(`Delete ${what}? This removes ${takes.length===1?'the clip and its job':'the clips and their jobs'} permanently.`))return false;
-  for(const take of takes)await api('/assets/'+take.id,'DELETE');
+function deleteTakes(takes){return deleteItems(takes,`take ${takes[0].take}`,'takes');}
+// Deletes gallery items after asking; `one` names a single item ("take 2"), `many` the plural noun.
+async function deleteItems(items,one,many){
+  const what=items.length===1?one:`${items.length} ${many}`;
+  if(!confirm(`Delete ${what}? This removes ${items.length===1?'it and the job that made it':'them and the jobs that made them'} permanently.`))return false;
+  for(const item of items)await api('/assets/'+item.id,'DELETE');
   refreshGallery();return true;
 }
 // After a change to a pair: reload the tree, then show the pair again if it still has any clips.
@@ -1273,7 +1330,9 @@ async function reloadPair(key,playingId){
   const pair=branchTree&&branchPairs.get(key);
   if(pair)showBranchPair(pair,pair.takes.find(t=>t.id===playingId)||pair.preferred);else clearBranchPanel();
 }
-// ---- Set viewer: every take of a pair in one dialog. Built to show a gallery batch the same way later. ----
+// ---- Set viewer: a set of items in one dialog -- a pair's takes, or a gallery stack (a batch or a take set).
+// A view gives its items and may give a title, a noun ('take'), a label for each item, a hint, and prefer, newTake,
+// reload and closed actions. Items that are images are shown; Play all appears when every item is a video.
 let setView=null;
 function openTakeGallery(p){
   const view=pair=>({title:['TAKES',pairName(pair)].filter(Boolean).join(' · '),items:pair.takes,preferredId:pair.preferred?.id,
@@ -1287,18 +1346,21 @@ function openTakeGallery(p){
   stopBranchVideo();openSetViewer(view(p));
 }
 function openSetViewer(view,playingId){
-  setView={...view,selected:new Set(),playing:view.items.find(i=>i.id===playingId)||view.items.find(i=>i.id===view.preferredId)||view.items[0]};
+  setView={noun:'take',label:setNumber,...view,selected:new Set(),
+    playing:view.items.find(i=>i.id===playingId)||view.items.find(i=>i.id===view.preferredId)||view.items[0]};
+  $('#set-hint').textContent=view.hint||`Click a ${setView.noun} to play it. Shift-click or Ctrl-click to select several.`;
+  $('#set-viewer').setAttribute('aria-label',setView.title);
   renderSetViewer();playSetItem(setView.playing);
   if(!$('#set-viewer').open)$('#set-viewer').showModal();
 }
 function setNumber(item){return `Take ${item.take}`;}
 function renderSetViewer(){
   const v=setView;
-  $('#set-title').textContent=`${v.title} · ${count(v.items.length,'take','takes').toUpperCase()}`;
+  $('#set-title').textContent=`${v.title} · ${count(v.items.length,v.noun,v.noun+'s').toUpperCase()}`;
   $('#set-grid').replaceChildren(...v.items.map(item=>{
     const card=el('button','set-card');card.type='button';card.dataset.id=item.id;card.title=item.prompt;
     const img=el('img');img.src=item.thumbnail;img.alt='';img.loading='lazy';
-    card.append(img,el('span','',`${setNumber(item)} · ${item.seconds} s`+(item.id===v.preferredId?' ★':'')));
+    card.append(img,el('span','',v.label(item)+(item.seconds!=null?` · ${item.seconds} s`:'')+(item.id===v.preferredId?' ★':'')));
     card.onclick=e=>{
       if(e.shiftKey||e.ctrlKey||e.metaKey){v.selected.has(item.id)?v.selected.delete(item.id):v.selected.add(item.id);renderSetActions();markSetCards();}
       else playSetItem(item);
@@ -1314,26 +1376,29 @@ function markSetCards(){
   }
 }
 function renderSetActions(){
-  const v=setView,item=v.playing,actions=[actionButton('▶ Play all takes',playAllInSet)];
+  const v=setView,item=v.playing,actions=[];
+  if(v.items.every(i=>i.video!==false))actions.push(actionButton(`▶ Play all ${v.noun}s`,playAllInSet));
   if(v.prefer&&item&&item.id!==v.preferredId)actions.push(actionButton('★ Make preferred',async()=>{await v.prefer(item);await reloadSet(item.id);}));
   if(v.newTake&&item)actions.push(actionButton('New take ↗',async()=>{closeSetViewer();await v.newTake(item);}));
-  if(item)actions.push(actionButton('Delete',async()=>{if(await deleteTakes([item]))await reloadSet();}),
-    actionButton('View in gallery',async()=>{closeSetViewer();openAsset(await api('/assets/'+item.id));}));
+  if(item)actions.push(actionButton('Delete',async()=>{if(await deleteItems([item],v.label(item).toLowerCase(),v.noun+'s'))await reloadSet();}),
+    actionButton(v.viewLabel||'View in gallery',async()=>{closeSetViewer();openAsset(await api('/assets/'+item.id));}));
   if(v.selected.size){
     const chosen=v.items.filter(i=>v.selected.has(i.id));
-    const remove=actionButton(`Delete selected (${chosen.length})`,async()=>{if(await deleteTakes(chosen))await reloadSet(item?.id);});
+    const remove=actionButton(`Delete selected (${chosen.length})`,async()=>{if(await deleteItems(chosen,v.label(chosen[0]).toLowerCase(),v.noun+'s'))await reloadSet(item?.id);});
     remove.classList.add('danger');actions.push(remove);
   }
   $('#set-actions').replaceChildren(...actions);
 }
 function playSetItem(item){
-  setView.playing=item;playOne($('#set-player'),item);
-  $('#set-caption').textContent=`${setNumber(item)} · ${item.prompt}`;
+  setView.playing=item;
+  if(item.video===false){stopVideos($('#set-player'));const img=el('img');img.src=item.file;img.alt=item.prompt;$('#set-player').replaceChildren(img);}
+  else playOne($('#set-player'),item);
+  $('#set-caption').textContent=`${setView.label(item)} · ${item.prompt}`;
   markSetCards();renderSetActions();
 }
 function playAllInSet(){
   const v=setView;
-  playClips($('#set-player'),v.items,{captionEl:$('#set-caption'),caption:(i,pass)=>`${setNumber(v.items[i])} (${i+1} of ${v.items.length})`+(pass>1?' · looped':''),
+  playClips($('#set-player'),v.items,{captionEl:$('#set-caption'),caption:(i,pass)=>`${v.label(v.items[i])} (${i+1} of ${v.items.length})`+(pass>1?' · looped':''),
     onShow:item=>{v.playing=item;markSetCards();renderSetActions();}});
 }
 async function reloadSet(playingId){

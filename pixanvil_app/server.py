@@ -382,6 +382,10 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         with engine.lock:
             prepared,snapshots=prepare(value)
             save_snapshots(snapshots)
+            # Everything one submission makes is a batch, which the gallery can show as one stack.
+            if len(prepared)>1:
+                batch=uuid.uuid4().hex
+                for recipe,_ in prepared: recipe['batch']=batch
             return {'jobs':[store.create_job(rec,g) for rec,g in prepared]}
 
     @app.put('/api/jobs/{job_id}')
@@ -397,6 +401,7 @@ def make_app(state=None, worker=True, client_factory=Comfy):
             if found['state']!='queued': raise HTTPException(409,'This job has already started, so its settings can no longer change.')
             [(recipe,graph)],snapshots=prepare(value)
             save_snapshots(snapshots)
+            if found['recipe'].get('batch'): recipe['batch']=found['recipe']['batch']
             store.update_job(job_id,recipe=recipe,graph=graph)
             release_inputs(found['recipe'])
             return store.job(job_id)
@@ -508,8 +513,23 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         return {'deleted_jobs':jobs,'deleted_assets':len(removed),'deleted_inputs':len(inputs),'leftover_files':leftover}
 
     @app.get('/api/assets')
-    def assets(q:str='',model:str='',offset:int=0,limit:int=60,favorites:bool=False,media:Literal['','image','video']=''):
-        return store.assets(q,model,max(0,offset),max(1,min(limit,100)),favorites,media)
+    def assets(q:str='',model:str='',offset:int=0,limit:int=60,favorites:bool=False,media:Literal['','image','video']='',
+               group:Literal['','batch','takes']=''):
+        return store.assets(q,model,max(0,offset),max(1,min(limit,100)),favorites,media,group)
+
+    @app.get('/api/assets/group')
+    def asset_group(kind:Literal['batch','takes'],key:str):
+        """Every item in one gallery stack. A take set comes in take order with the preferred take marked, as in
+        Branches."""
+        items=store.group_members(kind,key)
+        if kind=='takes' and items:
+            _,trees=branch_graph()
+            marks={c['id']:c for t in trees for c in t['clips'] if not c['pending']}
+            for item in items:
+                mark=marks.get(item['id'],{})
+                item.update(take=mark.get('take'),preferred=bool(mark.get('preferred')))
+            items.sort(key=lambda a:(a['take'] or 0,a['created']))
+        return {'items':items}
 
     @app.get('/api/assets/{asset_id}')
     def asset_detail(asset_id:str):

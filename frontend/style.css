@@ -112,3 +112,11 @@ fieldset.plain{border:0;padding:0;margin:0;min-width:0}
 .picker-item:hover,.picker-item:focus-visible{border-color:var(--accent)}
 .picker-item img{display:block;width:100%;height:100%;object-fit:cover}
 #picker-more{margin-top:14px}
+
+.gallery-group{width:auto;margin:0;padding:7px 10px;font-size:12px}
+.card.stack .card-image{overflow:visible;box-shadow:5px -5px 0 -1px #2f352a,10px -10px 0 -2px #23271f}
+.card.stack .card-image img{border-radius:5px}
+.stack-count{position:absolute;top:10px;left:10px;background:#101210cc;padding:4px 9px;border-radius:30px;font:12px Consolas,monospace;color:var(--text)}
+.set-player img{width:100%;height:100%;object-fit:contain}
+.stack-pending{display:block;margin-top:3px;color:var(--accent);font-size:11px}
+.card.pending .stack-count{top:auto;bottom:10px}
