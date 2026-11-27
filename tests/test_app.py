@@ -349,3 +349,21 @@ def test_comfyui_failure_keeps_the_node_and_exception(app,monkeypatch):
     assert found['error'].startswith('ComfyUI execution failed in TextEncodeQwenImageEditPlus (node negative): '
                                      'RuntimeError: GET was unable to find an engine to execute this computation\n')
     assert 'F.conv3d' in found['error'] and 'tensor(' not in found['error']
+
+
+def test_restart_runs_docker_restart_and_is_refused_while_a_job_renders(app,monkeypatch):
+    import time
+    ran=[]
+    class Done: returncode=0; stdout=''; stderr=''
+    def fake_run(command,**kwargs): ran.append(command[-1]); return Done()
+    monkeypatch.setattr('pixanvil_app.server.subprocess.run',fake_run)
+    with TestClient(app) as client:
+        assert client.post('/api/connection/restart',headers=HEADERS).status_code==200
+        for _ in range(100):
+            if client.get('/api/connection').json()['startup']['state']!='starting': break
+            time.sleep(.01)
+        assert ran==['docker restart comfyui']
+        job=submit(app)[0]
+        app.state.store.update_job(job['id'],state='running')
+        refused=client.post('/api/connection/restart',headers=HEADERS)
+        assert refused.status_code==409 and 'rendering' in refused.json()['detail']

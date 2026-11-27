@@ -252,14 +252,17 @@ def make_app(state=None, worker=True, client_factory=Comfy):
     @app.get('/api/discover')
     def discover(): return config.discovery()
 
-    def start_service():
+    def start_service(restart=False):
+        """Start ComfyUI on SPARK over SSH, or restart it, then wait until it answers. Starting does nothing when
+        it is already up; restarting is for a ComfyUI that is up but failing (see the Spark notes on bad GPU state)."""
         try:
-            try:
-                client_factory(config.data['comfy_url']).health()
-                startup.update(state='ready',message='ComfyUI is already ready'); return
-            except Exception: pass
-            command=['ssh','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o','ConnectTimeout=8',config.data['ssh_host'],
-                     'python3 ~/ai/scripts/spark_services.py comfyui']
+            if not restart:
+                try:
+                    client_factory(config.data['comfy_url']).health()
+                    startup.update(state='ready',message='ComfyUI is already ready'); return
+                except Exception: pass
+            remote='docker restart comfyui' if restart else 'python3 ~/ai/scripts/spark_services.py comfyui'
+            command=['ssh','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o','ConnectTimeout=8',config.data['ssh_host'],remote]
             flags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0
             proc=subprocess.run(command,capture_output=True,text=True,timeout=600,creationflags=flags)
             if proc.returncode: raise RuntimeError((proc.stderr or proc.stdout)[-3000:])
@@ -269,7 +272,7 @@ def make_app(state=None, worker=True, client_factory=Comfy):
                     client_factory(config.data['comfy_url']).health()
                     startup.update(state='ready',message='ComfyUI is ready'); return
                 except Exception: time.sleep(3)
-            raise RuntimeError('Start command completed, but ComfyUI is not yet reachable. Check the SPARK service logs.')
+            raise RuntimeError(('Restart' if restart else 'Start')+' command completed, but ComfyUI is not yet reachable. Check the SPARK service logs.')
         except Exception as exc:
             startup.update(state='failed',message=str(exc))
         finally: start_lock.release()
@@ -279,6 +282,18 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         if start_lock.acquire(blocking=False):
             startup.update(state='starting',message='Starting ComfyUI over SSH; first startup may take several minutes.')
             threading.Thread(target=start_service,daemon=True).start()
+        return startup.copy()
+
+    @app.post('/api/connection/restart')
+    def restart():
+        """Restart ComfyUI on SPARK. Refused while a job is on ComfyUI, which a restart would lose; queued jobs
+        wait, because jobs are only sent once ComfyUI answers."""
+        if any(j['state'] in busy_states for j in store.active()):
+            raise HTTPException(409,'A job is rendering on ComfyUI, and restarting would lose it. Wait for it to finish, or abandon it in History first.')
+        if not start_lock.acquire(blocking=False):
+            raise HTTPException(409,'ComfyUI is already starting or restarting.')
+        startup.update(state='starting',message='Restarting ComfyUI on SPARK; this usually takes a minute or two.')
+        threading.Thread(target=start_service,args=(True,),daemon=True).start()
         return startup.copy()
 
     @app.get('/api/workflows')

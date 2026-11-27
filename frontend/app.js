@@ -452,9 +452,9 @@ function showJob(j,active){
   $('#job-body').replaceChildren(progressView(j),...(j.error?[el('p','error',j.error)]:[]),inputThumbs(r),list);
   const actions=[];
   const reuse=el('button','quiet','Reuse settings');reuse.onclick=run(async()=>{endEditing(false);await restoreRecipe(r);$('#job-dialog').close();tab('generate');});actions.push(reuse);
-  if(j.state==='queued'){const edit=el('button','quiet','Edit settings');edit.onclick=run(()=>editJob(j));actions.push(edit);}
+  if(j.state==='queued'){const edit=el('button','quiet','Edit settings');edit.title='Change this job\'s settings before it starts. It keeps its place in the queue';edit.onclick=run(()=>editJob(j));actions.push(edit);}
   if(j.state==='queued'||j.state==='unknown'){
-    const b=el('button','quiet',j.state==='queued'?'Cancel queued':'Abandon local job');
+    const b=el('button','quiet',j.state==='queued'?'Cancel queued':'Abandon local job');b.title=j.state==='queued'?'Take this job out of the queue before it starts':'Stop tracking this job here. ComfyUI may still finish it on SPARK';
     b.onclick=run(async()=>{await api(`/jobs/${j.id}/${j.state==='queued'?'cancel':'abandon'}`,'POST');await refreshJobs();});actions.push(b);
   }
   const close=el('button','quiet','Close');close.onclick=()=>$('#job-dialog').close();actions.push(close);
@@ -482,16 +482,16 @@ async function refreshJobs(){
     const row=el('div','job-row'),status=el('div','badge '+j.state,j.state),body=el('div');
     body.append(el('p','',j.recipe.prompt),el('small','',`${j.recipe.workflow} · seed ${j.recipe.seed} · ${new Date(j.created).toLocaleString()}`),inputThumbs(j.recipe),progressView(j));
     if(j.error)body.append(el('p','error',j.error));
-    const actions=el('div'),reuse=el('button','quiet','Reuse settings');
+    const actions=el('div'),reuse=el('button','quiet','Reuse settings');reuse.title='Open Generate with this job\'s settings, to run it again or change it';
     reuse.onclick=run(async()=>{endEditing(false);await restoreRecipe(j.recipe);tab('generate');});actions.append(reuse);
-    if(j.state==='queued'){const edit=el('button','quiet','Edit settings');edit.onclick=run(()=>editJob(j));actions.append(edit);}
+    if(j.state==='queued'){const edit=el('button','quiet','Edit settings');edit.title='Change this job\'s settings before it starts. It keeps its place in the queue';edit.onclick=run(()=>editJob(j));actions.append(edit);}
     if(j.state==='queued'||j.state==='unknown'){
-      const b=el('button','quiet',j.state==='queued'?'Cancel queued':'Abandon local job');
+      const b=el('button','quiet',j.state==='queued'?'Cancel queued':'Abandon local job');b.title=j.state==='queued'?'Take this job out of the queue before it starts':'Stop tracking this job here. ComfyUI may still finish it on SPARK';
       b.onclick=run(async()=>{await api(`/jobs/${j.id}/${j.state==='queued'?'cancel':'abandon'}`,'POST');await refreshJobs();});actions.append(b);
     }
     // Work that may still be running on ComfyUI cannot be deleted until it finishes or is abandoned.
     if(!['submitting','running','collecting','unknown'].includes(j.state)){
-      const remove=el('button','quiet danger','Delete'),n=j.outputs.length;
+      const remove=el('button','quiet danger','Delete'),n=j.outputs.length;remove.title='Delete this job from History, with any images or clips it made';
       remove.onclick=run(()=>deleteRecord('/jobs/'+j.id,n?`Delete this job and its ${n} output${n===1?'':'s'}? The files are removed from your library.`:'Delete this job from your history?'));
       actions.append(remove);
     }
@@ -917,7 +917,7 @@ function showChainSelection(){
 function renderChainSelection(ids,reversed){
   stopBranchVideo();
   const chain=chainFromSelection(branchTree,ids,reversed);
-  const reverse=chain.reversible?[actionButton('⇄ Reverse',()=>renderChainSelection(ids,!reversed))]:[];
+  const reverse=chain.reversible?[actionButton('⇄ Reverse',()=>renderChainSelection(ids,!reversed),'Run the chain the other way, from the second image clicked to the first')]:[];
   $('#branch-actions').replaceChildren(...reverse);
   if(chain.error){
     $('#branch-preview').replaceChildren(el('p','muted',chain.error));
@@ -944,8 +944,8 @@ function renderChainSelection(ids,reversed){
     caption:i=>`Clip ${i+1} of ${chosen.length} · ${nodeName(chosen[i].source)} → ${nodeName(chosen[i].target)}`,
     onShow:(clip,i)=>{highlightPlaying(clip);markStepPlaying(i);}});
   const grid=el('div','branch-grid');
-  grid.append(actionButton('▶ Play chain',()=>{stopBranchVideo();play();}),exportChainButton(chosen),...reverse,
-    actionButton('Build chain…',()=>startBuilder(chosen[0].source,chosen)));
+  grid.append(actionButton('▶ Play chain',()=>{stopBranchVideo();play();},'Play the clips in the chain back to back. The browser may hitch slightly at each join; Export chain joins them seamlessly'),exportChainButton(chosen),...reverse,
+    actionButton('Build chain…',()=>startBuilder(chosen[0].source,chosen),'Change to picking connections one at a time to build a chain: any direction, loops and repeats, with a take for each step'));
   drawSave();
   $('#branch-actions').replaceChildren(saveRow,grid);
 }
@@ -1030,9 +1030,9 @@ function renderBuilder(){
   $('#branch-info').append(column);column.scrollTop=column.scrollHeight;
   const play=actionButton('▶ Play chain',()=>playClips($('#branch-preview'),clips,{captionEl:caption,
     caption:i=>`Clip ${i+1} of ${clips.length} · ${nodeName(clips[i].source)} → ${nodeName(clips[i].target)}`,
-    onShow:(clip,i)=>{highlightPlaying(clip);markStepPlaying(i);}}));
-  const undo=actionButton('Undo last step',()=>{builder.steps.pop();builder.gaps.delete(builder.steps.length);builderChanged();});
-  const clear=actionButton('Clear',()=>{builder.steps=[];builder.gaps.clear();builderChanged();});
+    onShow:(clip,i)=>{highlightPlaying(clip);markStepPlaying(i);}}),'Play the clips in the chain back to back. The browser may hitch slightly at each join; Export chain joins them seamlessly');
+  const undo=actionButton('Undo last step',()=>{builder.steps.pop();builder.gaps.delete(builder.steps.length);builderChanged();},'Remove the last step of the chain');
+  const clear=actionButton('Clear',()=>{builder.steps=[];builder.gaps.clear();builderChanged();},'Remove every step and start again from the first image');
   play.disabled=!complete;undo.disabled=clear.disabled=!clips.length;
   const grid=el('div','branch-grid');
   grid.append(play,complete?exportChainButton(clips):actionButton('Export chain ↓',()=>{}),undo,clear);
@@ -1053,7 +1053,7 @@ function saveChainRow(state,clips,complete,afterSave){
     state.chainId=chain.id;state.name=chain.name;state.saved=true;
     branchTree.chains=[chain,...(branchTree.chains||[]).filter(c=>c.id!==chain.id)];
     afterSave();
-  });
+  },'Save this chain under the name, to open again from the tree\'s side panel (click empty space in the graph)');
   name.oninput=()=>{state.name=name.value;state.saved=false;save.textContent=label();};
   save.disabled=!complete;
   if(!complete)save.title='A chain with a missing step cannot be saved until the gap is filled.';
@@ -1107,7 +1107,7 @@ function exportChainButton(clips){
       saved.append(el('p','muted','Saved to the gallery as one video.'),download,actionButton('View in gallery',()=>openAsset(joined)));
       $('#branch-actions').append(saved);refreshGallery();
     }finally{button.disabled=false;button.textContent='Export chain ↓';}
-  });
+  },'Join the clips into one MP4 on this PC, dropping the repeated frame at each join, and save it to the gallery');
   return button;
 }
 $('#export-selected').onclick=run(async()=>{
@@ -1143,16 +1143,18 @@ function showBranchPair(p,playing=p?.preferred){
   if(p.takes.length){
     $('#branch-info').append(pairLabelField(p),takeList(p,playing));
     const grid=el('div','branch-grid');
-    grid.append(actionButton('▶ Play all takes',()=>playAllTakes(p)),actionButton('Open take gallery',()=>openTakeGallery(p)),
-      actionButton('New take ↗',()=>newTake(p,playing||p.preferred)),actionButton('Build chain…',()=>startBuilder(p.source,[playing||p.preferred])));
-    if(playing)grid.append(actionButton('View in gallery',async()=>openAsset(await api('/assets/'+playing.id))));
+    grid.append(actionButton('▶ Play all takes',()=>playAllTakes(p),'Play every take of this connection one after another, looping'),
+      actionButton('Open take gallery',()=>openTakeGallery(p),'Show every take in a grid to compare them, choose the preferred one, or delete several'),
+      actionButton('New take ↗',()=>newTake(p,playing||p.preferred),'Open Generate to make another version between these two images, with this take\'s settings and a new seed'),
+      actionButton('Build chain…',()=>startBuilder(p.source,[playing||p.preferred]),'Change to picking connections one at a time to build a chain: any direction, loops and repeats, with a take for each step'));
+    if(playing)grid.append(actionButton('View in gallery',async()=>openAsset(await api('/assets/'+playing.id)),'Open this take in the Gallery viewer'));
     actions.push(grid);
   }
   $('#branch-actions').replaceChildren(...actions);
 }
 // Stats label (automatic) or custom label (exactly what was typed). Switching back to stats keeps the typed text.
 function pairLabelField(p){
-  const mode=el('select');
+  const mode=el('select');mode.title='Stats label: the preferred take\'s length and number, updated automatically. Custom label: your own text';
   for(const [value,text] of [['stats','Stats label'],['custom','Custom label']]){const o=el('option','',text);o.value=value;mode.append(o);}
   mode.value=p.labelMode;
   const input=el('input');input.maxLength=60;input.placeholder='e.g. Leap';input.value=p.label;input.hidden=p.labelMode!=='custom';
@@ -1217,6 +1219,11 @@ async function generateBetween(startId,endId,base){
 // dropping on empty space cancels. Nothing is queued: Generate opens filled in.
 let connectDrag=null;
 function branchNode(id){return branchTree?.nodes.find(n=>n.id===id);}
+// The clip whose settings a new clip from this image starts with: the latest clip leaving it, else the clip that made it.
+function baseClipFor(start){
+  const finished=branchTree.clips.filter(c=>!c.pending).sort((a,b)=>a.created.localeCompare(b.created));
+  return finished.filter(c=>c.source===start).at(-1)||finished.find(c=>c.target===start);
+}
 function canConnect(n){return !!n&&n.available&&['image','virtual'].includes(n.kind);}
 function graphPosition(event){
   const box=$('#branch-graph').getBoundingClientRect(),pan=cy.pan(),zoom=cy.zoom();
@@ -1309,9 +1316,7 @@ async function dropConnectDrag(){
     // latest clip leaving its start image, else the clip that made that image.
     const pair=branchPairs.get(start+'>'+end);
     if(pair?.preferred)return newTake(pair,pair.preferred);
-    const finished=branchTree.clips.filter(c=>!c.pending).sort((a,b)=>a.created.localeCompare(b.created));
-    const base=finished.filter(c=>c.source===start).at(-1)||finished.find(c=>c.target===start);
-    return generateBetween(start,end,base);
+    return generateBetween(start,end,baseClipFor(start));
   }
   const node=await realNode(branchNode(drag.from));
   if(fromRight)startImageTool('img2vid',node);else extendBackwards(node);
@@ -1372,16 +1377,17 @@ function renderSetViewer(){
 function markSetCards(){
   for(const card of $('#set-grid').children){
     card.classList.toggle('playing',card.dataset.id===setView.playing?.id);
+    card.classList.toggle('in-play-all',!!setView.playingAll&&card.dataset.id!==setView.playing?.id);
     card.classList.toggle('selected',setView.selected.has(card.dataset.id));
   }
 }
 function renderSetActions(){
   const v=setView,item=v.playing,actions=[];
-  if(v.items.every(i=>i.video!==false))actions.push(actionButton(`▶ Play all ${v.noun}s`,playAllInSet));
-  if(v.prefer&&item&&item.id!==v.preferredId)actions.push(actionButton('★ Make preferred',async()=>{await v.prefer(item);await reloadSet(item.id);}));
-  if(v.newTake&&item)actions.push(actionButton('New take ↗',async()=>{closeSetViewer();await v.newTake(item);}));
-  if(item)actions.push(actionButton('Delete',async()=>{if(await deleteItems([item],v.label(item).toLowerCase(),v.noun+'s'))await reloadSet();}),
-    actionButton(v.viewLabel||'View in gallery',async()=>{closeSetViewer();openAsset(await api('/assets/'+item.id));}));
+  if(v.items.every(i=>i.video!==false))actions.push(actionButton(`▶ Play all ${v.noun}s`,playAllInSet,`Play every ${v.noun} one after another, looping. The playing one is outlined in orange, the rest in gray`));
+  if(v.prefer&&item&&item.id!==v.preferredId)actions.push(actionButton('★ Make preferred',async()=>{await v.prefer(item);await reloadSet(item.id);},'Make this the take used for this connection in Branches chains and exports'));
+  if(v.newTake&&item)actions.push(actionButton('New take ↗',async()=>{closeSetViewer();await v.newTake(item);},'Open Generate to make another version between the same two images, with this take\'s settings and a new seed'));
+  if(item)actions.push(actionButton('Delete',async()=>{if(await deleteItems([item],v.label(item).toLowerCase(),v.noun+'s'))await reloadSet();},`Delete this ${v.noun} and its files from this PC`),
+    actionButton(v.viewLabel||'View in gallery',async()=>{closeSetViewer();openAsset(await api('/assets/'+item.id));},'Open it in the normal viewer, with its settings and all its actions'));
   if(v.selected.size){
     const chosen=v.items.filter(i=>v.selected.has(i.id));
     const remove=actionButton(`Delete selected (${chosen.length})`,async()=>{if(await deleteItems(chosen,v.label(chosen[0]).toLowerCase(),v.noun+'s'))await reloadSet(item?.id);});
@@ -1390,14 +1396,14 @@ function renderSetActions(){
   $('#set-actions').replaceChildren(...actions);
 }
 function playSetItem(item){
-  setView.playing=item;
+  setView.playing=item;setView.playingAll=false;
   if(item.video===false){stopVideos($('#set-player'));const img=el('img');img.src=item.file;img.alt=item.prompt;$('#set-player').replaceChildren(img);}
   else playOne($('#set-player'),item);
   $('#set-caption').textContent=`${setView.label(item)} · ${item.prompt}`;
   markSetCards();renderSetActions();
 }
 function playAllInSet(){
-  const v=setView;
+  const v=setView;v.playingAll=true;
   playClips($('#set-player'),v.items,{captionEl:$('#set-caption'),caption:(i,pass)=>`${v.label(v.items[i])} (${i+1} of ${v.items.length})`+(pass>1?' · looped':''),
     onShow:item=>{v.playing=item;markSetCards();renderSetActions();}});
 }
@@ -1409,7 +1415,7 @@ async function reloadSet(playingId){
 function closeSetViewer(){if($('#set-viewer').open)$('#set-viewer').close();}
 $('#close-set-viewer').onclick=closeSetViewer;
 $('#set-viewer').addEventListener('close',()=>{stopVideos($('#set-player'));const v=setView;setView=null;v?.closed?.();});
-function actionButton(label,handler){const b=el('button','quiet',label);b.type='button';b.onclick=run(handler);return b;}
+function actionButton(label,handler,title){const b=el('button','quiet',label);b.type='button';b.onclick=run(handler);if(title)b.title=title;return b;}
 // A virtual node is saved as a gallery image the first time something is built from it.
 function realNode(n){return n.kind==='image'?api('/assets/'+n.asset_id):api(`/branches/nodes/${encodeURIComponent(n.id)}/real`,'POST');}
 function showBranchNode(n){
@@ -1423,18 +1429,21 @@ function showBranchNode(n){
   const actions=[];
   if(n.available&&n.kind!=='pending'){
     // Two rows: build backward or forward, then look at the image or edit it into a new one.
-    const gallery=actionButton('View in gallery',async()=>openAsset(await api('/assets/'+n.asset_id)));
+    const gallery=actionButton('View in gallery',async()=>openAsset(await api('/assets/'+n.asset_id)),'Open this image in the Gallery viewer');
     if(n.kind!=='image'){gallery.disabled=true;gallery.title='This frame is saved to the gallery once something is built from it.';}
+    // First row: make a clip that ends here, starts and ends here, or starts here. Second row: view or edit it.
+    const extend=el('div','branch-grid three');
+    extend.append(actionButton('← Extend backward',async()=>extendBackwards(await realNode(n)),'Make a clip that ends on this image: Generate opens with this image as the end image'),
+      actionButton('↻ Loop take',()=>generateBetween(n.id,n.id,baseClipFor(n.id)),'Make a clip that starts and ends on this image, a loop: Generate opens with this image as both the start and the end image'),
+      actionButton('Extend forward →',async()=>startImageTool('img2vid',await realNode(n)),'Make a clip that starts from this image: Generate opens with this image as the start image'));
     const grid=el('div','branch-grid');
-    grid.append(actionButton('← Extend backward',async()=>extendBackwards(await realNode(n))),
-      actionButton('Extend forward →',async()=>startImageTool('img2vid',await realNode(n))),
-      gallery,actionButton('Edit into new ↗',async()=>startImageTool('edit',await realNode(n))));
-    actions.push(grid);
+    grid.append(gallery,actionButton('Edit into new ↗',async()=>startImageTool('edit',await realNode(n)),'Make a new image from this one by written instruction (Edit). This image is kept'));
+    actions.push(extend,grid);
   }
   if(n.kind!=='pending'&&[...branchPairs.values()].some(p=>p.preferred&&p.source===n.id))
-    actions.push(actionButton('Build chain from here…',()=>startBuilder(n.id)));
+    actions.push(actionButton('Build chain from here…',()=>startBuilder(n.id),'Change to picking connections one at a time to build a chain: any direction, loops and repeats, with a take for each step, starting at this image'));
   if(n.added&&!branchTree.clips.some(c=>c.source===n.id||c.target===n.id))
-    actions.push(actionButton('Remove from Branches',async()=>{await api('/branches/images/'+n.asset_id,'DELETE');branchOpenId=null;await showBranches();}));
+    actions.push(actionButton('Remove from Branches',async()=>{await api('/branches/images/'+n.asset_id,'DELETE');branchOpenId=null;await showBranches();},'Take this image out of Branches. It stays in the gallery'));
   $('#branch-actions').replaceChildren(...actions);
 }
 // A short name such as A1, shown on the node and used for exported file names.
@@ -1469,15 +1478,15 @@ async function updateBranchButton(a){
       if(found)break;
     }
     if(selected?.id!==a.id||!found)return;
-    button.textContent='Open chain in builder';
+    button.textContent='Open chain in builder';button.title='Open this chain in the Branches chain builder, with the same steps and takes';
     button.onclick=()=>{$('#viewer').close();openInBranches(found.id,[],{steps});};
     button.hidden=false;return;
   }
   const found=await api('/branches/'+a.id).catch(()=>null);
   if(selected?.id!==a.id)return;
-  if(found){button.textContent='Show in branches';button.onclick=()=>{$('#viewer').close();openInBranches(found.id);};}
+  if(found){button.textContent='Show in branches';button.title='Open the Branches tree this item belongs to';button.onclick=()=>{$('#viewer').close();openInBranches(found.id);};}
   else{
-    button.textContent='Add to Branches';
+    button.textContent='Add to Branches';button.title='Start a Branches tree from this item, to build clips forward and backward from it';
     // A clip joins through its first frame; an image is listed as a tree of its own.
     button.onclick=run(async()=>{
       const id=isVideo(a)?(await api(`/branches/nodes/${encodeURIComponent(a.id+':first')}/real`,'POST')).id:(await api('/branches/images','POST',{asset_id:a.id})).tree;
@@ -1499,9 +1508,13 @@ document.addEventListener('keydown',e=>{
   if((e.key==='f'||e.key==='F')&&!e.ctrlKey&&!e.metaKey&&!e.altKey&&cy&&!$('#tree-view').hidden&&!$('#branches').hidden
      &&!e.target.closest('input,textarea,select')&&!document.querySelector('dialog[open]'))cy.fit(undefined,40);
 });
-async function connection(){const c=await api('/connection');$('#connection-dot').classList.toggle('ready',c.state==='ready');$('#connection-label').textContent=c.state==='ready'?'Connected · ready':c.state==='starting'?'Starting ComfyUI…':'Unavailable';$('#start-comfy').hidden=c.state==='ready';$('#start-comfy').disabled=c.state==='starting';$('#connection-detail').textContent=c.state==='ready'?`Connected to ${c.url}`:(c.startup?.message||c.error||'');if(c.state==='ready'&&!workflows.length)await loadWorkflows();}
+async function connection(){const c=await api('/connection');$('#connection-dot').classList.toggle('ready',c.state==='ready');$('#connection-label').textContent=c.state==='ready'&&c.startup?.state!=='starting'?'Connected · ready':c.state==='starting'||c.startup?.state==='starting'?(/^Restart/.test(c.startup?.message||'')?'Restarting ComfyUI…':'Starting ComfyUI…'):'Unavailable';$('#start-comfy').hidden=c.state==='ready';$('#start-comfy').disabled=c.state==='starting';$('#connection-detail').textContent=c.state==='ready'?`Connected to ${c.url}`:(c.startup?.message||c.error||'');if(c.state==='ready'&&!workflows.length)await loadWorkflows();}
 async function loadWorkflows(){try{workflows=(await api('/workflows')).items;toolCapabilities=await api('/image-tools');$('#upscale-model').replaceChildren(...(toolCapabilities.upscale?.models||[]).filter(m=>m==='RealESRGAN_x4plus.pth').map(m=>{const o=el('option','',m);o.value=m;return o;}));setMode(mode(),$('#workflow').value||'flux-dev');setModelOptions($('#workflow').value);refinementModels();const draft=localStorage.getItem('pixanvil-draft');// A fresh visit always starts with a random seed; a fixed seed lasts only until the page is reloaded.
   if(draft)await restoreRecipe({...JSON.parse(draft),seed:'-1'});}catch(e){$('#workflow-description').textContent=e.message;$('#generate-button').disabled=true;}}
+$('#restart-comfy').onclick=run(async()=>{
+  if(!confirm('Restart ComfyUI on SPARK? It takes a minute or two; queued jobs wait until it is back.'))return;
+  await api('/connection/restart','POST');notice('Restarting ComfyUI on SPARK. Status will update in the sidebar.');await connection();
+});
 $('#start-comfy').onclick=run(async()=>{await api('/connection/start','POST');notice('Starting ComfyUI on SPARK. Status will update here.');await connection();});
 $('#settings-form').onsubmit=run(async e=>{e.preventDefault();await api('/settings','PUT',{library:$('#library').value,comfy_url:$('#comfy-url').value,ssh_host:$('#ssh-host').value});workflows=[];notice('Settings saved. Existing images remain linked to their original files.');await connection();});$('#discover').onclick=run(async()=>{const d=await api('/discover');$('#discovery-result').textContent=d.addresses.length?`${d.hostname} → ${d.addresses.join(', ')}`:d.error;if(d.addresses.length){$('#comfy-url').value=`http://${d.hostname}:8188`;$('#ssh-host').value=`exordium@${d.hostname}`;}});
 async function readMetadata(file){const form=new FormData();form.append('file',file);metadata=await api('/inspect','POST',form);$('#metadata-content').textContent=JSON.stringify(metadata.recipe||metadata.raw,null,2);$('#metadata-notice').textContent=metadata.notice||`Recovered ${metadata.format} settings. Review before generating.`;$('#load-metadata').hidden=!metadata.recipe;$('#metadata-dialog').showModal();}
