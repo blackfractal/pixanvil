@@ -61,6 +61,48 @@ def import_file(base,path):
         return request(base,'/api/assets/import','POST',files={'file':(path.name,handle)})
 
 
+def follow_task(base,task):
+    """Print a history export or import's stage and progress until it finishes; returns the finished task."""
+    shown=''
+    while not task['finished']:
+        time.sleep(.5)
+        task=request(base,f'/api/library/tasks/{task["id"]}')
+        total=task['bytes_total'] or task['files_total']
+        done=task['bytes_done'] if task['bytes_total'] else task['files_done']
+        line=task['stage']+(f' {100*done//total}%' if total else '')
+        if line!=shown: print(line,flush=True); shown=line
+    if task['error']: raise RuntimeError(task['error'])
+    return task
+
+
+def export_history(base,path):
+    task=follow_task(base,request(base,'/api/library/export','POST'))
+    with httpx.Client(timeout=None,trust_env=False) as client, client.stream('GET',f'{base}/api/library/tasks/{task["id"]}/file',headers={'X-PixAnvil':'local'}) as response:
+        response.raise_for_status()
+        part=Path(str(path)+'.part')
+        with part.open('wb') as out:
+            for chunk in response.iter_bytes(1<<20): out.write(chunk)
+        part.replace(path)
+    counts=task['result']
+    print(f'Saved {path}: {counts["jobs"]} jobs, {counts["assets"]} gallery items, {counts["presets"]} presets.')
+    if counts['missing']: print('Missing from disk, not included: '+', '.join(counts['missing']))
+    return 0
+
+
+def import_history(base,path):
+    path=Path(path)
+    print('Uploading',flush=True)
+    with path.open('rb') as handle, httpx.Client(timeout=None,trust_env=False) as client:
+        response=client.post(base+'/api/library/import',headers={'X-PixAnvil':'local'},files={'file':(path.name,handle,'application/zip')})
+        if response.is_error: raise RuntimeError(response.json().get('detail',response.text))
+    result=follow_task(base,response.json())['result']
+    added,skipped=result['added'],result['skipped']
+    print(f'Added {added["jobs"]} jobs, {added["assets"]} gallery items, {added["presets"]} presets, {added["inputs"]} source images.')
+    print(f'Already here, skipped: {skipped["jobs"]} jobs, {skipped["assets"]} gallery items, {skipped["presets"]} presets.')
+    if result['unavailable']: print(f'{len(result["unavailable"])} gallery items were missing from the export and were not added.')
+    return 0
+
+
 def main():
     parser=argparse.ArgumentParser(description='PixAnvil — local images, made on SPARK')
     sub=parser.add_subparsers(dest='command')
@@ -89,6 +131,10 @@ def main():
     imp.add_argument('file')
     imp.add_argument('--port',type=int,default=8790)
     imp.add_argument('--json',action='store_true',help='Print the whole asset record instead of its id')
+    exp=sub.add_parser('export',help='Save the whole history (jobs, gallery, presets, Branches, files) to a zip')
+    exp.add_argument('file'); exp.add_argument('--port',type=int,default=8790)
+    imh=sub.add_parser('import-history',help='Merge a history zip into this library; anything already present is skipped')
+    imh.add_argument('file'); imh.add_argument('--port',type=int,default=8790)
     for name,description in (('open',None),('status',None),('start-comfy',None),('stop','Stop the running PixAnvil server')):
         cmd=sub.add_parser(name,help=description)
         cmd.add_argument('--port',type=int,default=8790)
@@ -112,6 +158,8 @@ def main():
     if args.command=='open': webbrowser.open(base); print(base); return 0
     if args.command=='status': print(json.dumps(request(base,'/api/connection'),indent=2)); return 0
     if args.command=='start-comfy': print(request(base,'/api/connection/start','POST')); return 0
+    if args.command=='export': return export_history(base,args.file)
+    if args.command=='import-history': return import_history(base,args.file)
     if args.command=='import':
         asset=import_file(base,args.file)
         print(json.dumps(asset,indent=2) if args.json else f'Imported: {asset["id"]}\nSaved: {Path(asset["root"])/asset["path"]}')

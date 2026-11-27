@@ -123,3 +123,9 @@ fieldset.plain{border:0;padding:0;margin:0;min-width:0}
 .card.pending .stack-count{top:auto;bottom:10px}
 .branch-grid.three{grid-template-columns:repeat(3,1fr)}
 .branch-grid.three button{min-width:0;padding-left:6px;padding-right:6px;white-space:normal;line-height:1.25}
+.history-buttons{display:flex;gap:10px;margin-top:6px}
+.history-progress{margin-top:14px}
+.history-progress progress{width:100%;height:8px;accent-color:var(--accent)}
+.history-progress div{display:flex;justify-content:space-between;align-items:center;gap:10px}
+#history-result{padding:35px;max-width:620px}
+#history-result .field-note{overflow-wrap:anywhere}

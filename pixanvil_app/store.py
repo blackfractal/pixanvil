@@ -307,6 +307,48 @@ class Store:
         with self.connect() as db:
             return [self.decode(r) for r in db.execute('SELECT * FROM assets')]
 
+    # History export and import (pixanvil_app/history.py). Records travel as plain JSON, not as this file, so an old
+    # export still imports after the schema changes.
+    BRANCH_TABLES = ('branch_layout', 'branch_names', 'branch_added', 'branch_labels', 'branch_pairs', 'branch_chains', 'branch_takes')
+    JOB_COLUMNS = ('id', 'created', 'updated', 'state', 'prompt_id', 'recipe', 'graph', 'error', 'outputs')
+    ASSET_COLUMNS = ('id', 'job_id', 'created', 'root', 'path', 'thumbnail', 'recipe', 'width', 'height', 'favorite', 'rating')
+
+    def export_records(self):
+        """Every job, asset and preset, decoded, and every Branches row, by table."""
+        with self.connect() as db:
+            return {'jobs': [self.decode(r) for r in db.execute('SELECT * FROM jobs ORDER BY created')],
+                    'assets': [self.decode(r) for r in db.execute('SELECT * FROM assets ORDER BY created')],
+                    'presets': [self.decode(r) for r in db.execute('SELECT * FROM presets ORDER BY name')],
+                    'branches': {t: [dict(r) for r in db.execute('SELECT * FROM '+t)] for t in self.BRANCH_TABLES}}
+
+    def record_ids(self):
+        with self.connect() as db:
+            return {t: {r[0] for r in db.execute(f'SELECT id FROM {t}')} for t in ('jobs', 'assets', 'presets')}
+
+    def import_records(self, jobs, assets, presets, branches):
+        """Insert imported records in one transaction, keeping their created times. A record whose id (or a Branches
+        row whose key) is already present is skipped, so local values win. Returns how many of each were added."""
+        def insert(db, table, columns, row):
+            names = [c for c in columns if c in row]
+            values = [json.dumps(row[c]) if isinstance(row[c], (dict, list)) else row[c] for c in names]
+            return db.execute(f'INSERT OR IGNORE INTO {table}({",".join(names)}) VALUES({",".join("?"*len(names))})', values).rowcount
+        added = {'jobs': 0, 'assets': 0, 'presets': 0, 'branch_rows': 0}
+        with self.connect() as db:
+            for job in jobs:
+                added['jobs'] += insert(db, 'jobs', self.JOB_COLUMNS, job)
+            for asset in assets:
+                added['assets'] += insert(db, 'assets', self.ASSET_COLUMNS, asset)
+            for preset in presets:
+                added['presets'] += insert(db, 'presets', ('id', 'name', 'data'), preset)
+            for table, rows in branches.items():
+                if table not in self.BRANCH_TABLES:
+                    continue
+                columns = [r[1] for r in db.execute(f'PRAGMA table_info({table})')]
+                for row in rows:
+                    if isinstance(row, dict):
+                        added['branch_rows'] += insert(db, table, columns, row)
+        return added
+
     def job_count(self):
         with self.connect() as db:
             return db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0]

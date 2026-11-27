@@ -136,6 +136,10 @@ Refine, upscale, edit and animate jobs snapshot their source PNG in `.local/inpu
 
 `GET /api/image-tools` reports installed capabilities. `POST /api/jobs` accepts `operation`, `source_asset_id`, `end_asset_id` (video end image), `variation_seed`, `variation_strength`, `denoise`, `scale`, `upscale_model`, and an optional `refinement` object alongside generation settings. `GET /api/assets/{id}` returns source/child metadata. `POST /api/assets/import` (multipart `file`) adds an image and returns its asset; `POST /api/assets/{id}/first-frame` does the same for a clip's opening frame. The `operation` values are `txt2img`, `variation`, `refine`, `upscale`, `edit` and `img2vid`.
 
+## Save and load history
+
+**Settings → Save and load history.** **Export history** builds one zip of every job, gallery item, preset and Branches record (labels, takes, saved chains and so on), with every library file and saved source image, and downloads it as `pixanvil-history-<date>.zip`. **Import history…** merges such a zip into the current library: anything already present is skipped, so importing the same zip twice changes nothing, and for items you already have your own favorites and choices are kept. Files go into the current library folder, so a zip also moves a library to another folder or PC. Jobs that were still queued come back cancelled, never rerun. Both show a progress bar and can be cancelled; both are refused while a job is rendering. The settings recorded at export are shown after an import but never applied. From a terminal: `python pixanvil.py export history.zip` and `python pixanvil.py import-history history.zip`.
+
 ## Tests
 
 ```powershell

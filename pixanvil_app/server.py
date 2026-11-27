@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from .config import Config, ROOT
 from .store import Store
+from . import history
 from .comfy import Comfy
 from .engine import Engine
 from .workflows import catalog, compile_recipe
@@ -164,6 +165,10 @@ class SavedChain(Chain):
 def make_app(state=None, worker=True, client_factory=Comfy):
     config=Config(state)
     store=Store(config.state/'pixanvil.sqlite3')
+    # History zips being built or uploaded live here; any left behind by a crash are removed at start.
+    exports=config.state/'exports'; exports.mkdir(exist_ok=True)
+    for leftover in [*exports.glob('history-*.zip'),*exports.glob('import-*.zip')]: leftover.unlink(missing_ok=True)
+    library_tasks={}
     engine=Engine(store,config,client_factory)
     startup={'state':'idle','message':''}
     start_lock=threading.Lock()
@@ -526,6 +531,64 @@ def make_app(state=None, worker=True, client_factory=Comfy):
                 try: file.unlink()
                 except OSError: leftover.append(str(file))
         return {'deleted_jobs':jobs,'deleted_assets':len(removed),'deleted_inputs':len(inputs),'leftover_files':leftover}
+
+    # ---- History export and import (pixanvil_app/history.py): background tasks the page polls for progress. ----
+    def start_library_task(task,work):
+        if any(j['state'] in busy_states for j in store.active()):
+            raise HTTPException(409,'Some jobs may still be rendering on ComfyUI. Wait for them to finish, or abandon them first.')
+        if any(not t.finished for t in library_tasks.values()):
+            raise HTTPException(409,'A history export or import is already running.')
+        library_tasks[task.id]=task
+        def go():
+            try: work()
+            except history.Cancelled: task.update(stage='Cancelled',error='Cancelled')
+            except Exception as exc: task.update(stage='Failed',error=str(exc))
+            finally: task.update(finished=True)
+        threading.Thread(target=go,daemon=True).start()
+        return task.public()
+
+    def library_task(task_id):
+        task=library_tasks.get(task_id)
+        if not task: raise HTTPException(404,'No such export or import')
+        return task
+
+    @app.post('/api/library/export',status_code=202)
+    def export_library():
+        """Start building a zip of the whole history; download it from the task once it is ready."""
+        task=history.Task('export')
+        path=exports/f'history-{task.id}.zip'
+        return start_library_task(task,lambda:history.export_history(task,store,config.data,asset_files,saved_inputs(),path))
+
+    @app.post('/api/library/import',status_code=202)
+    async def import_library(file:UploadFile):
+        """Merge an uploaded history zip into this library. Anything already present is skipped."""
+        task=history.Task('import')
+        path=exports/f'import-{task.id}.zip'
+        with path.open('wb') as out:
+            while chunk:=await file.read(1<<20): out.write(chunk)
+        def work():
+            try: history.import_history(task,store,config.data['library'],config.state/'inputs',path,engine.lock)
+            finally: path.unlink(missing_ok=True)
+        try: return start_library_task(task,work)
+        except HTTPException:
+            path.unlink(missing_ok=True); raise
+
+    @app.get('/api/library/tasks/{task_id}')
+    def library_task_status(task_id:str): return library_task(task_id).public()
+
+    @app.post('/api/library/tasks/{task_id}/cancel')
+    def cancel_library_task(task_id:str):
+        task=library_task(task_id); task.cancel_requested=True
+        return task.public()
+
+    @app.get('/api/library/tasks/{task_id}/file')
+    def library_task_file(task_id:str):
+        """The finished export, sent once; the temporary zip is deleted after it is sent."""
+        task=library_task(task_id)
+        if not task.file or not task.file.is_file(): raise HTTPException(404,'This export is not ready, or was already downloaded')
+        file=task.file; task.file=None
+        return FileResponse(file,media_type='application/zip',filename=f'pixanvil-history-{datetime.now().date().isoformat()}.zip',
+                            background=BackgroundTask(file.unlink,missing_ok=True))
 
     @app.get('/api/assets')
     def assets(q:str='',model:str='',offset:int=0,limit:int=60,favorites:bool=False,media:Literal['','image','video']='',

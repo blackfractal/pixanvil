@@ -1528,3 +1528,73 @@ async function readMetadata(file){const form=new FormData();form.append('file',f
 $('#metadata-file').onchange=run(e=>{const file=pickedFile(e);if(file)return readMetadata(file);});dropZone($('#metadata-drop'),readMetadata);$('#close-metadata').onclick=()=>$('#metadata-dialog').close();$('#load-metadata').onclick=run(async()=>{endEditing(false);await restoreRecipe(metadata.recipe);$('#metadata-dialog').close();});
 async function init(){tab(location.hash.slice(1)||'gallery');const settings=await api('/settings');$('#library').value=settings.library;$('#comfy-url').value=settings.comfy_url;$('#ssh-host').value=settings.ssh_host;await Promise.all([refreshGallery(),refreshPresets(),refreshJobs(),connection()]);setInterval(()=>refreshJobs().catch(()=>{}),2000);setInterval(()=>connection().catch(()=>{}),10000);}
 run(init)();
+
+// ---- Save and load history (pixanvil_app/history.py): an export or import runs on the server; this shows its progress. ----
+let historyTask=null,historyUpload=null;
+function showHistoryProgress(stage,done,total,detail=''){
+  $('#history-progress').hidden=false;
+  $('#history-bar').max=total||1;$('#history-bar').value=total?done:0;
+  $('#history-stage').textContent=stage+(detail?` · ${detail}`:'');
+}
+function historyBusy(busy){$('#export-history').disabled=$('#import-history').disabled=busy;if(!busy)$('#history-progress').hidden=true;}
+async function followHistoryTask(task){
+  historyTask=task;
+  try{
+    for(;;){
+      const total=task.bytes_total||task.files_total;
+      showHistoryProgress(task.stage,task.bytes_total?task.bytes_done:task.files_done,total,task.files_total?`${task.files_done} of ${task.files_total} files`:'');
+      if(task.finished)break;
+      await new Promise(resolve=>setTimeout(resolve,500));
+      task=await api('/library/tasks/'+task.id);
+    }
+  }finally{historyTask=null;}
+  if(task.error)throw new Error(task.stage==='Cancelled'?'Cancelled.':task.error);
+  return task;
+}
+$('#export-history').onclick=run(async()=>{
+  historyBusy(true);
+  try{
+    const task=await followHistoryTask(await api('/library/export','POST'));
+    const link=el('a');link.href=`/api/library/tasks/${task.id}/file`;link.download='';document.body.append(link);link.click();link.remove();
+    const c=task.result;
+    notice(`History exported: ${count(c.jobs,'job','jobs')}, ${count(c.assets,'gallery item','gallery items')}, ${count(c.presets,'preset','presets')}. Your browser saves the zip.`+
+      (c.missing.length?` Missing from disk, not included: ${c.missing.join(', ')}`:''));
+  }finally{historyBusy(false);}
+});
+$('#import-history').onclick=()=>$('#import-history-file').click();
+// The upload uses XMLHttpRequest, the one browser API that reports upload progress.
+function uploadHistory(file){
+  return new Promise((resolve,reject)=>{
+    const xhr=new XMLHttpRequest();historyUpload=xhr;
+    xhr.open('POST','/api/library/import');xhr.setRequestHeader('X-PixAnvil','local');
+    xhr.upload.onprogress=e=>showHistoryProgress('Uploading',e.loaded,e.total,`${(e.loaded/1e6).toFixed(0)} of ${(e.total/1e6).toFixed(0)} MB`);
+    xhr.onload=()=>{
+      historyUpload=null;
+      let data={};try{data=JSON.parse(xhr.responseText);}catch{}
+      if(xhr.status>=200&&xhr.status<300)resolve(data);else reject(new Error(typeof data.detail==='string'?data.detail:'The upload failed.'));
+    };
+    xhr.onerror=()=>{historyUpload=null;reject(new Error('The upload failed.'));};
+    xhr.onabort=()=>{historyUpload=null;reject(new Error('Cancelled.'));};
+    const form=new FormData();form.append('file',file);xhr.send(form);
+  });
+}
+$('#import-history-file').onchange=run(async()=>{
+  const file=$('#import-history-file').files[0];$('#import-history-file').value='';
+  if(!file)return;
+  historyBusy(true);
+  try{
+    const r=(await followHistoryTask(await uploadHistory(file))).result;
+    const line=(label,c)=>`${label}: ${count(c.jobs,'job','jobs')}, ${count(c.assets,'gallery item','gallery items')}, ${count(c.presets,'preset','presets')}, ${count(c.inputs,'source image','source images')}`;
+    const body=[el('p','',line('Added',r.added)),el('p','muted',line('Already here, skipped',r.skipped))];
+    if(r.unavailable.length)body.push(el('p','',`${count(r.unavailable.length,'gallery item was','gallery items were')} missing from the export, so ${r.unavailable.length===1?'it was':'they were'} not added.`));
+    const from=r.settings||{};
+    body.push(el('p','field-note',`Exported ${r.exported?new Date(r.exported).toLocaleString():'at an unknown time'}${from.library?` from the library ${from.library}`:''}${from.comfy_url?`, rendering on ${from.comfy_url}`:''}. Your own settings are unchanged.`));
+    $('#history-result-body').replaceChildren(...body);$('#history-result').showModal();
+    await Promise.all([refreshGallery(),refreshJobs(),refreshPresets()]);
+  }finally{historyBusy(false);}
+});
+$('#cancel-history').onclick=run(async()=>{
+  if(historyUpload){historyUpload.abort();return;}
+  if(historyTask)await api(`/library/tasks/${historyTask.id}/cancel`,'POST');
+});
+$('#close-history-result').onclick=()=>$('#history-result').close();
