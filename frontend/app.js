@@ -934,7 +934,7 @@ function renderChainSelection(ids,reversed){
   // Choosing a take redraws the heading and the column, since the length can change, and the chain needs saving again.
   const draw=()=>{
     const nextHeading=chainHeading(chosen);
-    const nextColumn=chainColumn(chosen[0].source,chosen,{onTake:(i,id)=>{chosen[i]=clipById.get(id);saving.saved=false;draw();drawSave();}});
+    const nextColumn=chainColumn(chosen[0].source,chosen,{onTake:(i,id)=>{stopBranchVideo();caption.textContent='';chosen[i]=clipById.get(id);saving.saved=false;draw();drawSave();}});
     heading.replaceWith(nextHeading);heading=nextHeading;
     if(column)column.replaceWith(nextColumn);column=nextColumn;
   };
@@ -963,20 +963,27 @@ function beginBuilder(state){
 }
 // Opens saved steps ({clip, start_key, end_key}) in the builder. A deleted take is replaced by the preferred take
 // between the same two images; with none left the step stays as a gap. `saved` is the saved chain, if it is one.
+// When later steps cannot be opened at all (their images are now in another tree), the builder holds a copy, so
+// saving never overwrites the full saved chain with its surviving start.
 function openChain(steps,saved=null){
   const nodeByKey=new Map(branchTree.nodes.filter(n=>n.label_key).map(n=>[n.label_key,n.id]));
   const ids=[],gaps=new Map(),notes=[];
+  let cut=false;
   for(const [i,step] of steps.entries()){
     const clip=clipById.get(step.clip);
     if(clip){ids.push(clip.id);continue;}
     const source=nodeByKey.get(step.start_key),target=nodeByKey.get(step.end_key);
-    if(!source||!target){notes.push(`Steps ${i+1} to ${steps.length} could not be opened: step ${i+1}'s clip was deleted and its images are no longer in this tree.`);break;}
+    if(!source||!target){notes.push(`Steps ${i+1} to ${steps.length} could not be opened: step ${i+1}'s clip was deleted and its images are no longer in this tree.`);cut=true;break;}
     const pair=branchPairs.get(source+'>'+target);
     if(pair?.preferred){ids.push(pair.preferred.id);notes.push(`Step ${i+1}'s take was deleted, so it uses take ${pair.preferred.take} instead.`);}
     else{ids.push(null);gaps.set(i,{source,target});}
   }
   const first=clipById.get(ids[0])?.source||gaps.get(0)?.source;
   if(!first){notice('This chain cannot be opened: its first clip was deleted and its images are no longer in this tree.');return;}
+  if(cut&&saved){
+    notes.push(`This is a copy of the steps that could be opened. Saving it makes a new chain; "${saved.name}" keeps all ${steps.length} steps.`);
+    beginBuilder({start:first,steps:ids,gaps,notes,chainId:null,name:`${saved.name} (part)`,saved:false});return;
+  }
   // A saved chain opened exactly as it was saved needs no saving.
   beginBuilder({start:first,steps:ids,gaps,notes,chainId:saved?.id||null,name:saved?.name||'',saved:!!saved&&!notes.length&&!gaps.size});
 }
