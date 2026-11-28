@@ -13,10 +13,11 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from .media import safe_path
+from .store import Store
 
 FORMAT = 1
 RECORDS = ('manifest.json', 'jobs.json', 'assets.json', 'presets.json', 'branches.json')
-BRANCH_TABLES = ('branch_layout', 'branch_names', 'branch_added', 'branch_labels', 'branch_pairs', 'branch_chains', 'branch_takes')
+BRANCH_TABLES = Store.BRANCH_TABLES
 # Already compressed, so stored as they are; everything else is deflated.
 MEDIA = {'.png', '.jpg', '.jpeg', '.webp', '.mp4'}
 # A job still in one of these states is imported as cancelled, so imported work never starts rendering on its own.
@@ -157,17 +158,64 @@ def chain_conflicts(local, incoming):
             continue
         steps = json.loads(row['steps']) if isinstance(row.get('steps'), str) else row.get('steps')
         if (row.get('name'), steps) != (here['name'], here['steps']):
-            found.append({'id': row['id'],
+            found.append({'id': row['id'], 'kind': 'chain',
                           'local': {'name': here['name'], 'steps': len(here['steps']), 'updated': here['updated']},
                           'incoming': {'name': row.get('name'), 'steps': len(steps or []), 'updated': row.get('updated')}})
     return found
+
+
+def group_conflicts(local, incoming, members):
+    """Incoming groups whose id is already here with a different name or different members (image keys), described
+    like chain conflicts. A group can be replaced or left out, but not copied: an image is in one group at most."""
+    mine = {g['id']: g for g in local}
+    keys = {}
+    for row in members:
+        keys.setdefault(row.get('group_id'), []).append(row.get('image_key'))
+    found = []
+    for row in incoming:
+        here = mine.get(row.get('id'))
+        if not here:
+            continue
+        theirs = sorted(k for k in keys.get(row['id'], []) if isinstance(k, str))
+        if (row.get('name'), theirs) != (here['name'], sorted(here['members'])):
+            found.append({'id': row['id'], 'kind': 'group',
+                          'local': {'name': here['name'], 'steps': len(here['members']), 'updated': here['updated']},
+                          'incoming': {'name': row.get('name'), 'steps': len(theirs), 'updated': row.get('updated')}})
+    return found
+
+
+def group_notes(store, incoming, members, skipped):
+    """After an import: which incoming group members stayed in another group here, and which incoming groups were
+    left with no members and removed. Returns readable notes."""
+    groups = {g['id']: g for g in store.branch_groups()}
+    owner = {k: g for g in groups.values() for k in g['members']}
+    notes = []
+    for row in incoming:
+        if row['id'] in skipped:
+            continue
+        name = row.get('name') or 'Group'
+        elsewhere = {}
+        for m in members:
+            other = owner.get(m.get('image_key')) if m.get('group_id') == row['id'] else None
+            if other and other['id'] != row['id']:
+                elsewhere.setdefault(other['name'], 0)
+                elsewhere[other['name']] += 1
+        for other, n in elsewhere.items():
+            notes.append(f"Group '{name}' from the export: {n} image{'s were' if n != 1 else ' was'} already in your group '{other}', so {'they' if n != 1 else 'it'} stayed there.")
+        if row['id'] in groups and not groups[row['id']]['members']:
+            store.delete_branch_group(row['id'])
+            notes.append(f"Group '{name}' from the export was left out: all its images are in other groups here.")
+        elif row['id'] not in groups:
+            notes.append(f"Group '{name}' from the export was left out: all its images are in other groups here.")
+    return notes
 
 
 def choose_chains(task, conflicts, policy):
     """A choice for each conflicting chain: everything by `policy`, or, when it is 'ask', whatever the person sends
     to the waiting task. Waiting can be cancelled; nothing has been written yet."""
     if policy != 'ask':
-        return {c['id']: policy for c in conflicts}
+        # A group cannot be kept as a copy, so "keep both" keeps yours for groups.
+        return {c['id']: 'skip' if c['kind'] == 'group' and policy == 'copy' else policy for c in conflicts}
     task.update(stage='Waiting for your choices', conflicts=conflicts)
     while not task.chosen.wait(.25):
         task.check()
@@ -243,7 +291,9 @@ def import_history(task, store, library, inputs_dir, path, lock, chains='ask', v
         known = store.record_ids()
         new_assets = [a for a in records['assets'] if a['id'] not in known['assets']]
         incoming_chains = [r for r in records['branches'].get('branch_chains') or [] if isinstance(r, dict)]
-        conflicts = chain_conflicts(store.branch_chains(), incoming_chains)
+        incoming_groups = [r for r in records['branches'].get('branch_groups') or [] if isinstance(r, dict) and isinstance(r.get('id'), str)]
+        incoming_members = [r for r in records['branches'].get('branch_group_members') or [] if isinstance(r, dict)]
+        conflicts = chain_conflicts(store.branch_chains(), incoming_chains)+group_conflicts(store.branch_groups(), incoming_groups, incoming_members)
         # Every file the import may write, then which are already there unchanged (skipped) or different (replaced).
         candidates = [('library/'+relative, safe_path(library, relative)) for a in new_assets for relative in a['files']]
         candidates += [(name, safe_path(inputs_dir, name[7:])) for name in names if name.startswith('inputs/')]
@@ -260,11 +310,15 @@ def import_history(task, store, library, inputs_dir, path, lock, chains='ask', v
             would = {'jobs': sum(j['id'] not in known['jobs'] for j in records['jobs']), 'assets': len(new_assets),
                      'presets': sum(p['id'] not in known['presets'] for p in records['presets']), 'inputs': new_inputs}
             task.update(stage='Done', result={'verified': True, 'counts': manifest.get('counts') or {}, 'would_add': would,
-                                              'would_replace': replaced, 'changed_chains': len(conflicts), 'bytes': need,
+                                              'would_replace': replaced, 'changed_chains': sum(c['kind'] == 'chain' for c in conflicts),
+                                              'changed_groups': sum(c['kind'] == 'group' for c in conflicts), 'bytes': need,
                                               'unavailable': unavailable, 'exported': manifest.get('exported'),
                                               'settings': manifest.get('settings') or {}, 'missing': manifest.get('missing') or []})
             return
         choices = choose_chains(task, conflicts, chains) if conflicts else {}
+        # A group cannot be copied; a "keep both" choice for one keeps yours.
+        group_ids = {c['id'] for c in conflicts if c['kind'] == 'group'}
+        choices = {i: 'skip' if i in group_ids and c == 'copy' else c for i, c in choices.items()}
         library.mkdir(parents=True, exist_ok=True); inputs_dir.mkdir(parents=True, exist_ok=True)
         free = shutil.disk_usage(library).free
         if need > free:
@@ -292,9 +346,16 @@ def import_history(task, store, library, inputs_dir, path, lock, chains='ask', v
             copies = {i for i, c in choices.items() if c == 'copy'}
             branches['branch_chains'] = [r | {'id': 'chain-'+uuid.uuid4().hex, 'name': f'{r.get("name")} (imported)'} if r['id'] in copies else r
                                          for r in incoming_chains if choices.get(r['id']) != 'skip']
+            # Groups left out keep yours, members and all. A replaced group takes the export's members, except images
+            # already in another of your groups, which stay there (see group_notes).
+            skipped_groups = {i for i in group_ids if choices.get(i) == 'skip'}
+            branches['branch_groups'] = [r for r in incoming_groups if r['id'] not in skipped_groups]
+            branches['branch_group_members'] = [r for r in incoming_members if r.get('group_id') not in skipped_groups]
+            overwrite = {i for i, c in choices.items() if c == 'overwrite'}
             with lock:
                 added = store.import_records(jobs, assets, records['presets'], branches,
-                                             replace={'branch_chains': {i for i, c in choices.items() if c == 'overwrite'}})
+                                             replace={'branch_chains': overwrite-group_ids, 'branch_groups': overwrite & group_ids})
+                notes = group_notes(store, incoming_groups, incoming_members, skipped_groups)
         except BaseException:
             for file in written:
                 file.unlink(missing_ok=True)
@@ -304,7 +365,9 @@ def import_history(task, store, library, inputs_dir, path, lock, chains='ask', v
     counts = {'jobs': len(jobs), 'assets': len(assets), 'presets': len(records['presets'])}
     result = {'added': added | {'inputs': new_inputs},
               'skipped': {k: counts[k]-added[k] for k in counts} | {'inputs': sum(n.startswith('inputs/') for n in names)-new_inputs},
-              'chains': {c: sum(1 for v in choices.values() if v == c) for c in CHAIN_CHOICES},
+              'chains': {c: sum(1 for i, v in choices.items() if v == c and i not in group_ids) for c in CHAIN_CHOICES},
+              'groups': {c: sum(1 for i, v in choices.items() if v == c and i in group_ids) for c in ('overwrite', 'skip')},
+              'group_notes': notes,
               'replaced': [{'file': name, 'kept_as': aside.name} for name, (_, aside) in zip(replaced, moved)],
               'unavailable': unavailable, 'exported': manifest.get('exported'), 'settings': manifest.get('settings') or {},
               'missing': manifest.get('missing') or []}

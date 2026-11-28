@@ -167,6 +167,32 @@ class ChainChoices(BaseModel):
     choices: dict[str,Literal['copy','overwrite','skip']]
 
 
+class GroupBox(BaseModel):
+    left: float
+    top: float
+    right: float
+    bottom: float
+
+
+class GroupNew(BaseModel):
+    name: str = Field(default='', max_length=80)
+    members: list[str] = Field(min_length=1, max_length=500)
+    box: GroupBox | None = None
+
+
+class GroupChange(BaseModel):
+    name: str | None = Field(default=None, max_length=80)
+    collapsed: bool | None = None
+    ports: dict[str, str] | None = None
+    box: GroupBox | None = None
+    clear_box: bool = False
+
+
+class GroupMembers(BaseModel):
+    add: list[str] = Field(default_factory=list, max_length=500)
+    remove: list[str] = Field(default_factory=list, max_length=500)
+
+
 class FrameAt(BaseModel):
     frame: int = Field(ge=0)
 
@@ -784,11 +810,26 @@ def make_app(state=None, worker=True, client_factory=Comfy):
                for t in trees for c in t['clips']]
         return branches.split_users(split_id,clips,store.branch_chains())
 
+    probed={}
+    def probe_clip(clip):
+        """sequence.probe of a clip's file, remembered until the file changes (a tree reads every clip it draws)."""
+        path=safe_path(clip['root'],clip['path'])
+        stat=path.stat()
+        key=(str(path),stat.st_mtime_ns,stat.st_size)
+        if key not in probed: probed[key]=sequence.probe(path)
+        return probed[key]
+
     def clip_frames(clip):
         """A clip's frame rate and frame count, read from the file: a recipe's can differ from what the model wrote."""
-        try: info=sequence.probe(safe_path(clip['root'],clip['path']))
+        try: info=probe_clip(clip)
         except (ValueError,OSError,subprocess.TimeoutExpired) as exc: raise HTTPException(422,'Cannot read this clip: '+str(exc))
         return info,round(info.seconds*info.fps)
+
+    def file_fps(clip_id,fallback):
+        """The frame rate of a clip's file, or `fallback` (the recipe's) when the file cannot be read."""
+        clip=store.asset(clip_id)
+        try: return probe_clip(clip).fps if clip else fallback
+        except (ValueError,OSError,subprocess.TimeoutExpired): return fallback
 
     def frame_png(clip,frame):
         """Frame number `frame` of a clip (from 0), as PNG bytes."""
@@ -802,6 +843,53 @@ def make_app(state=None, worker=True, client_factory=Comfy):
             raise HTTPException(500,'Could not take the frame from the clip: '+str(exc))
         finally:
             temp.unlink(missing_ok=True)
+
+    def group_keys(node_ids):
+        """The image keys of nodes picked on the page, checked: in one tree, and images that can be grouped."""
+        nodes,trees=branch_graph()
+        tree=branches.find_tree(trees,node_ids[0]) if node_ids else None
+        if not tree or any(n not in tree['nodes'] for n in node_ids): raise HTTPException(422,'Group images from one tree')
+        keys=[branches.label_key(nodes[n]) for n in node_ids]
+        if None in keys: raise HTTPException(422,'An image still rendering cannot be grouped yet')
+        return keys
+
+    def taken_message(taken):
+        names=sorted(set(taken.values()))
+        return f'{len(taken)} of these images {"is" if len(taken)==1 else "are"} already in the group{"s" if len(names)>1 else ""} {", ".join(chr(39)+n+chr(39) for n in names)}; an image can be in one group'
+
+    @app.post('/api/branches/groups',status_code=201)
+    def make_group(value:GroupNew):
+        """Group images: drawn as a box around them, or collapsed into one block with ports. Nothing is changed."""
+        keys=group_keys(value.members)
+        group_id='group-'+uuid.uuid4().hex
+        try: store.create_branch_group(group_id,value.name.strip() or 'Group',keys,value.box.model_dump() if value.box else None)
+        except ValueError as exc: raise HTTPException(409,taken_message(exc.args[0]))
+        return store.branch_group(group_id)
+
+    @app.put('/api/branches/groups/{group_id}')
+    def change_group(group_id:str,value:GroupChange):
+        """Rename a group, collapse or expand it, or name its ports."""
+        if not store.branch_group(group_id): raise HTTPException(404,'Group not found')
+        store.update_branch_group(group_id,None if value.name is None else value.name.strip() or 'Group',value.collapsed,
+                                  None if value.ports is None else {k:v.strip()[:40] for k,v in value.ports.items() if v.strip()},
+                                  value.box.model_dump() if value.box else None,value.clear_box)
+        return store.branch_group(group_id)
+
+    @app.put('/api/branches/groups/{group_id}/members')
+    def change_group_members(group_id:str,value:GroupMembers):
+        """Images joining or leaving a group, as dragged into or out of its box. A group left empty is removed."""
+        if not store.branch_group(group_id): raise HTTPException(404,'Group not found')
+        add=group_keys(value.add) if value.add else []
+        remove=group_keys(value.remove) if value.remove else []
+        try: kept=store.change_group_members(group_id,add,remove)
+        except ValueError as exc: raise HTTPException(409,taken_message(exc.args[0]))
+        return store.branch_group(group_id) if kept else {'removed':group_id}
+
+    @app.delete('/api/branches/groups/{group_id}')
+    def ungroup(group_id:str):
+        if not store.branch_group(group_id): raise HTTPException(404,'Group not found')
+        store.delete_branch_group(group_id)
+        return {'ok':True}
 
     @app.post('/api/branches/splits',status_code=201)
     def make_split(value:Split):
@@ -819,6 +907,12 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         return import_image(store,config.data['library'],frame_png(clip,value.frame),f'{clip["id"]}-frame{value.frame}.png',asset_id=split_id,
                             operation='frame',frame=value.frame,clip_frames=total,fps=info.fps,
                             prompt=prompt,resolved_prompt=prompt,parent_asset_id=clip['id'])
+
+    @app.get('/api/assets/{asset_id}/frames')
+    def clip_frame_info(asset_id:str):
+        """A clip's frame rate and frame count as read from its file, so frame numbers on the page match the file's."""
+        info,total=clip_frames(video_asset(asset_id))
+        return {'fps':info.fps,'frames':total}
 
     @app.post('/api/assets/{asset_id}/frames',status_code=201)
     def save_still(asset_id:str,value:FrameAt):
@@ -998,13 +1092,16 @@ def make_app(state=None, worker=True, client_factory=Comfy):
         # Anything using a split is in its tree, so the tree's clips are enough to say why it cannot be removed.
         keyed=[c|{'source_key':branches.label_key(nodes[c['source']]),'target_key':branches.label_key(nodes[c['target']])} for c in tree['clips']]
         chains=store.branch_chains()
+        # Frame numbers on the page (the player, the spark, Split here) use the file's frame rate, as splits do.
+        clips=[c|{'fps':file_fps(c['id'],c.get('fps'))} if not c.get('pending') and not c.get('piece') else c for c in tree['clips']]
         def drawn(node):
             key=branches.label_key(node)
             extra={'split':node['split']|{'in_use':branches.split_users(key,keyed,chains)}} if node.get('split') else {}
             return node|{'label_key':key,'label':labels.get(key,''),'default_label':defaults[node['id']]}|extra
         return branches.summary(tree,nodes,store.branch_names())|{
-            'nodes':[drawn(nodes[n]) for n in tree['nodes']],'clips':tree['clips'],
+            'nodes':[drawn(nodes[n]) for n in tree['nodes']],'clips':clips,
             'chains':branches.tree_chains(tree,nodes,store.branch_chains()),
+            'groups':branches.tree_groups(tree,nodes,store.branch_groups()),
             'positions':{n:positions[n] for n in tree['nodes'] if n in positions}}
 
     @app.put('/api/assets/{asset_id}')

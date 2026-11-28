@@ -375,3 +375,54 @@ def test_splits_pieces_and_their_chains_round_trip(two):
     done=import_zip(b,export(a))
     assert done['stage']=='Done',done
     assert drawn(b,start['id'])==drawn(a,start['id'])
+
+
+def group_history_setup(app,client):
+    """a -> x -> c and a -> y, with x and y in group 'Middle'."""
+    a,c=add_image(client,(20,60,120),'a'),add_image(client,(90,30,10),'c')
+    x,y=add_image(client,(10,140,40),'x'),add_image(client,(140,140,40),'y')
+    clip(app,client,a,end=x); clip(app,client,x,end=c); clip(app,client,a,end=y)
+    group=client.post('/api/branches/groups',headers=HEADERS,json={'name':'Middle','members':[x['id'],y['id']]}).json()
+    return a,c,x,y,group
+
+
+def test_groups_round_trip(two):
+    (app,a),(other,b)=two
+    start,c,x,y,group=group_history_setup(app,a)
+    a.put('/api/branches/groups/'+group['id'],headers=HEADERS,json={'collapsed':True,'ports':{start['id']:'In'}})
+    done=import_zip(b,export(a))
+    assert done['stage']=='Done',done
+    assert tree(b,start['id'])['groups']==tree(a,start['id'])['groups']
+
+
+@pytest.mark.parametrize('choice,expected',[('overwrite',('Middle',2)),('skip',('Middle, edited',1))])
+def test_an_import_asks_about_a_changed_group(two,choice,expected):
+    (app,a),_=two
+    start,c,x,y,group=group_history_setup(app,a)
+    data=export(a)
+    a.put('/api/branches/groups/'+group['id'],headers=HEADERS,json={'name':'Middle, edited'})
+    a.put(f'/api/branches/groups/{group["id"]}/members',headers=HEADERS,json={'remove':[y['id']]})
+    task_id=start_import(a,data)
+    waiting=wait_for(a,task_id,'Waiting for your choices')
+    [conflict]=waiting['conflicts']
+    assert (conflict['kind'],conflict['local']['name'],conflict['local']['steps'],conflict['incoming']['steps'])==('group','Middle, edited',1,2)
+    assert a.post(f'/api/library/tasks/{task_id}/choices',headers=HEADERS,json={'choices':{group['id']:choice}}).status_code==200
+    done=wait_for(a,task_id,'Done')
+    assert done['stage']=='Done' and done['result']['groups'][choice]==1,done
+    [now]=tree(a,start['id'])['groups']
+    assert (now['name'],len(now['members']))==expected
+
+
+def test_an_imported_member_already_in_another_group_stays_there(two):
+    (app,a),(other,b)=two
+    start,c,x,y,group=group_history_setup(app,a)
+    data=export(a)
+    # b gets the same images first, with y in a group of its own, then imports a's history.
+    done=import_zip(b,data)
+    b.delete('/api/branches/groups/'+group['id'],headers=HEADERS)
+    mine=b.post('/api/branches/groups',headers=HEADERS,json={'name':'Alt ending','members':[y['id']]}).json()
+    done=import_zip(b,data)
+    assert done['stage']=='Done',done
+    assert "Group 'Middle' from the export: 1 image was already in your group 'Alt ending', so it stayed there." in done['result']['group_notes']
+    groups={g['name']:sorted(g['members']) for g in tree(b,start['id'])['groups']}
+    assert groups=={'Alt ending':[y['id']],'Middle':[x['id']]}

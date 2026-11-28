@@ -601,7 +601,7 @@ async function loadTree(id){
   // Pieces are parts of takes already counted.
   const finished=tree.clips.filter(c=>!c.pending&&!c.piece).length;
   $('#tree-summary').textContent=`${count(tree.connections,'connection','connections')} · ${count(finished,'clip','clips')} · ${tree.seconds} s of footage`+(tree.pending?` · ${tree.pending} on the way`:'');
-  const signature=JSON.stringify([tree.nodes,tree.clips]);
+  const signature=JSON.stringify([tree.nodes,tree.clips,tree.groups]);
   if(fresh||signature!==branchSignature){branchSignature=signature;await drawTree(tree,fresh);}
   else cy?.resize();
   // Opened to show particular items, such as the clips a joined chain was made from.
@@ -678,6 +678,24 @@ function branchStyle(){
     {selector:'node',style:{shape:'round-rectangle',width:NODE_W,height:NODE_H,'background-color':'#252922','border-width':2,'border-color':'#3b4235',
       label:'data(label)',color:'#cbd0c3','font-size':10,'text-valign':'bottom','text-margin-y':6,'text-wrap':'ellipsis','text-max-width':NODE_W}},
     {selector:'node[thumb]',style:{'background-image':'data(thumb)','background-fit':'cover'}},
+    // Groups: a faint box with its name, or a block with ports; ports are small dots on the border.
+    {selector:'node.group-box',style:{shape:'round-rectangle',width:'data(w)',height:'data(h)','background-color':'#1d2119','background-opacity':.18,
+      'border-width':2,'border-color':'#6b7360',label:'',events:'no'}},
+    {selector:'node.group-box.will-join',style:{'border-color':SELECTED,'border-style':'dashed','background-opacity':.3}},
+    {selector:'node.group-block.will-join',style:{'border-color':SELECTED,'border-style':'dashed','border-width':3}},
+    {selector:'node.group-box.will-leave',style:{'border-color':'#e0a46a','border-style':'dashed'}},
+    // A group's title bar, drawn above images so it can always be grabbed to move the group.
+    {selector:'node.group-label',style:{shape:'rectangle',width:'data(w)',height:GROUP_TITLE,'background-color':'#2a2f25','background-opacity':.9,'border-width':0,
+      label:'data(label)',color:'#e8e9df','font-size':12,'text-valign':'center','text-halign':'center','text-margin-y':0,'text-max-width':400,'z-index':20}},
+    {selector:'node.group-block',style:{width:NODE_W,height:'data(h)','background-color':'#2a2f25','border-color':'#8a9478',
+      color:'#e8e9df','font-size':11,'text-valign':'top','text-margin-y':16,'text-wrap':'wrap'}},
+    {selector:'node.group-port',style:{shape:'ellipse',width:10,height:10,'background-color':'#cbd0c3','border-width':0,label:'',events:'no','z-index':5}},
+    // Thin strips along a box's sides, seen only on hover, dragged to resize it.
+    {selector:'node.group-handle',style:{shape:'rectangle',width:'data(w)',height:'data(h)','background-color':SELECTED,'background-opacity':0,'border-width':0,label:''}},
+    {selector:'node.group-handle:active',style:{'background-opacity':.35,'overlay-opacity':0}},
+    {selector:'node.group-label:active',style:{'overlay-opacity':0}},
+    {selector:'node.group-port.labelled.in',style:{label:'data(label)','font-size':9,color:'#a5ad9f','text-halign':'right','text-valign':'center','text-margin-x':6,'text-margin-y':0}},
+    {selector:'node.group-port.labelled.out',style:{label:'data(label)','font-size':9,color:'#a5ad9f','text-halign':'left','text-valign':'center','text-margin-x':-6,'text-margin-y':0}},
     {selector:'node.virtual',style:{opacity:.55,'border-style':'dashed'}},
     {selector:'node.pending',style:{'border-style':'dashed','text-valign':'center','text-margin-y':0}},
     {selector:'node.missing',style:{'border-style':'dashed','border-color':'#a5523f','text-valign':'center','text-margin-y':0}},
@@ -755,8 +773,9 @@ function renderingWords(p){
 function updateBranchLabels(){
   if(!cy)return;
   for(const p of branchPairs.values()){
-    const edge=cy.getElementById(p.id);if(!edge.length)continue;
-    edge.data('label',pairCaption(p));edge.toggleClass('unseen',p.takes.some(c=>!c.seen));
+    const edges=pairEdges(p.id);if(!edges.length)continue;
+    // A line shared by several connections (an outside image joined to several members) has no label of its own.
+    edges.not('.outer').data('label',pairCaption(p));edges.toggleClass('unseen',p.takes.some(c=>!c.seen));
   }
 }
 // The text under a node: its label, and its state when it has no picture.
@@ -798,6 +817,15 @@ function pairCaption(p){
   return [parts.join(' · '),coming.join(' · ')].filter(Boolean).join('\n');
 }
 function pairName(p){return `${nodeName(p.source)} → ${nodeName(p.target)}`;}
+// A connection's state classes (no finished take yet, rendering, queued, a take not played yet), and with its shape
+// (a loop on one image, or one of two connections both ways) for its own line. Pieces drawn through a group's ports
+// take the state only.
+function pairStateClasses(p){
+  return [p.preferred?'':'pending',p.rendering?'rendering':'',p.takes.some(c=>!c.seen)?'unseen':'',p.queued?'queued':''].join(' ').trim();
+}
+function pairClasses(p){
+  return [pairStateClasses(p),p.source===p.target?'self':branchPairs.has(p.target+'>'+p.source)?'two-way':''].join(' ').trim();
+}
 // Connections both ways between two images are two straight parallel lines, each shifted to the left of its own
 // direction of travel, so the pair sits side by side with the left-to-right (forward) one on top. Cytoscape draws them through explicit endpoints on the node
 // borders, worked out here and again whenever a node moves.
@@ -817,13 +845,24 @@ function placeTwoWay(edge){
 async function drawTree(tree,fit){
   if(connectDrag)endConnectDrag();
   if(sparkDrag)endSparkDrag();
+  groupDrag=null;
   const positions=await placeNodes(tree);
+  // Groups: members of a collapsed group are not drawn, a block with ports stands in, and other images shift to close
+  // the space (groupLayout). Everything else is drawn where it was saved.
+  // A group made before boxes were saved, or after Tidy layout, gets a box fitted around its members, kept from then on.
+  for(const g of tree.groups||[])if(!g.box){g.box=fittedBox(g.members,positions);if(g.box)api('/branches/groups/'+g.id,'PUT',{box:g.box}).catch(()=>{});}
+  const layout=groupLayout(tree,positions);
+  // Images an expanded box pushed out of its way are saved where they now are.
+  for(const [id,p] of Object.entries(layout.moved)){positionQueue[id]=branchTree.positions[id]={...p};}
+  if(Object.keys(layout.moved).length)run(savePositions)();
+  const at=id=>positions[id];
   const elements=[
-    ...tree.nodes.map(n=>({group:'nodes',classes:n.kind+(n.split?' split':''),position:{...positions[n.id]},
+    ...layout.elements,
+    ...tree.nodes.filter(n=>!layout.hidden.has(n.id)).map(n=>({group:'nodes',classes:n.kind+(n.split?' split':''),position:at(n.id),
       data:{id:n.id,label:nodeCaption(n),...(n.thumbnail?{thumb:n.thumbnail}:{})}})),
-    ...[...branchPairs.values()].map(p=>({group:'edges',
-      classes:[p.preferred?'':'pending',p.rendering?'rendering':'',p.takes.some(c=>!c.seen)?'unseen':'',p.queued?'queued':'',p.source===p.target?'self':branchPairs.has(p.target+'>'+p.source)?'two-way':''].join(' ').trim(),
+    ...[...branchPairs.values()].filter(p=>!layout.hiddenPairs.has(p.id)).map(p=>({group:'edges',classes:pairClasses(p),
       data:{id:p.id,source:p.source,target:p.target,label:pairCaption(p)}})),
+    ...layout.edges,
   ];
   if(!cy){
     cy=cytoscape({container:$('#branch-graph'),elements,layout:{name:'preset'},style:branchStyle(),boxSelectionEnabled:true,maxZoom:3,minZoom:.1});
@@ -831,8 +870,19 @@ async function drawTree(tree,fit){
     // A message appearing above the graph moves it without either, and clicks would then land off target.
     new ResizeObserver(()=>cy.resize()).observe($('main'));
     // While the chain builder is open, clicking a connection adds it as the next step instead of opening its panel.
-    cy.on('tap','node',e=>{if(!builder)showBranchNode(branchTree.nodes.find(n=>n.id===e.target.id()));});
-    cy.on('tap','edge',e=>{if(sparkPressed)return;const pair=pairByEdge.get(e.target.id());if(builder)addBuilderStep(pair);else showBranchPair(pair);});
+    cy.on('tap','node',e=>{
+      if(builder)return;
+      const group=e.target.data('group');
+      if(group)showGroup(branchTree.groups.find(g=>g.id===group));else showBranchNode(branchTree.nodes.find(n=>n.id===e.target.id()));
+    });
+    // Double-clicking a group's block or its name toggles collapsed and expanded.
+    cy.on('dbltap','node',e=>{const group=e.target.data('group');if(group&&!builder)run(toggleGroup)(group);});
+    // Dragging an image over a group's box says whether dropping it there joins or leaves the group.
+    cy.on('grab','node',e=>{if(e.target.data('group'))startGroupDrag(e.target);});
+    cy.on('drag','node',e=>{if(groupDrag?.handle===e.target.id())moveGroupDrag(e.target);else if(!groupDrag)showGroupDrop(e.target);});
+    // Released: a group drag that moved is saved; one that did not (a click or double-click) is simply dropped.
+    cy.on('free','node',e=>{if(groupDrag?.handle===e.target.id()){if(groupDrag.moved)run(endGroupDrag)();else groupDrag=null;}});
+    cy.on('tap','edge',e=>{if(sparkPressed)return;const pair=pairByEdge.get(e.target.id())||pairByEdge.get(e.target.data('pair'));if(builder)addBuilderStep(pair);else showBranchPair(pair);});
     cy.on('tap',e=>{if(e.target===cy&&!builder&&!sparkPressed)clearBranchPanel();});
     // Dragging off an image's side makes a new connection (see startConnectDrag).
     // Pressing the spark comes first: it pauses the clip and can be dragged to build from that frame.
@@ -841,6 +891,9 @@ async function drawTree(tree,fit){
     cy.on('tapdrag',e=>{if(connectDrag)moveConnectDrag(e.position);else if(sparkDrag)moveSparkDrag(e.position);});
     cy.on('tapend',e=>{if(connectDrag)run(dropConnectDrag)(e.position);else if(sparkDrag)run(dropSparkDrag)();});
     cy.on('mousemove','node',e=>{
+      // A group's name tag moves it and its sides resize it.
+      const handle=e.target.data('side'),tag=e.target.hasClass('group-label');
+      if(handle||tag){$('#branch-graph').style.cursor=tag?'move':handle==='left'||handle==='right'?'ew-resize':'ns-resize';return;}
       const side=!builder&&!connectDrag&&canConnect(branchNode(e.target.id()))?sideAt(e.target,e.position):null;
       $('#branch-graph').style.cursor=side?'crosshair':'';
       showSideHover(side&&e.target,side);
@@ -855,8 +908,10 @@ async function drawTree(tree,fit){
     cy.on('position','node',e=>e.target.connectedEdges('.two-way').forEach(placeTwoWay));
     cy.on('dragfree','node',e=>{
       const id=e.target.id();if(id.startsWith('job:'))return;
+      if(e.target.data('group'))return;
       positionQueue[id]={...e.target.position()};branchTree.positions[id]=positionQueue[id];
-      clearTimeout(positionTimer);positionTimer=setTimeout(run(async()=>{const positions=positionQueue;positionQueue={};await api('/branches/layout','PUT',{positions});}),250);
+      clearTimeout(positionTimer);positionTimer=setTimeout(run(savePositions),250);
+      run(dropIntoGroups)(e.target);
     });
   }else{
     const viewport={zoom:cy.zoom(),pan:{...cy.pan()}},chosen=cy.$(':selected').map(e=>e.id());
@@ -865,7 +920,7 @@ async function drawTree(tree,fit){
       cy.resize();cy.elements().remove();cy.add(elements);
       for(const id of chosen)cy.getElementById(id).select();
     }finally{redrawingTree=false;}
-    if(chainPlaying)cy.getElementById(chainPlaying).addClass('playing');
+    if(chainPlaying)pairEdges(chainPlaying).union(cy.collection(sparkPath(chainPlaying))).addClass('playing');
     if(builder)markBuilder();
     if(!fit)cy.viewport(viewport);
   }
@@ -975,7 +1030,7 @@ function playClips(container,clips,{captionEl,caption,onShow,from=0}){
 function highlightPlaying(clip){
   sparkClip=clip;
   const edge=pairByClip.get(clip.id)?.id||clip.id;
-  cy.edges().removeClass('playing');cy.getElementById(edge).addClass('playing');chainPlaying=edge;
+  cy.edges().removeClass('playing');pairEdges(edge).union(cy.collection(sparkPath(edge))).addClass('playing');chainPlaying=edge;
 }
 // ---- Chains: clips that each start where the previous one ended, played back to back. ----
 // Quick chains from a selection. A box runs forward from its leftmost image to its rightmost; two clicked images run
@@ -1092,6 +1147,7 @@ function quietUnselect(){redrawingTree=true;try{cy.elements().unselect();}finall
 function startBuilder(start,steps=[]){beginBuilder({start,steps:steps.map(c=>c.id),gaps:new Map(),notes:[],chainId:null,name:''});}
 function beginBuilder(state){
   stopBranchVideo();quietUnselect();
+  if(branchTree.groups?.some(g=>g.collapsed))branchTask(()=>drawTree(branchTree,false));
   // Clicks build the chain, so they select nothing while the builder is open.
   cy.autounselectify(true);
   builder=state;renderBuilder();
@@ -1131,9 +1187,9 @@ function builderEnd(){
 function markBuilder(){
   cy?.edges().removeClass('next-step in-chain');
   if(!builder)return;
-  for(const id of builder.steps){const pair=id&&pairByClip.get(id);if(pair)cy.getElementById(pair.id).addClass('in-chain');}
+  for(const id of builder.steps){const pair=id&&pairByClip.get(id);if(pair)pairEdges(pair.id).addClass('in-chain');}
   const end=builderEnd();
-  for(const p of branchPairs.values())if(p.preferred&&p.source===end)cy.getElementById(p.id).addClass('next-step');
+  for(const p of branchPairs.values())if(p.preferred&&p.source===end)pairEdges(p.id).addClass('next-step');
 }
 function addBuilderStep(p){
   quietUnselect();
@@ -1143,7 +1199,7 @@ function addBuilderStep(p){
 }
 // Shown in the builder's panel rather than at the top of the page, so the graph never shifts under the cursor.
 function builderWarning(message){const box=$('#branch-info .builder-warning');box.textContent=message;box.hidden=!message;}
-function stopBuilder(){builder=null;cy?.autounselectify(false);markBuilder();notice('');clearBranchPanel();}
+function stopBuilder(){builder=null;cy?.autounselectify(false);markBuilder();notice('');clearBranchPanel();if(branchTree?.groups?.some(g=>g.collapsed))branchTask(()=>drawTree(branchTree,false));}
 function builderChanged(){builder.saved=false;renderBuilder();}
 function renderBuilder(){
   stopBranchVideo();
@@ -1269,7 +1325,8 @@ function exportChainButton(clips){
 }
 $('#export-selected').onclick=run(async()=>{
   // A selected connection stands for every take between its two images.
-  const items=cy?cy.$(':selected').map(e=>e.id()).flatMap(id=>{const p=pairByEdge.get(id);return p?[...p.takes,...p.pending].map(c=>c.id):[id];}):[];
+  const groupOf=id=>branchTree.groups?.find(g=>'gblock:'+g.id===id);
+  const items=cy?cy.$(':selected').map(e=>e.id()).flatMap(id=>{const p=pairByEdge.get(id),g=groupOf(id);return p?[...p.takes,...p.pending].map(c=>c.id):g?g.members:[id];}):[];
   if(!items.length){notice('Select images and connections to export first: shift-click them, or shift-drag a box around them.');return;}
   const button=$('#export-selected');button.disabled=true;button.textContent='Exporting…';
   try{
@@ -1443,7 +1500,7 @@ function moveConnectDrag(pos){
       classes:'drag-line '+(fromRight?'from-right':'from-left'),selectable:false});
     // Dragging off a right side lands on left sides, and the other way round; the same image counts, for a loop.
     const offset=(NODE_W-NODE_W*SIDE)/2*(fromRight?-1:1);
-    for(const n of branchTree.nodes.filter(canConnect)){
+    for(const n of branchTree.nodes.filter(n=>canConnect(n)&&cy.getElementById(n.id).nonempty())){
       const at=cy.getElementById(n.id).position();
       cy.add({group:'nodes',data:{id:'drop:'+n.id,label:''},classes:'drop-zone',position:{x:at.x+offset,y:at.y},grabbable:false,selectable:false});
     }
@@ -1677,6 +1734,8 @@ $('#fit-tree').onclick=()=>cy?.fit(undefined,40);
 $('#tidy-tree').onclick=run(async()=>{
   if(!branchTree||!confirm('Lay out this whole tree again? Positions you set by hand are replaced.'))return;
   await api('/branches/layout','PUT',{positions:Object.fromEntries(branchTree.nodes.map(n=>[n.id,null]))});
+  // Boxes are refitted around their members' new places.
+  for(const g of branchTree.groups||[]){await api('/branches/groups/'+g.id,'PUT',{clear_box:true});g.box=null;}
   branchTree.positions={};await branchTask(()=>drawTree(branchTree,true));
 });
 $('#tree-name').onchange=run(async()=>{if(!branchTree)return;await api(`/branches/${encodeURIComponent(branchTree.id)}/name`,'PUT',{name:$('#tree-name').value});branchSignature='';await showBranches();});
@@ -1768,6 +1827,9 @@ $('#import-history-file').onchange=run(async()=>{
     const body=[el('p','',line('Added',r.added)),el('p','muted',line('Already here, skipped',r.skipped))];
     const ch=r.chains;
     if(ch.copy+ch.overwrite+ch.skip)body.push(el('p','',`Saved chains that differed from yours: ${ch.copy} kept as copies, ${ch.overwrite} replaced, ${ch.skip} left out.`));
+    const gr=r.groups||{overwrite:0,skip:0};
+    if(gr.overwrite+gr.skip)body.push(el('p','',`Groups that differed from yours: ${gr.overwrite} replaced, ${gr.skip} kept as yours.`));
+    for(const note of r.group_notes||[])body.push(el('p','',note));
     if(r.replaced.length)body.push(el('p','',`${count(r.replaced.length,'file was','files were')} already in the library with different contents; ${r.replaced.length===1?'it was':'they were'} moved aside (${r.replaced.map(x=>x.kept_as).join(', ')}) and the archived ${r.replaced.length===1?'copy':'copies'} written.`));
     if(r.unavailable.length)body.push(el('p','',`${count(r.unavailable.length,'gallery item was','gallery items were')} missing from the export, so ${r.unavailable.length===1?'it was':'they were'} not added.`));
     const from=r.settings||{};
@@ -1788,18 +1850,21 @@ $('#close-history-result').onclick=()=>$('#history-result').close();
 function askChainChoices(conflicts){
   const when=t=>t?new Date(t).toLocaleString():'at an unknown time';
   const picks=conflicts.map(c=>{
-    const pick=el('select');pick.setAttribute('aria-label',`What to do with ${c.local.name}`);
-    for(const [value,text] of [['copy','Keep both (the export\'s as a copy)'],['overwrite','Use the export\'s (replaces mine)'],['skip','Keep mine (leave the export\'s out)']]){
-      const o=el('option','',text);o.value=value;pick.append(o);
-    }
+    const group=c.kind==='group',noun=group?['image','images']:['step','steps'];
+    const pick=el('select');pick.setAttribute('aria-label',`What to do with ${group?'group':'chain'} ${c.local.name}`);
+    // A group cannot be kept twice (an image is in one group at most), so groups offer replace or keep.
+    const options=[...(group?[]:[['copy','Keep both (the export\'s as a copy)']]),['overwrite','Use the export\'s (replaces mine)'],['skip','Keep mine (leave the export\'s out)']];
+    for(const [value,text] of options){const o=el('option','',text);o.value=value;pick.append(o);}
+    if(group)pick.value='skip';
     const row=el('div','conflict-row'),about=el('div');
-    about.append(el('strong','',c.local.name===c.incoming.name?c.local.name:`${c.local.name} / ${c.incoming.name}`),
-      el('small','',`Mine: ${c.local.name}, ${count(c.local.steps,'step','steps')}, saved ${when(c.local.updated)}`),
-      el('small','',`In the export: ${c.incoming.name}, ${count(c.incoming.steps,'step','steps')}, saved ${when(c.incoming.updated)}`));
+    about.append(el('strong','',(group?'Group: ':'Chain: ')+(c.local.name===c.incoming.name?c.local.name:`${c.local.name} / ${c.incoming.name}`)),
+      el('small','',`Mine: ${c.local.name}, ${count(c.local.steps,...noun)}, saved ${when(c.local.updated)}`),
+      el('small','',`In the export: ${c.incoming.name}, ${count(c.incoming.steps,...noun)}, saved ${when(c.incoming.updated)}`));
     row.append(about,pick);return {id:c.id,pick,row};
   });
   $('#chain-conflict-list').replaceChildren(...picks.map(p=>p.row));
-  document.querySelectorAll('#chain-conflicts [data-all]').forEach(b=>b.onclick=()=>picks.forEach(p=>p.pick.value=b.dataset.all));
+  // Set all leaves a group alone when the choice is one groups do not have (keep both).
+  document.querySelectorAll('#chain-conflicts [data-all]').forEach(b=>b.onclick=()=>picks.forEach(p=>{if([...p.pick.options].some(o=>o.value===b.dataset.all))p.pick.value=b.dataset.all;}));
   return new Promise(resolve=>{
     const dialog=$('#chain-conflicts');
     const finish=value=>{dialog.onclose=null;if(dialog.open)dialog.close();resolve(value);};
@@ -1829,7 +1894,8 @@ $('#verify-history-file').onchange=run(async()=>{
     if(r.missing.length)body.push(el('p','',`It is incomplete: ${count(r.missing.length,'file was','files were')} already missing from disk when it was made (${r.missing.join(', ')}).`));
     body.push(el('p','muted',`Importing it here would add ${count(w.jobs,'job','jobs')}, ${count(w.assets,'gallery item','gallery items')}, ${count(w.presets,'preset','presets')} and ${count(w.inputs,'source image','source images')}`+
       (r.would_replace.length?`, and set aside ${count(r.would_replace.length,'different file','different files')} already in the library`:'')+
-      (r.changed_chains?`; ${count(r.changed_chains,'saved chain differs','saved chains differ')} from yours and would be asked about`:'')+'.'));
+      (r.changed_chains?`; ${count(r.changed_chains,'saved chain differs','saved chains differ')} from yours and would be asked about`:'')+
+      (r.changed_groups?`; ${count(r.changed_groups,'group differs','groups differ')} from yours and would be asked about`:'')+'.'));
     body.push(el('p','field-note',`Exported ${r.exported?new Date(r.exported).toLocaleString():'at an unknown time'}${r.settings?.library?` from the library ${r.settings.library}`:''}. Nothing was imported or changed.`));
     $('#history-result-eyebrow').textContent='BACKUP CHECKED';$('#history-result-title').textContent=r.missing.length?'Readable, but incomplete.':'This backup is complete and intact.';
     $('#history-result-body').replaceChildren(...body);$('#history-result').showModal();
@@ -1936,13 +2002,48 @@ function edgePoint(edge,t){
   while(level.length>1)level=level.slice(1).map((p,i)=>({x:level[i].x+(p.x-level[i].x)*t,y:level[i].y+(p.y-level[i].y)*t}));
   return level[0];
 }
+// The lines a connection is drawn as, in travel order: its own line; through an expanded group's port, the outside
+// piece then the inside piece (for an input) or the inside piece then the outside piece (for an output); or, for a
+// collapsed group, its stand-in.
+function sparkPath(pairId){
+  const parts=pairEdges(pairId).toArray();
+  if(!parts.length)return [];
+  // Put the pieces in order, from the one nothing leads into.
+  const path=[];
+  let next=parts.find(e=>!parts.some(o=>o!==e&&o.target().same(e.source())))||parts[0];
+  while(next&&!path.includes(next)){path.push(next);const end=next.target();next=parts.find(o=>!path.includes(o)&&o.source().same(end));}
+  // A line shared by several connections (an outside image to its port) carries only one of them; join it on where
+  // the path stops at a port.
+  const first=path[0].source(),last=path.at(-1).target();
+  const into=first.hasClass('group-port')?first.connectedEdges('.outer').filter(e=>e.target().same(first)).first():null;
+  const out=last.hasClass('group-port')?last.connectedEdges('.outer').filter(e=>e.source().same(last)).first():null;
+  if(into?.nonempty()&&!path.includes(into))path.unshift(into);
+  if(out?.nonempty()&&!path.includes(out))path.push(out);
+  return path;
+}
+// The length of a line as drawn, measured along it.
+function edgeLength(edge){
+  let length=0,last=edgePoint(edge,0);
+  for(let i=1;i<=16;i++){const p=edgePoint(edge,i/16);length+=Math.hypot(p.x-last.x,p.y-last.y);last=p;}
+  return length;
+}
+// A point a share t along several lines taken as one, by length.
+function pathPoint(path,t){
+  const lengths=path.map(edgeLength),total=lengths.reduce((a,b)=>a+b,0);
+  let left=t*total;
+  for(const [i,edge] of path.entries()){
+    if(left<=lengths[i]||i===path.length-1)return edgePoint(edge,lengths[i]?Math.min(1,left/lengths[i]):0);
+    left-=lengths[i];
+  }
+}
 function moveSpark(){
   requestAnimationFrame(moveSpark);
   if(!cy)return;
-  const spark=cy.getElementById('spark'),edge=chainPlaying&&cy.getElementById(chainPlaying),video=visibleBranchVideo();
-  if($('#branches').hidden||!sparkClip||!edge?.nonempty()||!video){if(spark.nonempty()&&!sparkDrag)cy.remove(spark);return;}
+  const spark=cy.getElementById('spark'),video=visibleBranchVideo();
+  const path=chainPlaying?sparkPath(chainPlaying):[];
+  if($('#branches').hidden||!sparkClip||!path.length||!video){if(spark.nonempty()&&!sparkDrag)cy.remove(spark);return;}
   if(sparkDrag)return;
-  const at=edgePoint(edge,playFraction(video,sparkClip));
+  const at=pathPoint(path,playFraction(video,sparkClip));
   if(spark.empty())cy.add({group:'nodes',data:{id:'spark'},classes:'spark',position:at,grabbable:false,selectable:false});
   else spark.position(at);
 }
@@ -1978,7 +2079,7 @@ function moveSparkDrag(pos){
     cy.add({group:'nodes',data:{id:'drag-end'},classes:'drag-end',position:{...pos},grabbable:false,selectable:false});
     cy.add({group:'edges',data:{id:'drag-line',source:'spark',target:'drag-end'},classes:'drag-line',selectable:false});
     const offset=(NODE_W-NODE_W*SIDE)/2;
-    for(const n of branchTree.nodes.filter(canConnect)){
+    for(const n of branchTree.nodes.filter(n=>canConnect(n)&&cy.getElementById(n.id).nonempty())){
       const at=cy.getElementById(n.id).position();
       for(const side of ['left','right'])
         cy.add({group:'nodes',data:{id:`drop:${n.id}:${side}`,label:''},classes:'drop-zone both',grabbable:false,selectable:false,
@@ -2024,11 +2125,15 @@ async function dropSparkDrag(){
 // ---- Frames from a clip in the Gallery viewer: Save frame N (an image of its own) and Split at frame N (Branches). ----
 // The buttons name the frame showing, so the frame saved is the one seen. Results show under the buttons, because the
 // page's notice is behind the viewer.
+// Frame numbers use the frame rate read from the file (the recipe's can differ), fetched when the clip opens.
 const fullVideo=$('#full-video');
-function viewerFrame(){return Math.max(0,Math.floor(fullVideo.currentTime*(selected?.recipe.fps||0)+1e-6));}
+let viewerFps=0,viewerFpsReady=Promise.resolve();
+function viewerFrame(){return Math.max(0,Math.floor(fullVideo.currentTime*viewerFps+1e-6));}
 function showFrameButtons(a){
   const usable=isVideo(a)&&!!a.recipe.fps;
+  viewerFps=usable?a.recipe.fps:0;
   $('#still-image').hidden=!usable;$('#split-image').hidden=true;$('#viewer-status').hidden=true;
+  if(usable)viewerFpsReady=api(`/assets/${a.id}/frames`).then(info=>{if(selected?.id===a.id){viewerFps=info.fps;labelFrameButtons();}}).catch(()=>{});
   labelFrameButtons();
 }
 function labelFrameButtons(){
@@ -2040,6 +2145,7 @@ for(const event of ['timeupdate','seeked','loadedmetadata','pause'])fullVideo.ad
 function viewerStatus(text){$('#viewer-status').textContent=text;$('#viewer-status').hidden=!text;}
 async function frameAction(work){
   fullVideo.pause();
+  await viewerFpsReady;
   try{viewerStatus(await work(viewerFrame()));}catch(e){viewerStatus(e.message);}
 }
 $('#still-image').onclick=()=>frameAction(async n=>{
@@ -2050,3 +2156,312 @@ $('#split-image').onclick=()=>frameAction(async n=>{
   await api('/branches/splits','POST',{clip_id:selected.id,frame:n});refreshGallery();
   return `Split at frame ${n}: Branches now shows the frame as an image with the clip's two pieces through it.`;
 });
+
+// ---- Groups (Nuke-style, _plans/branches.md): a box of its own size, or one block with a port per outside image. ----
+const GROUP_PAD=22,GROUP_CAPTION=20,PORT_ROW=20,PORT_GAP=28,GROUP_HANDLE=10,GROUP_TITLE=22;
+function groupCollapsed(g){return g.collapsed&&!builder;}
+// A box fitted around images, with room for their captions and the group's name: a new group's box, or one forgotten
+// (Tidy layout). After that the box keeps the size it is given.
+function fittedBox(memberIds,positions){
+  const xs=memberIds.map(id=>positions[id]?.x).filter(Number.isFinite),ys=memberIds.map(id=>positions[id]?.y).filter(Number.isFinite);
+  if(!xs.length)return null;
+  return {left:Math.min(...xs)-NODE_W/2-GROUP_PAD,right:Math.max(...xs)+NODE_W/2+GROUP_PAD,
+    top:Math.min(...ys)-NODE_H/2-GROUP_PAD-GROUP_CAPTION,bottom:Math.max(...ys)+NODE_H/2+GROUP_PAD+GROUP_CAPTION};
+}
+function portName(g,port){return port.name||nodeName(port.node);}
+// Port heights, centred on y in their order: the same on a box's sides and a block's.
+function portYs(n,y,gap){return Array.from({length:n},(_,i)=>y+(i-(n-1)/2)*gap);}
+function blockHeight(g){return Math.max(NODE_H,Math.max(g.inputs.length,g.outputs.length,1)*PORT_ROW+28);}
+function moveBox(b,d){return {left:b.left+d.x,right:b.right+d.x,top:b.top+d.y,bottom:b.bottom+d.y};}
+// The connections between an outside image and a group's members, one direction.
+function crossing(g,port,dir){
+  return [...branchPairs.values()].filter(p=>dir==='in'?p.source===port.node&&g.members.includes(p.target)&&!g.members.includes(p.source)
+    :p.target===port.node&&g.members.includes(p.source)&&!g.members.includes(p.target));
+}
+// The parts of an expanded group drawn around its members: the box, its name tag (dragged to move the group), a thin
+// handle along each side (dragged to resize it) and the port dots, all placed from the box.
+function groupChrome(g,b){
+  const w=b.right-b.left,h=b.bottom-b.top,cx=b.left+w/2,cy_=b.top+h/2,parts=[];
+  parts.push({id:'gbox:'+g.id,classes:'group-box',position:{x:cx,y:cy_},data:{w,h}});
+  // The title bar spans the top inside the side handles; it is the group's handle for moving.
+  parts.push({id:'glabel:'+g.id,classes:'group-label',position:{x:cx,y:b.top+GROUP_HANDLE/2+GROUP_TITLE/2},data:{label:g.name,group:g.id,w:Math.max(w-2*GROUP_HANDLE,20)},grabbable:true});
+  for(const [side,x,y,hw,hh] of [['left',b.left,cy_,GROUP_HANDLE,h],['right',b.right,cy_,GROUP_HANDLE,h],['top',cx,b.top,w,GROUP_HANDLE],['bottom',cx,b.bottom,w,GROUP_HANDLE]])
+    parts.push({id:`gside:${g.id}:${side}`,classes:'group-handle '+side,position:{x,y},data:{w:hw,h:hh,group:g.id,side},grabbable:true});
+  portYs(g.inputs.length,cy_,PORT_GAP).forEach((y,i)=>parts.push({id:`gport:${g.id}:in:${g.inputs[i].node}`,classes:'group-port',position:{x:b.left,y},data:{}}));
+  portYs(g.outputs.length,cy_,PORT_GAP).forEach((y,i)=>parts.push({id:`gport:${g.id}:out:${g.outputs[i].node}`,classes:'group-port',position:{x:b.right,y},data:{}}));
+  return parts;
+}
+// What groups add to the drawing: boxes or blocks and their ports, the connections drawn broken through ports, and the
+// images and connections not drawn as they are. Collapsing moves no other image; expanding pushes images out of the
+// box's way for real (pushOutOfBoxes), so what is drawn is always where things are saved.
+function groupLayout(tree,positions){
+  const groups=tree.groups||[],elements=[],edges=[],hidden=new Set(),hiddenPairs=new Set();
+  for(const g of groups)if(groupCollapsed(g))for(const id of g.members)hidden.add(id);
+  groupBoxes=[];blockBoxes=[];
+  const node=(part,selectable=false)=>({group:'nodes',data:{id:part.id,...part.data},classes:part.classes,position:part.position,grabbable:!!part.grabbable,selectable});
+  // A connection between two groups runs from the source group's output port to the target group's input port: the
+  // images themselves may be folded away. It is added once, by the source group; the target group draws only its inside.
+  const groupOf=new Map();
+  for(const g of groups)if(g.box||fittedBox(g.members,positions))for(const id of g.members)groupOf.set(id,g);
+  const between=(from,to,p)=>({group:'edges',classes:'stand-in '+(groupCollapsed(from)&&groupCollapsed(to)?'':'outer ')+pairStateClasses(p),
+    data:{id:'gcross:'+p.id,pair:p.id,label:groupCollapsed(from)&&groupCollapsed(to)?pairCaption(p):'',
+      source:`gport:${from.id}:out:${p.target}`,target:`gport:${to.id}:in:${p.source}`}});
+  for(const g of groups){
+    const saved=g.box||fittedBox(g.members,positions);if(!saved)continue;
+    for(const p of branchPairs.values())if(g.members.includes(p.source)||g.members.includes(p.target)){
+      // Inside a collapsed group everything is folded away; for an expanded one only connections crossing the box
+      // are redrawn, broken through their ports.
+      if(groupCollapsed(g)||!(g.members.includes(p.source)&&g.members.includes(p.target)))hiddenPairs.add(p.id);
+    }
+    const b=saved;
+    if(groupCollapsed(g)){
+      const h=blockHeight(g),x=b.left+NODE_W/2,y=(b.top+b.bottom)/2;
+      elements.push({...node({id:'gblock:'+g.id,classes:'group-block',position:{x,y},data:{label:`${g.name} · ${count(g.members.length,'image','images')}`,group:g.id,h}},true),grabbable:true});
+      blockBoxes.push({id:g.id,saved});
+      for(const [list,dir,px] of [[g.inputs,'in',x-NODE_W/2],[g.outputs,'out',x+NODE_W/2]])
+        portYs(list.length,y+8,PORT_ROW).forEach((py,i)=>{
+          const port=list[i],id=`gport:${g.id}:${dir}:${port.node}`,pairs=crossing(g,port,dir),other=groupOf.get(port.node);
+          elements.push(node({id,classes:'group-port labelled '+dir,position:{x:px,y:py},data:{label:portName(g,port)}}));
+          if(other){if(dir==='out')for(const p of pairs)edges.push(between(g,other,p));return;}
+          // One line per outside image; it opens the real connection (the first, if it joins several members).
+          if(pairs.length)edges.push({group:'edges',classes:'stand-in '+(pairs.length>1?'outer ':'')+pairStateClasses(pairs[0]),
+            data:{id:`gedge:${g.id}:${dir}:${port.node}`,pair:pairs[0].id,label:pairs.length>1?'':pairCaption(pairs[0]),
+              source:dir==='in'?port.node:id,target:dir==='in'?id:port.node}});
+        });
+      continue;
+    }
+    elements.push(...groupChrome(g,b).map(part=>node(part)));
+    groupBoxes.push({id:g.id,members:new Set(g.members),...b});
+    // Broken lines: outside image to its port, then port to each member it reaches.
+    for(const [list,dir] of [[g.inputs,'in'],[g.outputs,'out']])for(const port of list){
+      const id=`gport:${g.id}:${dir}:${port.node}`,pairs=crossing(g,port,dir),other=groupOf.get(port.node);
+      if(!pairs.length)continue;
+      if(!other)edges.push({group:'edges',classes:'stand-in outer '+pairStateClasses(pairs[0]),data:{id:`gedge:${g.id}:${dir}:${port.node}`,pair:pairs[0].id,label:'',
+        source:dir==='in'?port.node:id,target:dir==='in'?id:port.node}});
+      else if(dir==='out')for(const p of pairs)edges.push(between(g,other,p));
+      for(const p of pairs)edges.push({group:'edges',classes:'inner '+pairStateClasses(p),data:{id:`gseg:${g.id}:${p.id}`,pair:p.id,label:pairCaption(p),
+        source:dir==='in'?id:p.source,target:dir==='in'?p.target:id}});
+    }
+  }
+  // Anything left pointing at an image that is not drawn (in a collapsed group with no place to draw it) is dropped.
+  const drawn=new Set([...tree.nodes.filter(n=>!hidden.has(n.id)).map(n=>n.id),...elements.map(e=>e.data.id)]);
+  return {elements,edges:edges.filter(e=>drawn.has(e.data.source)&&drawn.has(e.data.target)),hidden,hiddenPairs,moved:pushOutOfBoxes(tree,positions,groups,hidden)};
+}
+// An expanded box makes room: any image (not in a group) overlapping it is pushed right until clear of it, and any image
+// a pushed one would land on is pushed along, left to right. The pushes are real moves: `positions` is updated and the
+// moved images are returned, to be saved.
+function pushOutOfBoxes(tree,positions,groups,hidden){
+  const moves={};
+  const free=tree.nodes.filter(n=>!hidden.has(n.id)&&positions[n.id]&&!groups.some(g=>g.members.includes(n.id)));
+  const at=n=>positions[n.id];
+  // Whether an image at p overlaps a rectangle r.
+  const hits=(p,r)=>p.x+NODE_W/2>r.left&&p.x-NODE_W/2<r.right&&p.y+NODE_H/2>r.top&&p.y-NODE_H/2<r.bottom;
+  const blocked=groupBoxes.map(b=>({left:b.left,right:b.right,top:b.top,bottom:b.bottom}));
+  if(!blocked.length)return moves;
+  for(const n of free.slice().sort((a,b)=>at(a).x-at(b).x)){
+    const p=at(n);let moved=0;
+    // Pushing clear of one rectangle can land on another, so check again until clear.
+    for(let again=true,guard=0;again&&guard<50;guard++){
+      again=false;
+      for(const r of blocked)if(hits({x:p.x+moved,y:p.y},r)){moved=r.right+NODE_W/2+16-p.x;again=true;}
+    }
+    if(!moved)continue;
+    const x=p.x+moved;
+    moves[n.id]=positions[n.id]={x,y:p.y};
+    blocked.push({left:x-NODE_W/2,right:x+NODE_W/2,top:p.y-NODE_H/2,bottom:p.y+NODE_H/2});
+  }
+  return moves;
+}
+// Expanded groups' boxes as last drawn, used while dragging.
+let groupBoxes=[];
+// Collapsed groups' saved boxes, for dragging a block.
+let blockBoxes=[];
+function boxAt(pos){return groupBoxes.find(b=>pos.x>=b.left&&pos.x<=b.right&&pos.y>=b.top&&pos.y<=b.bottom);}
+function showGroupDrop(node){
+  if(!cy||node.data('group'))return;
+  const pos=node.position(),over=boxAt(pos),onto=over?null:blockAt(pos);
+  for(const b of groupBoxes){
+    const box=cy.getElementById('gbox:'+b.id),member=b.members.has(node.id());
+    box.toggleClass('will-join',!member&&over===b);box.toggleClass('will-leave',member&&over!==b);
+  }
+  for(const b of blockBoxes)cy.getElementById('gblock:'+b.id).toggleClass('will-join',onto===b);
+}
+// The collapsed block under a point, if any.
+function blockAt(pos){
+  return blockBoxes.find(b=>{const r=cy.getElementById('gblock:'+b.id).boundingBox({includeLabels:false});return pos.x>=r.x1&&pos.x<=r.x2&&pos.y>=r.y1&&pos.y<=r.y2;});
+}
+// Where an image dropped on a collapsed block goes inside its box: the first free image-sized cell, left to right and
+// top to bottom; when there is none the box grows downward to make one. Returns the place and the box to save.
+function placeInBox(box,taken){
+  const left=box.left+GROUP_PAD+NODE_W/2,top=box.top+GROUP_HANDLE+GROUP_TITLE+NODE_H/2+12,stepX=NODE_W+40,stepY=NODE_H+GROUP_CAPTION+16;
+  const free=p=>!taken.some(q=>Math.abs(q.x-p.x)<NODE_W+20&&Math.abs(q.y-p.y)<NODE_H+GROUP_CAPTION);
+  for(let y=top;y+NODE_H/2+GROUP_CAPTION<=box.bottom-8;y+=stepY)
+    for(let x=left;x+NODE_W/2<=box.right-GROUP_PAD;x+=stepX)if(free({x,y}))return {at:{x,y},box};
+  const at={x:left,y:box.bottom+NODE_H/2+8};
+  return {at,box:{...box,bottom:at.y+NODE_H/2+GROUP_CAPTION+GROUP_PAD}};
+}
+// After an image is dropped: inside a box it joins that group; a member dropped outside its box leaves.
+async function dropIntoGroups(node){
+  cy.nodes('.group-box, .group-block').removeClass('will-join will-leave');
+  const id=node.id(),over=boxAt(node.position()),from=groupBoxes.find(b=>b.members.has(id));
+  if(!branchTree.nodes.some(n=>n.id===id))return;
+  // Dropped on a collapsed block: it joins that group, placed inside its box.
+  const onto=over?null:blockAt(node.position());
+  if(onto){
+    const taken=Object.entries(branchTree.positions).filter(([k])=>k!==id).map(([,p])=>p),{at,box}=placeInBox(onto.saved,taken);
+    positionQueue[id]=branchTree.positions[id]={...at};
+    await savePositions();
+    if(from)await api(`/branches/groups/${from.id}/members`,'PUT',{remove:[id]});
+    if(box!==onto.saved)await api('/branches/groups/'+onto.id,'PUT',{box});
+    await api(`/branches/groups/${onto.id}/members`,'PUT',{add:[id]});
+    branchSignature='';await branchTask(()=>loadTree(branchOpenId));
+    return;
+  }
+  if(over===from)return;
+  // Positions are saved before the tree is loaded again, so the image is drawn where it was dropped.
+  await savePositions();
+  if(from)await api(`/branches/groups/${from.id}/members`,'PUT',{remove:[id]});
+  if(over)await api(`/branches/groups/${over.id}/members`,'PUT',{add:[id]});
+  branchSignature='';await branchTask(()=>loadTree(branchOpenId));
+}
+// Dragging a group's name tag moves the box and its members together; dragging a side resizes the box. A side stops
+// at the members, and widening the box around an image adds it when released.
+let groupDrag=null;
+function startGroupDrag(node){
+  const groupId=node.data('group'),g=branchTree.groups.find(x=>x.id===groupId);
+  // A collapsed block moves the whole group: its saved box and its members' saved places, by the distance dragged.
+  if(node.hasClass('group-block')){
+    const saved=blockBoxes.find(x=>x.id===groupId)?.saved;
+    if(g&&saved)groupDrag={g,block:true,saved,handle:node.id(),moved:false,start:{...node.position()},
+      ports:cy.nodes(`[id ^= "gport:${groupId}:"]`).map(p=>({id:p.id(),at:{...p.position()}}))};
+    return;
+  }
+  const b=groupBoxes.find(x=>x.id===groupId);
+  if(!groupId||!b)return;
+  groupDrag={g,box:b,handle:node.id(),moved:false,side:node.data('side')||null,start:{...node.position()},rect:{left:b.left,right:b.right,top:b.top,bottom:b.bottom},
+    members:g.members.map(id=>({id,at:{...cy.getElementById(id).position()}}))};
+}
+function placeGroupChrome(g,rect,skip){
+  for(const part of groupChrome(g,rect)){
+    const el=cy.getElementById(part.id);if(el.empty()||part.id===skip)continue;
+    el.position(part.position);el.data(part.data);
+  }
+}
+function moveGroupDrag(node){
+  const drag=groupDrag,p=node.position();
+  drag.moved=true;
+  if(drag.block){
+    // The ports, and the lines to them, move with the block.
+    const d={x:p.x-drag.start.x,y:p.y-drag.start.y};
+    for(const port of drag.ports)cy.getElementById(port.id).position({x:port.at.x+d.x,y:port.at.y+d.y});
+    return;
+  }
+  if(!drag.side){
+    const d={x:p.x-drag.start.x,y:p.y-drag.start.y};
+    for(const m of drag.members)cy.getElementById(m.id).position({x:m.at.x+d.x,y:m.at.y+d.y});
+    drag.rect=moveBox(drag.box,d);
+  }else{
+    // A side moves on one axis only, and not past the members (with room for their captions).
+    const inner=fittedBox(drag.members.map(m=>m.id),Object.fromEntries(drag.members.map(m=>[m.id,m.at])));
+    const r={left:drag.box.left,right:drag.box.right,top:drag.box.top,bottom:drag.box.bottom};
+    if(drag.side==='left')r.left=Math.min(p.x,inner.left);
+    if(drag.side==='right')r.right=Math.max(p.x,inner.right);
+    if(drag.side==='top')r.top=Math.min(p.y,inner.top);
+    if(drag.side==='bottom')r.bottom=Math.max(p.y,inner.bottom);
+    drag.rect=r;
+    node.position(drag.side==='left'||drag.side==='right'?{x:r[drag.side],y:(r.top+r.bottom)/2}:{x:(r.left+r.right)/2,y:r[drag.side]});
+  }
+  placeGroupChrome(drag.g,drag.rect,node.id());
+}
+async function endGroupDrag(){
+  const drag=groupDrag;groupDrag=null;
+  if(!drag)return;
+  if(drag.block){
+    const at=cy.getElementById(drag.handle).position(),d={x:at.x-drag.start.x,y:at.y-drag.start.y};
+    for(const id of drag.g.members){const p=branchTree.positions[id];if(p)positionQueue[id]=branchTree.positions[id]={x:p.x+d.x,y:p.y+d.y};}
+    await savePositions();
+    await api('/branches/groups/'+drag.g.id,'PUT',{box:moveBox(drag.saved,d)});
+    branchSignature='';await branchTask(()=>loadTree(branchOpenId));
+    return;
+  }
+  const saved=drag.rect;
+  if(!drag.side){
+    for(const m of drag.members)positionQueue[m.id]=branchTree.positions[m.id]={...cy.getElementById(m.id).position()};
+    await savePositions();
+  }
+  await api('/branches/groups/'+drag.g.id,'PUT',{box:saved});
+  if(drag.side){
+    // Images the wider box now surrounds join the group.
+    const inside=branchTree.nodes.filter(n=>!drag.g.members.includes(n.id)&&n.label_key&&n.kind!=='pending').map(n=>[n.id,cy.getElementById(n.id)])
+      .filter(([,el])=>el.nonempty()&&(p=>p.x>=drag.rect.left&&p.x<=drag.rect.right&&p.y>=drag.rect.top&&p.y<=drag.rect.bottom)(el.position())).map(([id])=>id);
+    if(inside.length)await api(`/branches/groups/${drag.g.id}/members`,'PUT',{add:inside});
+  }
+  branchSignature='';await branchTask(()=>loadTree(branchOpenId));
+}
+// Sends the positions of images dragged since the last save.
+async function savePositions(){
+  clearTimeout(positionTimer);
+  const positions=positionQueue;positionQueue={};
+  if(Object.keys(positions).length)await api('/branches/layout','PUT',{positions});
+}
+async function toggleGroup(groupId){
+  const g=branchTree.groups.find(x=>x.id===groupId);if(!g)return;
+  await api('/branches/groups/'+g.id,'PUT',{collapsed:!g.collapsed});
+  branchSignature='';await branchTask(()=>loadTree(branchOpenId));
+  const next=branchTree.groups.find(x=>x.id===groupId);if(next)showGroup(next);
+}
+// Every connection drawn for a pair: its own line, or the pieces standing in for it through a group's ports.
+function pairEdges(pairId){return cy.getElementById(pairId).union(cy.edges(`[pair = "${pairId}"]`));}
+// Group the selected images (Group in the toolbar, or Ctrl+G).
+async function groupSelected(){
+  if(!cy||!branchTree)return;
+  const ids=cy.$('node:selected').map(n=>n.id()).filter(id=>branchTree.nodes.some(n=>n.id===id));
+  if(!ids.length){notice('Select the images to group first: shift-click them, or shift-drag a box around them.');return;}
+  const name=prompt(`Name this group of ${count(ids.length,'image','images')}`,'Group');if(name===null)return;
+  const g=await api('/branches/groups','POST',{name,members:ids,box:fittedBox(ids,branchTree.positions)});
+  quietUnselect();branchSignature='';await branchTask(()=>loadTree(branchOpenId));
+  const made=branchTree.groups.find(x=>x.id===g.id);if(made)showGroup(made);
+}
+$('#group-selected').onclick=run(groupSelected);
+document.addEventListener('keydown',e=>{
+  if((e.key==='g'||e.key==='G')&&(e.ctrlKey||e.metaKey)&&!e.altKey&&!$('#branches').hidden&&!$('#tree-view').hidden&&!builder
+     &&!document.querySelector('dialog[open]')&&!e.target.closest?.('input,textarea,select')){e.preventDefault();run(groupSelected)();}
+});
+// A group's panel: its name, its ports' names, Expand or Collapse, and Ungroup.
+function showGroup(g){
+  if(!g)return;
+  stopBranchVideo();
+  $('#branch-preview').replaceChildren(el('p','muted',g.collapsed
+    ?'Collapsed: the images inside are not drawn, and a stand-in connection runs to each port. Chains through it still play and export. Double-click the block, or press Expand, to work inside it.'
+    :'Drag an image into the box to add it, or a member out of the box to take it out. Double-click the group\'s name, or press Collapse, to fold it into one block.'));
+  const name=el('input');name.maxLength=80;name.value=g.name;name.setAttribute('aria-label','Group name');
+  name.onchange=run(async()=>{await api('/branches/groups/'+g.id,'PUT',{name:name.value});branchSignature='';await branchTask(()=>loadTree(branchOpenId));});
+  const field=el('label','branch-label','Name');field.append(name);
+  const ports=(list,title)=>{
+    if(!list.length)return [];
+    const box=el('div','group-ports');box.append(el('span','eyebrow',title));
+    for(const port of list){
+      const input=el('input');input.maxLength=40;input.placeholder=nodeName(port.node);input.value=port.name;
+      input.setAttribute('aria-label',`${title} port name for ${nodeName(port.node)}`);
+      input.title='The port\'s name on the collapsed block; empty uses the outside image\'s name';
+      input.onchange=run(async()=>{
+        // From the group as it is now: an earlier rename in this panel has reloaded the tree since it opened.
+        const now=branchTree.groups.find(x=>x.id===g.id)||g;
+        const names=Object.fromEntries([...now.inputs,...now.outputs].filter(p=>p.key&&p.name).map(p=>[p.key,p.name]));
+        if(input.value.trim())names[port.key]=input.value.trim();else delete names[port.key];
+        await api('/branches/groups/'+g.id,'PUT',{ports:names});branchSignature='';await branchTask(()=>loadTree(branchOpenId));
+      });
+      box.append(input);
+    }
+    return [box];
+  };
+  $('#branch-info').replaceChildren(el('span','eyebrow',`GROUP · ${count(g.members.length,'IMAGE','IMAGES')} · ${count(g.inputs.length,'INPUT','INPUTS')} · ${count(g.outputs.length,'OUTPUT','OUTPUTS')}`),
+    field,...ports(g.inputs,'Inputs'),...ports(g.outputs,'Outputs'));
+  const grid=el('div','branch-grid');
+  grid.append(actionButton(g.collapsed?'Expand':'Collapse',()=>toggleGroup(g.id),g.collapsed?'Draw the images inside again, in a box (double-click does the same)':'Fold the group into one block with a port for each outside image (double-click does the same)'),
+    actionButton('Ungroup',async()=>{
+      if(!confirm(`Ungroup "${g.name}"? The images and clips stay exactly as they are.`))return;
+      await api('/branches/groups/'+g.id,'DELETE');branchSignature='';await branchTask(()=>loadTree(branchOpenId));clearBranchPanel();
+    },'Remove the group. Nothing inside it changes'));
+  $('#branch-actions').replaceChildren(grid);
+}

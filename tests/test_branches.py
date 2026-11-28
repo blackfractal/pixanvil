@@ -560,3 +560,61 @@ def test_save_frame_makes_a_plain_image_not_a_split(setup):
     assert {c['id'] for c in found['clips']}=={take['id']} and still['id'] not in {n['id'] for n in found['nodes']}
     assert client.post(f'/api/assets/{take["id"]}/frames',headers=HEADERS,json={'frame':48}).status_code==422
     assert client.post(f'/api/assets/{a["id"]}/frames',headers=HEADERS,json={'frame':0}).status_code==404
+
+
+def group_setup(setup):
+    """a -> x -> c and a -> y (a dead end), with x and y to be grouped: input a, output c."""
+    app,client=setup
+    a,c=add_image(client,(20,60,120),'a'),add_image(client,(90,30,10),'c')
+    x,y=add_image(client,(10,140,40),'x'),add_image(client,(140,140,40),'y')
+    clip(app,client,a,end=x); clip(app,client,x,end=c); clip(app,client,a,end=y)
+    return app,client,a,c,x,y
+
+
+def test_a_group_has_a_port_for_each_outside_image(setup):
+    app,client,a,c,x,y=group_setup(setup)
+    made=client.post('/api/branches/groups',headers=HEADERS,json={'name':'Middle','members':[x['id'],y['id']]})
+    assert made.status_code==201,made.text
+    group=made.json()
+    assert (group['name'],group['collapsed'],sorted(group['members']))==('Middle',False,sorted([x['id'],y['id']]))
+    drawn=tree(client,a['id'])['groups']
+    assert len(drawn)==1 and sorted(drawn[0]['members'])==sorted([x['id'],y['id']])
+    # a has clips to both members but is one input; c is the one output.
+    assert [p['node'] for p in drawn[0]['inputs']]==[a['id']] and [p['node'] for p in drawn[0]['outputs']]==[c['id']]
+    # Collapse, rename and name a port.
+    changed=client.put('/api/branches/groups/'+group['id'],headers=HEADERS,json={'collapsed':True,'name':'Outtakes','ports':{a['id']:'Start'}}).json()
+    assert (changed['collapsed'],changed['name'],changed['ports'])==(True,'Outtakes',{a['id']:'Start'})
+    assert tree(client,a['id'])['groups'][0]['inputs'][0]['name']=='Start'
+    # An image is in one group at most.
+    again=client.post('/api/branches/groups',headers=HEADERS,json={'members':[y['id'],c['id']]})
+    assert again.status_code==409 and "'Outtakes'" in again.json()['detail']
+
+
+def test_images_join_and_leave_and_ungroup_changes_nothing(setup):
+    app,client,a,c,x,y=group_setup(setup)
+    before=sorted(c_['id'] for c_ in tree(client,a['id'])['clips'])
+    group=client.post('/api/branches/groups',headers=HEADERS,json={'members':[x['id']]}).json()
+    joined=client.put(f'/api/branches/groups/{group["id"]}/members',headers=HEADERS,json={'add':[y['id']]}).json()
+    assert sorted(joined['members'])==sorted([x['id'],y['id']])
+    left=client.put(f'/api/branches/groups/{group["id"]}/members',headers=HEADERS,json={'remove':[x['id']]}).json()
+    assert left['members']==[y['id']]
+    # The last member leaving removes the group.
+    gone=client.put(f'/api/branches/groups/{group["id"]}/members',headers=HEADERS,json={'remove':[y['id']]}).json()
+    assert gone=={'removed':group['id']} and tree(client,a['id'])['groups']==[]
+    other=client.post('/api/branches/groups',headers=HEADERS,json={'members':[x['id'],y['id']]}).json()
+    assert client.delete('/api/branches/groups/'+other['id'],headers=HEADERS).status_code==200
+    assert tree(client,a['id'])['groups']==[] and sorted(c_['id'] for c_ in tree(client,a['id'])['clips'])==before
+
+
+def test_frame_numbers_use_the_files_frame_rate_not_the_recipes(setup):
+    app,client,a,b,take=split_setup(setup)
+    # The recipe says one rate; the file (24 fps) is what frames are counted in.
+    with app.state.store.connect() as db:
+        db.execute("UPDATE assets SET recipe=json_set(recipe,'$.fps',16) WHERE id=?",(take['id'],))
+    assert client.get(f'/api/assets/{take["id"]}').json()['recipe']['fps']==16
+    info=client.get(f'/api/assets/{take["id"]}/frames').json()
+    assert (info['fps'],info['frames'])==(24,48)
+    split=client.post('/api/branches/splits',headers=HEADERS,json={'clip_id':take['id'],'frame':20}).json()
+    clips={c['id']:c for c in tree(client,a['id'])['clips']}
+    assert clips[take['id']]['fps']==24
+    assert clips[f'piece:{split["id"]}:before']['fps']==clips[f'piece:{split["id"]}:after']['fps']==24

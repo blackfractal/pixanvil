@@ -141,7 +141,7 @@ def build(assets, active_jobs, added, has_last_frame):
             for side, source, target, low, high in (('before', start_id, middle, 0, frame+1), ('after', middle, target_id, frame, total)):
                 clips.append(made | {
                     'id': f'piece:{split["id"]}:{side}', 'source': source, 'target': target, 'created': split['created'],
-                    'seconds': round((high-low)/fps, 1),
+                    'seconds': round((high-low)/fps, 1), 'fps': fps,
                     'thumbnail': f'/api/assets/{clip["id"] if side == "before" else split["id"]}/thumbnail',
                     'piece': {'clip': clip['id'], 'split': split['id'], 'start_frame': low, 'end_frame': high,
                               'start': low/fps, 'end': high/fps}})
@@ -390,3 +390,22 @@ def split_users(split_id, clips, chains):
     if named:
         reasons.append('saved chains go through it: '+', '.join(named))
     return reasons
+
+
+def tree_groups(tree, nodes, groups):
+    """The groups with members in this tree, as drawn: members as node ids, and a port for every outside node with clips
+    into the group (inputs) and every outside node the group leads to (outputs), with any name typed for it."""
+    by_key = {label_key(nodes[n]): n for n in tree['nodes'] if label_key(nodes[n])}
+    found = []
+    for group in groups:
+        members = [by_key[k] for k in group['members'] if k in by_key]
+        if not members:
+            continue
+        inside = set(members)
+        def ports(outside):
+            return [{'node': n, 'key': label_key(nodes[n]), 'name': group['ports'].get(label_key(nodes[n]) or '', '')}
+                    for n in sorted(outside, key=lambda n: (nodes[n]['created'], n))]
+        found.append({'id': group['id'], 'name': group['name'], 'collapsed': group['collapsed'], 'members': members, 'box': group.get('box'),
+                      'inputs': ports({c['source'] for c in tree['clips'] if c['target'] in inside and c['source'] not in inside}),
+                      'outputs': ports({c['target'] for c in tree['clips'] if c['source'] in inside and c['target'] not in inside})})
+    return found

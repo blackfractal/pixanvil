@@ -51,12 +51,23 @@ class Store:
                 CREATE TABLE IF NOT EXISTS branch_chains (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, steps TEXT NOT NULL,
                     created TEXT NOT NULL, updated TEXT NOT NULL);
+                -- Groups fold images into one block (see _plans/branches.md, Groups). Members are keyed by image identity,
+                -- as labels are, and an image is in at most one group. parent_id is for nesting later; ports holds port
+                -- names typed by the user, by the outside image's key.
+                CREATE TABLE IF NOT EXISTS branch_groups (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT, collapsed INTEGER NOT NULL DEFAULT 0,
+                    ports TEXT NOT NULL DEFAULT '{}', created TEXT NOT NULL, updated TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS branch_group_members (
+                    image_key TEXT PRIMARY KEY, group_id TEXT NOT NULL);
             ''')
             # When each item was first looked at; NULL marks a new result nobody has viewed yet. Items from before
             # this column existed count as seen.
             if 'seen' not in {r[1] for r in db.execute('PRAGMA table_info(assets)')}:
                 db.execute('ALTER TABLE assets ADD COLUMN seen TEXT')
                 db.execute('UPDATE assets SET seen=created')
+            # A group's box (left, top, right, bottom, in saved positions), sized by the user; NULL until first drawn.
+            if 'box' not in {r[1] for r in db.execute('PRAGMA table_info(branch_groups)')}:
+                db.execute('ALTER TABLE branch_groups ADD COLUMN box TEXT')
 
     @contextmanager
     def connect(self):
@@ -315,6 +326,74 @@ class Store:
     def decode_chain(row):
         return dict(row) | {'steps': json.loads(row['steps'])}
 
+    def branch_groups(self):
+        """Every group with its member image keys, oldest first."""
+        with self.connect() as db:
+            groups = {r['id']: dict(r) | {'collapsed': bool(r['collapsed']), 'ports': json.loads(r['ports']), 'members': [],
+                                          'box': json.loads(r['box']) if r['box'] else None}
+                      for r in db.execute('SELECT * FROM branch_groups ORDER BY created, id')}
+            for row in db.execute('SELECT * FROM branch_group_members ORDER BY image_key'):
+                if row['group_id'] in groups:
+                    groups[row['group_id']]['members'].append(row['image_key'])
+        return list(groups.values())
+
+    def branch_group(self, group_id):
+        return next((g for g in self.branch_groups() if g['id'] == group_id), None)
+
+    @staticmethod
+    def grouped_elsewhere(db, keys, group_id=None):
+        """Which of `keys` are already members of a group other than `group_id`, as {key: group name}."""
+        found = {}
+        for key in keys:
+            row = db.execute('SELECT g.id, g.name FROM branch_group_members m JOIN branch_groups g ON g.id=m.group_id '
+                             'WHERE m.image_key=?', (key,)).fetchone()
+            if row and row['id'] != group_id:
+                found[key] = row['name']
+        return found
+
+    def create_branch_group(self, group_id, name, keys, box=None):
+        """Make a group of these images. Raises ValueError naming the group of any image already in one."""
+        stamp = now()
+        with self.connect() as db:
+            taken = self.grouped_elsewhere(db, keys)
+            if taken:
+                raise ValueError(taken)
+            db.execute('INSERT INTO branch_groups(id,name,box,created,updated) VALUES(?,?,?,?,?)',
+                       (group_id, name, json.dumps(box) if box else None, stamp, stamp))
+            db.executemany('INSERT INTO branch_group_members(image_key,group_id) VALUES(?,?)', [(k, group_id) for k in keys])
+
+    def update_branch_group(self, group_id, name=None, collapsed=None, ports=None, box=None, clear_box=False):
+        """Change what is given. `clear_box` forgets the box, so the page fits a new one around the members."""
+        values = {k: v for k, v in (('name', name), ('collapsed', None if collapsed is None else int(collapsed)),
+                                     ('ports', None if ports is None else json.dumps(ports)),
+                                     ('box', None if box is None else json.dumps(box))) if v is not None}
+        if clear_box:
+            values['box'] = None
+        values['updated'] = now()
+        with self.connect() as db:
+            db.execute('UPDATE branch_groups SET '+','.join(k+'=?' for k in values)+' WHERE id=?', (*values.values(), group_id))
+
+    def change_group_members(self, group_id, add=(), remove=()):
+        """Add and remove members. Raises ValueError naming the group of any image to add that is in another group. A
+        group left with no members is removed. Returns whether the group still exists."""
+        with self.connect() as db:
+            taken = self.grouped_elsewhere(db, add, group_id)
+            if taken:
+                raise ValueError(taken)
+            db.executemany('INSERT OR IGNORE INTO branch_group_members(image_key,group_id) VALUES(?,?)', [(k, group_id) for k in add])
+            db.executemany('DELETE FROM branch_group_members WHERE image_key=? AND group_id=?', [(k, group_id) for k in remove])
+            db.execute('UPDATE branch_groups SET updated=? WHERE id=?', (now(), group_id))
+            if not db.execute('SELECT 1 FROM branch_group_members WHERE group_id=?', (group_id,)).fetchone():
+                db.execute('DELETE FROM branch_groups WHERE id=?', (group_id,))
+                return False
+        return True
+
+    def delete_branch_group(self, group_id):
+        """Ungroup: the group and its memberships go; the images and clips are untouched."""
+        with self.connect() as db:
+            db.execute('DELETE FROM branch_group_members WHERE group_id=?', (group_id,))
+            db.execute('DELETE FROM branch_groups WHERE id=?', (group_id,))
+
     def branch_added(self):
         with self.connect() as db:
             return [r['asset_id'] for r in db.execute('SELECT asset_id FROM branch_added ORDER BY created')]
@@ -333,7 +412,8 @@ class Store:
 
     # History export and import (pixanvil_app/history.py). Records travel as plain JSON, not as this file, so an old
     # export still imports after the schema changes.
-    BRANCH_TABLES = ('branch_layout', 'branch_names', 'branch_added', 'branch_labels', 'branch_pairs', 'branch_chains', 'branch_takes')
+    BRANCH_TABLES = ('branch_layout', 'branch_names', 'branch_added', 'branch_labels', 'branch_pairs', 'branch_chains', 'branch_takes',
+                     'branch_groups', 'branch_group_members')
     JOB_COLUMNS = ('id', 'created', 'updated', 'state', 'prompt_id', 'recipe', 'graph', 'error', 'outputs')
     ASSET_COLUMNS = ('id', 'job_id', 'created', 'root', 'path', 'thumbnail', 'recipe', 'width', 'height', 'favorite', 'rating')
 
@@ -368,6 +448,9 @@ class Store:
                 added['assets'] += insert(db, 'assets', self.ASSET_COLUMNS+('seen',), asset | {'seen': asset.get('seen') or asset.get('created') or now()})
             for preset in presets:
                 added['presets'] += insert(db, 'presets', ('id', 'name', 'data'), preset)
+            # A replaced group takes the export's members, so its members here are cleared first.
+            for group_id in replace.get('branch_groups', ()):
+                db.execute('DELETE FROM branch_group_members WHERE group_id=?', (group_id,))
             for table, rows in branches.items():
                 if table not in self.BRANCH_TABLES:
                     continue
@@ -387,7 +470,7 @@ class Store:
             removed = [self.decode(r) for r in db.execute('SELECT * FROM assets')]
             db.execute('DELETE FROM assets')
             db.execute('DELETE FROM jobs')
-            for table in ('branch_layout', 'branch_names', 'branch_added', 'branch_labels', 'branch_pairs', 'branch_chains', 'branch_takes'):
+            for table in self.BRANCH_TABLES:
                 db.execute('DELETE FROM '+table)
         return removed
 
