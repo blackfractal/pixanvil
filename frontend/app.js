@@ -939,7 +939,7 @@ function toggleFullscreen(element){
 }
 // Plays clips back to back and loops. Two players take turns: while one plays, the other loads the next clip,
 // so each join waits as little as possible. caption(i, pass) gets the pass number, so a loop can say it has looped.
-function playClips(container,clips,{captionEl,caption,onShow}){
+function playClips(container,clips,{captionEl,caption,onShow,from=0}){
   stopVideos(container);
   // Full screen is the whole player area, not one video: the browser leaves full screen when the video it was given
   // is hidden, which happens at every join. So the videos' own full-screen button is replaced with one for the area.
@@ -953,7 +953,7 @@ function playClips(container,clips,{captionEl,caption,onShow}){
   full.title='Full screen, staying full screen from clip to clip (double-clicking the video does the same; Esc leaves)';
   full.setAttribute('aria-label','Full screen');full.onclick=()=>toggleFullscreen(container);
   container.replaceChildren(...players,full);
-  let active=0,index=0,pass=1;
+  let active=0,index=from,pass=1;
   const load=(player,i)=>{player.poster=clips[i].thumbnail;player.src=clips[i].file;followRange(player,clips[i],()=>advance(player));};
   const show=()=>{
     const current=players[active],other=players[1-active];
@@ -970,7 +970,7 @@ function playClips(container,clips,{captionEl,caption,onShow}){
     active=1-active;index=(index+1)%clips.length;if(index===0)pass++;show();
   };
   for(const player of players)player.onended=()=>advance(player);
-  load(players[0],0);show();
+  load(players[0],from);show();
 }
 function highlightPlaying(clip){
   sparkClip=clip;
@@ -1068,13 +1068,14 @@ function renderChainSelection(ids,reversed){
   // Choosing a take redraws the heading and the column, since the length can change, and the chain needs saving again.
   const draw=()=>{
     const nextHeading=chainHeading(chosen);
-    const nextColumn=chainColumn(chosen[0].source,chosen,{onTake:(i,id)=>{stopBranchVideo();caption.textContent='';chosen[i]=clipById.get(id);saving.saved=false;draw();drawSave();}});
+    const nextColumn=chainColumn(chosen[0].source,chosen,{onTake:(i,id)=>{stopBranchVideo();caption.textContent='';chosen[i]=clipById.get(id);saving.saved=false;draw();drawSave();},
+      onPick:i=>{stopBranchVideo();play(i);}});
     heading.replaceWith(nextHeading);heading=nextHeading;
     if(column)column.replaceWith(nextColumn);column=nextColumn;
   };
   $('#branch-info').replaceChildren(heading,caption,el('p','muted','Plays the clips back to back. Each join may hitch slightly in the browser.'));
   draw();$('#branch-info').append(column);
-  const play=()=>playClips($('#branch-preview'),chosen,{captionEl:caption,
+  const play=(from=0)=>playClips($('#branch-preview'),chosen,{captionEl:caption,from,
     caption:i=>`Clip ${i+1} of ${chosen.length} · ${nodeName(chosen[i].source)} → ${nodeName(chosen[i].target)}`,
     onShow:(clip,i)=>{highlightPlaying(clip);markStepPlaying(i);}});
   const grid=el('div','branch-grid');
@@ -1168,11 +1169,14 @@ function renderBuilder(){
     $('#branch-info').append(el('p','builder-warning',`Step ${i+1} (${nodeName(gap.source)} → ${nodeName(gap.target)}) has no take left, so the chain cannot play, export or be saved. A new take of that connection fills the gap when it finishes, while the chain is open here or the next time it is opened.`));
   }
   $('#branch-info').append(el('p','muted',clips.length?'Click a blue connection to add the next step. The same one can be added again and again.':'Click a blue connection to add the first step.'));
-  const column=chainColumn(builder.start,clips,{gaps:builder.gaps,onTake:(i,id)=>{builder.steps[i]=id;builderChanged();}});
-  $('#branch-info').append(column);column.scrollTop=column.scrollHeight;
-  const play=actionButton('▶ Play chain',()=>playClips($('#branch-preview'),clips,{captionEl:caption,
+  const playFrom=from=>playClips($('#branch-preview'),clips,{captionEl:caption,from,
     caption:i=>`Clip ${i+1} of ${clips.length} · ${nodeName(clips[i].source)} → ${nodeName(clips[i].target)}`,
-    onShow:(clip,i)=>{highlightPlaying(clip);markStepPlaying(i);}}),'Play the clips in the chain back to back. The browser may hitch slightly at each join; Export chain joins them seamlessly');
+    onShow:(clip,i)=>{highlightPlaying(clip);markStepPlaying(i);}});
+  // A chain with a gap cannot play, so its steps cannot be played from either.
+  const column=chainColumn(builder.start,clips,{gaps:builder.gaps,onTake:(i,id)=>{builder.steps[i]=id;builderChanged();},
+    onPick:complete?i=>{stopBranchVideo();playFrom(i);}:null});
+  $('#branch-info').append(column);column.scrollTop=column.scrollHeight;
+  const play=actionButton('▶ Play chain',()=>playFrom(0),'Play the clips in the chain back to back. The browser may hitch slightly at each join; Export chain joins them seamlessly. Click a step in the list to play from there');
   const undo=actionButton('Undo last step',()=>{builder.steps.pop();builder.gaps.delete(builder.steps.length);builderChanged();},'Remove the last step of the chain');
   const clear=actionButton('Clear',()=>{builder.steps=[];builder.gaps.clear();builderChanged();},'Remove every step and start again from the first image');
   play.disabled=!complete;undo.disabled=clear.disabled=!clips.length;
@@ -1204,21 +1208,28 @@ function saveChainRow(state,clips,complete,afterSave){
 // A chain drawn down the side panel: every image it visits, in order, with the connection between each pair, its
 // length and its take. An image visited twice appears twice, as the footage does. Used by the builder and by quick
 // chains; `gaps` are the builder's steps with no take left, and `onTake(i, clip id)` runs when a take is chosen.
-function chainColumn(start,clips,{gaps=new Map(),onTake}){
+function chainColumn(start,clips,{gaps=new Map(),onTake,onPick}){
   const column=el('div','chain-column');
+  // With onPick(i), clicking step i, or the image it starts from, plays the chain from that step (the last image, from
+  // the last step). Choosing a take in a step's list does not.
+  const pickable=(row,i,what)=>{
+    if(!onPick)return;
+    row.classList.add('pickable');row.title=`Play the chain from ${what}`;
+    row.onclick=e=>{if(!e.target.closest('select'))onPick(Math.min(i,clips.length-1));};
+  };
   const image=id=>{
     const n=branchTree.nodes.find(x=>x.id===id),row=el('div','column-node');
     if(n?.thumbnail){const img=el('img');img.src=n.thumbnail;img.alt='';row.append(img);}else row.append(el('div','blank'));
     row.append(el('span','',nodeName(id)));row.title=n?.prompt||'';return row;
   };
-  column.append(image(start));
+  const first=image(start);pickable(first,0,'the start');column.append(first);
   clips.forEach((clip,i)=>{
     if(!clip){
       const link=el('div','column-link missing');
       link.append(el('div','column-arrow'),el('span','','No take left'));
       column.append(link,image(gaps.get(i).target));return;
     }
-    const pair=pairByClip.get(clip.id),link=el('div','column-link');
+    const pair=pairByClip.get(clip.id),link=el('div','column-link');pickable(link,i,`step ${i+1}`);
     link.append(el('div','column-arrow'),el('span','',`${clip.seconds} s`));
     if(pair.takes.length>1){
       const pick=el('select');pick.setAttribute('aria-label',`Take for step ${i+1}`);
@@ -1229,7 +1240,8 @@ function chainColumn(start,clips,{gaps=new Map(),onTake}){
       const whole=clip.piece&&clipById.get(clip.piece.clip);
       link.append(el('span','',`Take ${clip.take}`+(whole?` · piece of take ${whole.take}`:'')));
     }
-    column.append(link,image(clip.target));
+    const next=image(clip.target);pickable(next,i+1,i+1<clips.length?`step ${i+2}`:'the last step');
+    column.append(link,next);
   });
   return column;
 }
